@@ -1,5 +1,7 @@
 set(EXTENSION_SOURCES lerobot_extension.cpp)
 
+include_directories(include)
+
 build_static_extension(lerobot ${EXTENSION_SOURCES})
 build_loadable_extension(lerobot "" ${EXTENSION_SOURCES})
 

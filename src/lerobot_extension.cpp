@@ -18,8 +18,15 @@ struct LerobotLayoutBindData final : public TableFunctionData {
 }
 
 	string root;
+};
+
+struct LerobotSingleRowGlobalState final : public GlobalTableFunctionState {
 	bool emitted = false;
 };
+
+unique_ptr<GlobalTableFunctionState> LerobotSingleRowInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<LerobotSingleRowGlobalState>();
+}
 
 string NormalizeRoot(string root) {
 	while (root.size() > 1 && root.back() == '/') {
@@ -58,7 +65,8 @@ unique_ptr<FunctionData> LerobotLayoutBind(ClientContext &, TableFunctionBindInp
 
 void LerobotLayoutFunction(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	auto &bind_data = input.bind_data->Cast<LerobotLayoutBindData>();
-	if (bind_data.emitted) {
+	auto &state = input.global_state->Cast<LerobotSingleRowGlobalState>();
+	if (state.emitted) {
 		return;
 	}
 
@@ -69,7 +77,7 @@ void LerobotLayoutFunction(ClientContext &, TableFunctionInput &input, DataChunk
 	output.SetValue(3, 0, Value(root + "/data"));
 	output.SetValue(4, 0, Value(root + "/videos"));
 	output.SetCardinality(1);
-	bind_data.emitted = true;
+	state.emitted = true;
 }
 
 struct LerobotV3ShardBindData final : public TableFunctionData {
@@ -81,7 +89,6 @@ struct LerobotV3ShardBindData final : public TableFunctionData {
 	string video_key;
 	int64_t chunk_index;
 	int64_t file_index;
-	bool emitted = false;
 };
 
 unique_ptr<FunctionData> LerobotV3ShardPathsBind(ClientContext &, TableFunctionBindInput &input,
@@ -109,7 +116,8 @@ unique_ptr<FunctionData> LerobotV3ShardPathsBind(ClientContext &, TableFunctionB
 
 void LerobotV3ShardPathsFunction(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	auto &bind_data = input.bind_data->Cast<LerobotV3ShardBindData>();
-	if (bind_data.emitted) {
+	auto &state = input.global_state->Cast<LerobotSingleRowGlobalState>();
+	if (state.emitted) {
 		return;
 	}
 
@@ -121,7 +129,7 @@ void LerobotV3ShardPathsFunction(ClientContext &, TableFunctionInput &input, Dat
 	output.SetValue(2, 0,
 	                Value(root + "/videos/" + bind_data.video_key + "/chunk-" + chunk + "/file-" + file + ".mp4"));
 	output.SetCardinality(1);
-	bind_data.emitted = true;
+	state.emitted = true;
 }
 
 unique_ptr<CreateMacroInfo> CreateTableMacro(const string &name, const vector<string> &parameters, const string &query) {
@@ -177,11 +185,12 @@ void LoadInternal(ExtensionLoader &loader) {
 	// This is the stable layout contract used by the scan and decoder work that
 	// follows. It deliberately performs no I/O, so it works for local paths and
 	// URI roots (hf://, s3://, https://) alike.
-	TableFunction layout("lerobot_layout", {LogicalType::VARCHAR}, LerobotLayoutFunction, LerobotLayoutBind);
+	TableFunction layout("lerobot_layout", {LogicalType::VARCHAR}, LerobotLayoutFunction, LerobotLayoutBind,
+	                     LerobotSingleRowInit);
 	loader.RegisterFunction(layout);
 	TableFunction shard_paths("lerobot_v3_shard_paths",
 	                          {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
-	                          LerobotV3ShardPathsFunction, LerobotV3ShardPathsBind);
+	                          LerobotV3ShardPathsFunction, LerobotV3ShardPathsBind, LerobotSingleRowInit);
 	loader.RegisterFunction(shard_paths);
 	auto episodes = CreateLerobotEpisodesMacro();
 	loader.RegisterFunction(*episodes);
