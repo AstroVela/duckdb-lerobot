@@ -53,6 +53,25 @@ clamped using episode `length` and marked with `is_padding`. The clamped
 alignment uses its real timestamp rather than reconstructing time as
 `frame_index / fps`.
 
+For large or dynamically generated target sets, the relation form is preferred:
+
+    SELECT *
+    FROM lerobot_video_targets(
+      root,
+      (SELECT request_id, episode_index, frame_index, video_key, delta_index
+       FROM training_targets
+       WHERE split = 'train'),
+      delta_timestamps := [-0.2, -0.1, 0.0]
+    );
+
+The five named input columns are cast by DuckDB and consumed through unified
+typed vectors. One row selects one camera/delta pair, avoiding the list API's
+bind-time materialization and cross product. Duplicate rows remain duplicate
+decode targets. Physical output is shard/time ordered; `target_ordinal` is a
+unique rejoin key, while `request_id`, `video_key`, and `delta_index` retain the
+caller's semantic identity. Filters and projections inside the input subquery
+are optimized before routing and decode.
+
 Video alignment is a separate metadata-only phase:
 
     SELECT *
@@ -130,9 +149,11 @@ a gap greater than 10 seconds starts a new seek cluster.
 
 The number of queued targets is bounded as well as the size of an individual
 shard buffer. If many shards each have a partial buffer, the scheduler flushes
-the least-recently-touched partial buffer before reading more Parquet rows. Only
-one worker can lease a given shard at a time, while distinct shards decode in
-parallel up to the smaller of `decode_threads` and `max_open_shards`.
+the least-recently-touched partial buffer before reading more Parquet rows. The
+source scheduler leases one decoder per shard at a time. Relation pipelines may
+hold separate sessions for the same shard when DuckDB runs independent input
+chunks concurrently; no FFmpeg object itself is shared. Decode runs in parallel
+up to the smaller of `decode_threads` and `max_cached_decoders`.
 
 The DuckDB file handle, FFmpeg container, codec, frames, and RGB conversion
 context stay open when a decoder is returned between buffers. A monotonic next
@@ -178,6 +199,20 @@ into execution: metadata-only columns, counts, and explicitly requested resize
 dimensions do not open FFmpeg. RGB conversion is skipped unless `image` is
 projected, and repeated targets selecting the same decoded frame reuse the most
 recent conversion.
+
+The standard source functions also accept DuckDB output-filter pushdown and
+evaluate the pushed expressions against typed output vectors. Their internal
+Parquet result is read through `UnifiedVectorFormat`, and RGB bytes are appended
+directly to `BLOB` vectors. The relation function receives upstream filters in
+its native child plan; DuckDB currently does not pass output `TableFilterSet`
+objects to table-in/out operators, so output predicates remain a normal
+downstream filter there.
+
+Decoder work is observable through DuckDB's query profiler: targets, acquires,
+cache hits, opens, evictions, decoder seeks, underlying AVIO seeks, bytes read,
+decoded frames, RGB conversions, and conversion fan-out hits are query-local
+atomic counters. These metrics distinguish open/seek amplification from codec
+and pixel-conversion cost instead of relying on wall time alone.
 
 There is no persistent or cross-shard decoded-frame cache. A decoder retains
 only its most recent RGB conversion to coalesce repeated targets. The dataset

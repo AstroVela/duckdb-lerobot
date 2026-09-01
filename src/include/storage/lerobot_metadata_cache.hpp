@@ -144,6 +144,9 @@ public:
 
 	vector<LerobotVideoRoute> ResolveRoutes(const vector<int64_t> &episode_indices,
 	                                        const vector<string> &requested_video_keys) const;
+	//! Resolve one episode/camera route without copying the dataset-wide route table.
+	//! The returned pointer remains valid for the lifetime of this immutable cache entry.
+	const LerobotVideoRoute *FindRoute(int64_t episode_index, const string &video_key) const;
 	const string &GetVideoKey(const LerobotVideoRoute &route) const {
 		return video_keys[route.video_key_index];
 	}

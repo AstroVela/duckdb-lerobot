@@ -15,6 +15,7 @@ vector<TableFunctionSet> LerobotFunctions::GetTableFunctions(ExtensionLoader &lo
 	functions.push_back(GetEpisodeFramesFunction());
 	functions.push_back(GetVideoFramesFunction());
 	functions.push_back(GetVideoWindowsFunction());
+	functions.push_back(GetVideoTargetsFunction());
 	return functions;
 }
 

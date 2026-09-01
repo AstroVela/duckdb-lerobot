@@ -215,6 +215,65 @@ ORDER BY delta_ordinal;
 1	0	0.0	520e780c7e7644f58eac8ad5c259a341
 2	1	0.5	09b3f62794209739b33ee60adadcae39
 
+# Relation targets decode in shard/timestamp order while target_ordinal keeps
+# duplicate occurrences distinct for rejoin. The first two requests fan out
+# from one RGB conversion.
+query IIIIRT
+SELECT request_id, target_ordinal, delta_index, target_frame_index,
+       decoded_timestamp, md5(image)
+FROM lerobot_video_targets(
+    '{TEST_DIR}/lerobot_video_frames',
+    (SELECT * FROM (VALUES
+        (30, 0, 0, 'observation.images.front', 0),
+        (31, 0, 0, 'observation.images.front', 1),
+        (32, 0, 0, 'observation.images.front', 2)
+    ) targets(request_id, episode_index, frame_index, video_key, delta_index)),
+    delta_timestamps := [-0.5, 0.0, 0.5],
+    decode_threads := 2,
+    max_cached_decoders := 1,
+    max_pending_targets := 2,
+    max_output_bytes := 1
+)
+ORDER BY target_ordinal;
+----
+30	0	0	0	0.0	520e780c7e7644f58eac8ad5c259a341
+31	1	1	0	0.0	520e780c7e7644f58eac8ad5c259a341
+32	2	2	1	0.5	09b3f62794209739b33ee60adadcae39
+
+# Standard source APIs publish decoder/open/seek/bytes/frame/conversion counters
+# through DuckDB's native JSON profiler.
+statement ok
+PRAGMA enable_profiling='json';
+
+statement ok
+SET profiling_output = '{TEST_DIR}/lerobot_video_frames/profile.json';
+
+query I
+SELECT count(image)
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_frames',
+    [0],
+    video_keys := ['observation.images.front'],
+    frame_indices := [0, 1]
+);
+----
+2
+
+statement ok
+PRAGMA disable_profiling;
+
+query I
+SELECT CAST(
+    contains(content, 'LeRobot Decoder Opens') AND
+    contains(content, 'LeRobot Decoder Seeks') AND
+    contains(content, 'LeRobot Video Bytes Read') AND
+    contains(content, 'LeRobot Frames Decoded') AND
+    contains(content, 'LeRobot RGB Conversions')
+AS INTEGER)
+FROM read_text('{TEST_DIR}/lerobot_video_frames/profile.json');
+----
+1
+
 statement error
 SELECT *
 FROM lerobot_video_windows(
@@ -282,3 +341,13 @@ FROM lerobot_video_frames(
 );
 ----
 max_open_shards must be between 1
+
+statement error
+SELECT *
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_frames',
+    [0],
+    max_cached_decoders := 0
+);
+----
+max_cached_decoders must be between 1

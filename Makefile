@@ -20,4 +20,5 @@ build: configure
 
 test: configure
 	cmake --build $(BUILD_DIR) --target unittest -j$(JOBS)
-	$(BUILD_DIR)/test/unittest "$(CURDIR)/test/*"
+	LD_LIBRARY_PATH="$(CURDIR)/$(BUILD_DIR)/src:$${LD_LIBRARY_PATH}" \
+		$(BUILD_DIR)/test/unittest "$(CURDIR)/test/*"

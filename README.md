@@ -48,6 +48,17 @@ mapping it into the MP4 shard. Request and delta ordinals survive the internal
 shard/time reorder, so callers can restore the requested tensor order without
 discarding duplicates.
 
+`lerobot_video_targets` is the scalable relation entry point. Its second
+argument is a DuckDB relation with exactly `request_id`, `episode_index`,
+`frame_index`, `video_key`, and `delta_index`. Each row selects one camera and
+one element of the named `delta_timestamps` list, so upstream joins, duplicate
+requests, and filters remain relational instead of being boxed into a bind-time
+list or expanded into a camera/window Cartesian product. The semantic keys
+survive shard/time scheduling, and `target_ordinal` keeps even exact duplicates
+distinct. Use an order-bearing `request_id` together with `delta_index` and
+`target_ordinal` to restore the caller's tensor order. Padding and the resolved
+target frame are returned explicitly.
+
 `lerobot_layout(root)` and `lerobot_v3_shard_paths(...)` expose the canonical
 layout without touching storage. A bare Hugging Face repository ID such as
 `lerobot/droid_1.0.1` is normalized to `hf://datasets/lerobot/droid_1.0.1`.
@@ -124,6 +135,28 @@ FROM lerobot_video_windows(
 )
 ORDER BY request_ordinal, delta_ordinal;
 
+-- Feed a native relation into the decoder. Filters in this subquery are
+-- planned before timestamp lookup and video decode. Every input row chooses
+-- exactly one camera and one delta.
+WITH targets AS (
+  SELECT * FROM (VALUES
+    (1001::BIGINT, 12::BIGINT, 45::BIGINT,
+     'observation.images.wrist'::VARCHAR, 0::BIGINT),
+    (1001::BIGINT, 12::BIGINT, 45::BIGINT,
+     'observation.images.wrist'::VARCHAR, 1::BIGINT),
+    (1002::BIGINT, 12::BIGINT, 90::BIGINT,
+     'observation.images.front'::VARCHAR, 2::BIGINT)
+  ) t(request_id, episode_index, frame_index, video_key, delta_index)
+)
+SELECT request_id, target_ordinal, video_key, delta_index, is_padding,
+       target_frame_index, decoded_timestamp, image
+FROM lerobot_video_targets(
+  'hf://datasets/lerobot/droid_1.0.1',
+  (SELECT * FROM targets),
+  delta_timestamps := [-0.2, -0.1, 0.0]
+)
+ORDER BY target_ordinal;
+
 -- Inspect the data route cache. Set refresh := true after an in-place
 -- metadata update that does not publish a new dataset revision.
 SELECT *
@@ -141,7 +174,8 @@ FROM lerobot_video_metadata_cache('hf://datasets/lerobot/droid_1.0.1');
 ## Roadmap
 
 1. Native state/proprioception expressions and episode trimming.
-2. Remote-revision benchmarks for decode cold/warm paths and byte ranges.
+2. Optional adaptive seek clustering if cross-storage benchmarks beat the
+   fixed 10-second policy materially.
 3. Optional hardware-accelerated FFmpeg backends after the CPU contract is
    stable.
 
@@ -212,14 +246,29 @@ independently caps image bytes emitted by one call at 64 MiB (a single larger
 frame is still emitted).
 
 `target_buffer_size` defaults to 256 alignment targets per shard buffer.
-`max_open_shards` defaults to 8 cached decoder sessions, while
+`max_cached_decoders` defaults to 8 decoder sessions, while
 `decode_threads` independently defaults to 8 workers. `max_pending_targets`
 defaults to twice `target_buffer_size * decode_threads`; the scheduler flushes
 the least-recently-used partial shard buffer before crossing that bound.
+`max_open_shards` remains a deprecated compatibility alias for
+`max_cached_decoders`. Actual concurrent decoder work cannot exceed either the
+worker or decoder-session limit, but changing one no longer silently rewrites
+the other.
 `codec_threads` defaults to one FFmpeg thread per decoder to avoid nested
 oversubscription. Projection pushdown avoids opening video entirely unless the
 query needs `image`, `decoded_timestamp`, or unknown native dimensions, so
-metadata-only queries also work in an FFmpeg-disabled build.
+metadata-only queries also work in an FFmpeg-disabled build. The relation input
+uses DuckDB typed vectors and native child-plan projection/filter pushdown; the
+source APIs also evaluate pushed output filters themselves. RGB data is written
+directly into DuckDB `BLOB` vectors.
+
+With JSON profiling enabled, `lerobot_video_frames` and
+`lerobot_video_windows` publish targets, decoder acquires/cache hits/opens/
+evictions, decoder seeks, AVIO seeks, video bytes read, frames decoded, RGB
+conversions, and same-frame fan-out hits. See the
+[A/B benchmark harness](benchmark/README.md) for matching DuckDB, Daft, and
+native LeRobot runs and the current adaptive-threshold/hardware-decode decision
+gates.
 
 Vane integration is tested against the matching official DuckDB release; Vane
 fork-specific integration stays in the Vane repository rather than leaking

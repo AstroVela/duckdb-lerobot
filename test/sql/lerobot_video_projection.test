@@ -31,7 +31,9 @@ statement ok
 COPY (
     SELECT episodes.*, 0 AS metadata_chunk FROM (VALUES
         (0::BIGINT, 2::BIGINT, 0::BIGINT, 0::BIGINT,
-         0::BIGINT, 0::BIGINT, 0.0::DOUBLE, 0.5::DOUBLE)
+         0::BIGINT, 0::BIGINT, 0.0::DOUBLE, 0.5::DOUBLE),
+        (1::BIGINT, 1::BIGINT, 0::BIGINT, 0::BIGINT,
+         0::BIGINT, 0::BIGINT, 1.0::DOUBLE, 1.0::DOUBLE)
     ) AS episodes(
         episode_index,
         length,
@@ -49,7 +51,8 @@ statement ok
 COPY (
     SELECT * FROM (VALUES
         (0::BIGINT, 0::BIGINT, 0.0::DOUBLE),
-        (0::BIGINT, 1::BIGINT, 0.5::DOUBLE)
+        (0::BIGINT, 1::BIGINT, 0.5::DOUBLE),
+        (1::BIGINT, 0::BIGINT, 0.0002::DOUBLE)
     ) AS frames(episode_index, frame_index, timestamp)
 ) TO '{TEST_DIR}/lerobot_video_projection/data.parquet' (FORMAT PARQUET);
 
@@ -101,3 +104,84 @@ ORDER BY request_ordinal;
 ----
 9	0	1
 9	1	0
+
+# The relation entry consumes typed vectors, keeps duplicate logical requests,
+# selects one camera/delta per row, and exposes a distinct target_ordinal.
+query IIIIIIRT
+SELECT request_id, target_ordinal, delta_index, CAST(is_padding AS INTEGER),
+       target_frame_index, frame_index, timestamp, video_key
+FROM lerobot_video_targets(
+    '{TEST_DIR}/lerobot_video_projection',
+    (SELECT * FROM (VALUES
+        (9, 0, 0, 'observation.images.front', 0),
+        (9, 0, 0, 'observation.images.front', 0),
+        (10, 0, 0, 'observation.images.front', 1),
+        (11, 0, 0, 'observation.images.front', 2)
+    ) targets(request_id, episode_index, frame_index, video_key, delta_index)),
+    delta_timestamps := [-0.5, 0.0, 0.5],
+    decode_threads := 1,
+    max_pending_targets := 2
+)
+ORDER BY target_ordinal;
+----
+9	0	0	1	0	0	0.0	observation.images.front
+9	1	0	1	0	0	0.0	observation.images.front
+10	2	1	0	0	0	0.0	observation.images.front
+11	3	2	0	1	0	0.5	observation.images.front
+
+# Filters in the child relation run before routing/decode. Metadata-only output
+# projection must not open the deliberately missing MP4.
+query II
+SELECT request_id, target_frame_index
+FROM lerobot_video_targets(
+    '{TEST_DIR}/lerobot_video_projection',
+    (SELECT request_id, episode_index, frame_index, video_key, delta_index
+     FROM (VALUES
+        (20, 0, 0, 'observation.images.front', 0),
+        (21, 0, 1, 'observation.images.front', 0)
+     ) targets(request_id, episode_index, frame_index, video_key, delta_index)
+     WHERE request_id = 21)
+);
+----
+21	1
+
+# Output filters pushed into the legacy source are evaluated by its typed
+# filter executor rather than being silently dropped.
+query I
+SELECT frame_index
+FROM lerobot_video_frames('{TEST_DIR}/lerobot_video_projection', [0])
+WHERE frame_index = 1;
+----
+1
+
+# DuckDB retains a pushed filter column even when it is not part of the final
+# projection. The extension evaluates it before the outer projection removes it.
+query I
+SELECT episode_index
+FROM lerobot_video_frames('{TEST_DIR}/lerobot_video_projection', [0])
+WHERE frame_index = 1;
+----
+0
+
+statement error
+SELECT *
+FROM lerobot_video_targets(
+    '{TEST_DIR}/lerobot_video_projection',
+    (SELECT 1 AS request_id, 0 AS episode_index, 0 AS frame_index,
+            'observation.images.front' AS video_key, 3 AS delta_index),
+    delta_timestamps := [-0.5, 0.0, 0.5]
+);
+----
+delta_index 3 is outside
+
+# Current LeRobot's strict default tolerance is 1e-4 seconds. This frame's
+# absolute timestamp is 0.0002 seconds past the inclusive route endpoint.
+statement error
+SELECT target_frame_index
+FROM lerobot_video_targets(
+    '{TEST_DIR}/lerobot_video_projection',
+    (SELECT 30 AS request_id, 1 AS episode_index, 0 AS frame_index,
+            'observation.images.front' AS video_key, 0 AS delta_index)
+);
+----
+falls outside video route

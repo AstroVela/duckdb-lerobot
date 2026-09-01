@@ -618,4 +618,25 @@ vector<LerobotVideoRoute> LerobotVideoMetadata::ResolveRoutes(const vector<int64
 	return result;
 }
 
+const LerobotVideoRoute *LerobotVideoMetadata::FindRoute(int64_t episode_index, const string &video_key) const {
+	auto key_entry = std::lower_bound(video_keys.begin(), video_keys.end(), video_key);
+	if (key_entry == video_keys.end() || *key_entry != video_key) {
+		return nullptr;
+	}
+	const auto video_key_index = static_cast<idx_t>(key_entry - video_keys.begin());
+	auto route = std::lower_bound(
+	    routes.begin(), routes.end(), episode_index,
+	    [](const LerobotVideoRoute &candidate, int64_t value) { return candidate.episode_index < value; });
+	while (route != routes.end() && route->episode_index == episode_index) {
+		if (route->video_key_index == video_key_index) {
+			return &*route;
+		}
+		if (route->video_key_index > video_key_index) {
+			break;
+		}
+		route++;
+	}
+	return nullptr;
+}
+
 } // namespace duckdb
