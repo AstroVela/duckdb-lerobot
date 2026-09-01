@@ -99,18 +99,40 @@ ORDER BY frame_index;
 1	2	1.0	1.0	16	16	3	768	32
 1	3	1.5	1.5	16	16	3	768	32
 
-# Two camera shards become independent parallel jobs; each shard is opened
-# once for this contiguous timestamp cluster.
+# One-target buffers alternate between two camera shards. A one-entry decoder
+# cache forces LRU close/reopen while preserving every aligned output row.
 query III
 SELECT count(*), count(DISTINCT video_path), count(DISTINCT md5(image))
 FROM lerobot_video_frames(
     '{TEST_DIR}/lerobot_video_frames',
     [0, 1],
     frame_indices := [0, 1, 2, 3],
-    batch_size := 1
+    batch_size := 1,
+    target_buffer_size := 1,
+    max_open_shards := 1
 );
 ----
 8	2	4
+
+# A decoder session survives target-buffer boundaries for the same shard. These
+# four one-target buffers are monotonic, so they can continue without a seek.
+query IR
+SELECT frame_index, decoded_timestamp
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_frames',
+    [0, 1],
+    video_keys := ['observation.images.front'],
+    frame_indices := [0, 1, 2, 3],
+    batch_size := 1,
+    target_buffer_size := 1,
+    max_open_shards := 1
+)
+ORDER BY frame_index;
+----
+0	0.0
+1	0.5
+2	1.0
+3	1.5
 
 query IIII
 SELECT min(width), max(width), min(octet_length(image)), max(octet_length(image))
@@ -192,3 +214,23 @@ FROM lerobot_video_frames(
 );
 ----
 batch_size must be between 1
+
+statement error
+SELECT *
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_frames',
+    [0],
+    target_buffer_size := 0
+);
+----
+target_buffer_size must be between 1
+
+statement error
+SELECT *
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_frames',
+    [0],
+    max_open_shards := 0
+);
+----
+max_open_shards must be between 1

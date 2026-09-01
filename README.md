@@ -30,13 +30,14 @@ projection cost. Neither cache duplicates Parquet footers, row-group
 statistics, or data blocks; those remain native DuckDB responsibilities.
 
 Native video decode is available as the third stage. `lerobot_video_frames`
-reads only the selected episodes' frame timestamps, adds each episode's video
-offset, groups work by MP4 shard, and decodes independent shards in parallel.
-Targets within a shard are timestamp-sorted and split at gaps larger than 10
-seconds. Each shard is opened once; each cluster seeks backward to the
-preceding keyframe and decodes forward to the closest frame within half a frame
-period. Results are small Arrow-compatible batches of interleaved RGB24 bytes,
-not Python image objects.
+streams only the selected episodes' frame timestamps, adds each episode's video
+offset, and routes targets into bounded per-MP4-shard buffers. Targets are
+timestamp-sorted inside each buffer and split at gaps larger than 10 seconds.
+Decoder sessions stay open across buffers, continue forward when timestamps are
+nearby, and otherwise seek backward to the preceding keyframe. A bounded LRU
+pool closes least-recently-used idle decoders when more shards are encountered
+than can remain open. Results are small Arrow-compatible batches of interleaved
+RGB24 bytes, not Python image objects.
 
 `lerobot_layout(root)` and `lerobot_v3_shard_paths(...)` expose the canonical
 layout without touching storage. A bare Hugging Face repository ID such as
@@ -181,6 +182,11 @@ LEROBOT_FFMPEG_TESTS=1 make test
 training reads. `tolerance` defaults to half a frame period, `cluster_gap`
 defaults to 10 seconds, and `batch_size` defaults to 16 output rows so raw RGB
 frames do not inflate a standard DuckDB vector to excessive memory.
+`target_buffer_size` defaults to 256 alignment targets per shard buffer, while
+`max_open_shards` defaults to 8 decoder sessions and also bounds decode
+parallelism. The scheduler additionally caps globally queued targets at twice
+`target_buffer_size * max_open_shards`, flushing the least-recently-touched
+partial shard buffer when necessary.
 
 Vane integration is tested against the matching official DuckDB release; Vane
 fork-specific integration stays in the Vane repository rather than leaking

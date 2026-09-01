@@ -103,24 +103,37 @@ is then located by:
     absolute_timestamp = videos/{key}/from_timestamp + frame.timestamp
 
 It must never be addressed by `frame_index` alone. `lerobot_video_frames`
-materializes the three alignment columns from only the routed data shards,
-expands the requested camera routes, and creates one parallel work item per
-distinct video path. Targets are sorted within each work item. A gap greater
-than 10 seconds starts a new seek cluster, but the DuckDB file handle, FFmpeg
-container, codec, and RGB conversion context remain open for the whole shard.
+uses a streaming DuckDB query for the three alignment columns from only the
+routed data shards, then expands the requested camera routes one target at a
+time. A global scheduler logically partitions those targets by MP4 shard while
+placing them into fixed-size buffers. Each buffer is sorted independently, and
+a gap greater than 10 seconds starts a new seek cluster.
 
-Every cluster seeks backward to the preceding keyframe and decodes in display
-timestamp order. Once a decoded timestamp crosses a target, the decoder picks
-the closer of that frame and its predecessor; ties select the predecessor. A
-match farther away than the configured tolerance is rejected. The default
+The number of queued targets is bounded as well as the size of an individual
+shard buffer. If many shards each have a partial buffer, the scheduler flushes
+the least-recently-touched partial buffer before reading more Parquet rows. Only
+one worker can lease a given shard at a time, while distinct shards decode in
+parallel up to `max_open_shards`.
+
+The DuckDB file handle, FFmpeg container, codec, frames, and RGB conversion
+context stay open when a decoder is returned between buffers. A monotonic next
+buffer within `cluster_gap` continues the existing forward decode; a backward
+target, a larger gap, or an in-buffer cluster boundary seeks backward to the
+preceding keyframe. Once a decoded timestamp crosses a target, the decoder
+picks the closer of that frame and its predecessor; ties select the predecessor.
+A match farther away than the configured tolerance is rejected. The default
 tolerance is `0.5 / fps`, matching LeRobot and Daft. A no-progress budget of
 20,000 decoded frames prevents corrupt timestamp metadata from turning into an
 unbounded scan, while resetting after every matched target permits long dense
 episodes to stream normally.
 
-The table function emits at most 16 rows per call by default. Each row includes
-the episode-local timestamp, absolute requested timestamp, actual decoded
-timestamp, dimensions, three channels, and an interleaved HWC RGB24 `BLOB`.
+The table function emits at most 16 rows per call by default. Target buffers
+hold at most 256 entries by default, and a global LRU retains at most 8 idle or
+leased decoder sessions. Encountering an additional shard closes the
+least-recently-used idle decoder before opening the replacement. Each row
+includes the episode-local timestamp, absolute requested timestamp, actual
+decoded timestamp, dimensions, three channels, and an interleaved HWC RGB24
+`BLOB`.
 Optional width and height use the same two-stage pixel contract as Daft: PyAV
 RGB24 conversion at native dimensions followed by Pillow-compatible
 nearest-neighbour resize. A `frame_indices` named argument filters the native
@@ -130,9 +143,9 @@ SQL filter for sparse sampling.
 FFmpeg reads through a seekable custom `AVIOContext` backed by DuckDB's
 `FileSystem`. This preserves `hf://` and other filesystem extensions, secrets,
 and any caching supplied by the host filesystem instead of teaching FFmpeg
-about every remote URI scheme. Shard jobs share only immutable bind data; each
-DuckDB worker owns its file, codec, frames, and scaler, so decoding needs no
-global codec lock.
+about every remote URI scheme. Decoder sessions move between the synchronized
+idle LRU and an exclusive worker lease; FFmpeg objects are never shared by two
+workers, so decoding needs no global codec lock.
 
 There is no decoded-frame cache. The dataset and video-route `ObjectCache`
 entries remain the small reusable control plane, DuckDB owns remote byte/block
