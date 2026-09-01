@@ -22,8 +22,10 @@ dataset is read. The familiar v3 paths are defaults, not an ABI:
 The public API is episode-first:
 
     SELECT * FROM lerobot_episodes('hf://datasets/org/dataset');
+    SELECT * FROM lerobot_info('hf://datasets/org/dataset');
 
-It returns one row per episode. Callers filter episode metadata before the
+The first query returns one row per episode; the second returns the
+authoritative info record. Callers filter episode metadata before the
 extension expands frame Parquet rows. This prevents a query that selects a
 small set of episodes from eagerly scanning or decoding the entire dataset.
 

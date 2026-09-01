@@ -29,6 +29,9 @@ SELECT * FROM lerobot_v3_shard_paths(
 
 -- Read all v3 episode-metadata shards through DuckDB's native Parquet scan.
 SELECT * FROM lerobot_episodes('hf://datasets/lerobot/droid_1.0.1');
+
+-- Read the authoritative version and path-template metadata.
+SELECT * FROM lerobot_info('hf://datasets/lerobot/droid_1.0.1');
 ```
 
 | root | info_path | episodes_path | data_path | videos_path |

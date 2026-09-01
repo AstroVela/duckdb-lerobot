@@ -7,3 +7,4 @@ duckdb_extension_load(lerobot
 # lerobot_episodes delegates physical Parquet decoding to DuckDB's native
 # scanner until the specialised metadata scan is introduced.
 duckdb_extension_load(parquet)
+duckdb_extension_load(json)

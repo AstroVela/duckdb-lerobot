@@ -124,29 +124,40 @@ void LerobotV3ShardPathsFunction(ClientContext &, TableFunctionInput &input, Dat
 	bind_data.emitted = true;
 }
 
-unique_ptr<CreateMacroInfo> CreateLerobotEpisodesMacro() {
+unique_ptr<CreateMacroInfo> CreateTableMacro(const string &name, const string &parameter, const string &query) {
 	Parser parser;
-	parser.ParseQuery(R"(
+	parser.ParseQuery(query);
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		throw InternalException("Expected a single SELECT statement for %s", name);
+	}
+
+	auto node = std::move(parser.statements[0]->Cast<SelectStatement>().node);
+	auto macro = make_uniq<TableMacroFunction>(std::move(node));
+	macro->parameters.push_back(make_uniq<ColumnRefExpression>(parameter));
+
+	auto info = make_uniq<CreateMacroInfo>(CatalogType::TABLE_MACRO_ENTRY);
+	info->name = name;
+	info->temporary = true;
+	info->internal = true;
+	info->macros.push_back(std::move(macro));
+	return info;
+}
+
+unique_ptr<CreateMacroInfo> CreateLerobotEpisodesMacro() {
+	return CreateTableMacro("lerobot_episodes", "root", R"(
 		SELECT *
 		FROM read_parquet(
 			root || '/meta/episodes/**/*.parquet',
 			union_by_name = true
 		)
 	)");
-	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
-		throw InternalException("Expected a single SELECT statement for lerobot_episodes");
-	}
+}
 
-	auto node = std::move(parser.statements[0]->Cast<SelectStatement>().node);
-	auto macro = make_uniq<TableMacroFunction>(std::move(node));
-	macro->parameters.push_back(make_uniq<ColumnRefExpression>("root"));
-
-	auto info = make_uniq<CreateMacroInfo>(CatalogType::TABLE_MACRO_ENTRY);
-	info->name = "lerobot_episodes";
-	info->temporary = true;
-	info->internal = true;
-	info->macros.push_back(std::move(macro));
-	return info;
+unique_ptr<CreateMacroInfo> CreateLerobotInfoMacro() {
+	return CreateTableMacro("lerobot_info", "root", R"(
+		SELECT *
+		FROM read_json(root || '/meta/info.json')
+	)");
 }
 
 void LoadInternal(ExtensionLoader &loader) {
@@ -161,6 +172,8 @@ void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(shard_paths);
 	auto episodes = CreateLerobotEpisodesMacro();
 	loader.RegisterFunction(*episodes);
+	auto info = CreateLerobotInfoMacro();
+	loader.RegisterFunction(*info);
 }
 
 } // namespace
