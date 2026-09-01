@@ -5,6 +5,13 @@
 require lerobot
 
 query I
+SELECT function_name
+FROM duckdb_functions()
+WHERE function_name = 'lerobot_episodes';
+----
+lerobot_episodes
+
+query I
 SELECT * FROM lerobot_layout('hf://datasets/lerobot/droid_1.0.1/');
 ----
 hf://datasets/lerobot/droid_1.0.1	hf://datasets/lerobot/droid_1.0.1/meta/info.json	hf://datasets/lerobot/droid_1.0.1/meta/episodes	hf://datasets/lerobot/droid_1.0.1/data	hf://datasets/lerobot/droid_1.0.1/videos

@@ -2,7 +2,12 @@
 
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/function/table_macro_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/parsed_data/create_macro_info.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 
 namespace duckdb {
 
@@ -119,6 +124,31 @@ void LerobotV3ShardPathsFunction(ClientContext &, TableFunctionInput &input, Dat
 	bind_data.emitted = true;
 }
 
+unique_ptr<CreateMacroInfo> CreateLerobotEpisodesMacro() {
+	Parser parser;
+	parser.ParseQuery(R"(
+		SELECT *
+		FROM read_parquet(
+			root || '/meta/episodes/**/*.parquet',
+			union_by_name = true
+		)
+	)");
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		throw InternalException("Expected a single SELECT statement for lerobot_episodes");
+	}
+
+	auto node = std::move(parser.statements[0]->Cast<SelectStatement>().node);
+	auto macro = make_uniq<TableMacroFunction>(std::move(node));
+	macro->parameters.push_back(make_uniq<ColumnRefExpression>("root"));
+
+	auto info = make_uniq<CreateMacroInfo>(CatalogType::TABLE_MACRO_ENTRY);
+	info->name = "lerobot_episodes";
+	info->temporary = true;
+	info->internal = true;
+	info->macros.push_back(std::move(macro));
+	return info;
+}
+
 void LoadInternal(ExtensionLoader &loader) {
 	// This is the stable layout contract used by the scan and decoder work that
 	// follows. It deliberately performs no I/O, so it works for local paths and
@@ -129,6 +159,8 @@ void LoadInternal(ExtensionLoader &loader) {
 	                          {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
 	                          LerobotV3ShardPathsFunction, LerobotV3ShardPathsBind);
 	loader.RegisterFunction(shard_paths);
+	auto episodes = CreateLerobotEpisodesMacro();
+	loader.RegisterFunction(*episodes);
 }
 
 } // namespace

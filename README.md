@@ -26,6 +26,9 @@ SELECT * FROM lerobot_v3_shard_paths(
   'observation.images.wrist',
   2, 17
 );
+
+-- Read all v3 episode-metadata shards through DuckDB's native Parquet scan.
+SELECT * FROM lerobot_episodes('hf://datasets/lerobot/droid_1.0.1');
 ```
 
 | root | info_path | episodes_path | data_path | videos_path |
@@ -34,14 +37,17 @@ SELECT * FROM lerobot_v3_shard_paths(
 
 ## Roadmap
 
-1. Native `lerobot_episodes` scan over `meta/episodes/*.parquet`, including
-   projection and filter pushdown.
+1. Replace the initial `lerobot_episodes` Parquet macro with a dedicated scan,
+   including dataset-layout discovery plus projection and filter pushdown.
 2. Episode-to-video-shard timestamp mapping.
 3. Shard-aware, batched video decode into Arrow-compatible image batches.
 4. Native state/proprioception expressions and episode trimming.
 
 Model inference, such as hand-pose or reward scoring, remains a Vane GPU actor
 UDF concern; this extension owns the data-plane hot path.
+
+See [the reader design](docs/design.md) for the LeRobot and Daft-derived
+format, query-planning, and video-alignment invariants.
 
 ## Build
 
