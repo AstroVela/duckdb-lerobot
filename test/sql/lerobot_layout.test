@@ -8,3 +8,14 @@ query I
 SELECT * FROM lerobot_layout('hf://datasets/lerobot/droid_1.0.1/');
 ----
 hf://datasets/lerobot/droid_1.0.1	hf://datasets/lerobot/droid_1.0.1/meta/info.json	hf://datasets/lerobot/droid_1.0.1/meta/episodes	hf://datasets/lerobot/droid_1.0.1/data	hf://datasets/lerobot/droid_1.0.1/videos
+
+query I
+SELECT *
+FROM lerobot_v3_shard_paths('hf://datasets/lerobot/droid_1.0.1', 'observation.images.wrist', 2, 17);
+----
+hf://datasets/lerobot/droid_1.0.1/meta/episodes/chunk-002/file-017.parquet	hf://datasets/lerobot/droid_1.0.1/data/chunk-002/file-017.parquet	hf://datasets/lerobot/droid_1.0.1/videos/observation.images.wrist/chunk-002/file-017.mp4
+
+statement error
+SELECT * FROM lerobot_v3_shard_paths('/dataset', 'cam', -1, 0);
+----
+LeRobot shard indices must be non-negative

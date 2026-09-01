@@ -12,13 +12,20 @@ version compatibility matrix.
 ## Current status
 
 The first vertical slice is deliberately small: `lerobot_layout(root)` exposes
-the canonical LeRobot dataset layout without touching storage. It establishes a
-stable URI and SQL contract for the native scans that follow.
+the canonical LeRobot dataset layout and `lerobot_v3_shard_paths(...)` expands
+v3's metadata path templates without touching storage. Together they establish
+a stable URI and SQL contract for the native scans that follow.
 
 ```sql
 LOAD lerobot;
 
 SELECT * FROM lerobot_layout('hf://datasets/lerobot/droid_1.0.1');
+
+SELECT * FROM lerobot_v3_shard_paths(
+  'hf://datasets/lerobot/droid_1.0.1',
+  'observation.images.wrist',
+  2, 17
+);
 ```
 
 | root | info_path | episodes_path | data_path | videos_path |
@@ -49,4 +56,3 @@ make
 Vane integration is tested against the matching official DuckDB release; Vane
 fork-specific integration stays in the Vane repository rather than leaking
 into this portable extension.
-DuckDB and Vane extension for LeRobot datasets
