@@ -34,6 +34,25 @@ The initial SQL interface for that second phase is:
 
     SELECT * FROM lerobot_episode_frames(root, [episode_index, ...]);
 
+The ordered training interface is:
+
+    SELECT *
+    FROM lerobot_video_windows(
+      root,
+      [struct_pack(request_id := 7, episode_index := 12, frame_index := 45)],
+      delta_timestamps := [-0.2, -0.1, 0.0]
+    );
+
+It preserves duplicate requests and duplicate target frames. `request_ordinal`
+and `delta_ordinal` describe the caller's logical order; physical output order
+is intentionally unspecified because decode work is repartitioned by MP4 shard.
+Each delta must be an integer frame offset at the dataset FPS within the same
+`1e-4`-second default tolerance used by LeRobot. Offsets outside an episode are
+clamped using episode `length` and marked with `is_padding`. The clamped
+`target_frame_index` is then joined back to the frame Parquet data so video
+alignment uses its real timestamp rather than reconstructing time as
+`frame_index / fps`.
+
 Video alignment is a separate metadata-only phase:
 
     SELECT *
@@ -84,7 +103,7 @@ caches. On a base route-cache miss, its metadata query projects only the three
 data route columns through DuckDB's native Parquet reader. The video cache is
 not populated until `lerobot_video_routes` or
 `lerobot_video_metadata_cache` is bound; that query projects only four columns
-per video key plus `episode_index`.
+per video key plus `episode_index` and episode `length`.
 
 ## Metadata required for a v3 episode
 
@@ -113,7 +132,7 @@ The number of queued targets is bounded as well as the size of an individual
 shard buffer. If many shards each have a partial buffer, the scheduler flushes
 the least-recently-touched partial buffer before reading more Parquet rows. Only
 one worker can lease a given shard at a time, while distinct shards decode in
-parallel up to `max_open_shards`.
+parallel up to the smaller of `decode_threads` and `max_open_shards`.
 
 The DuckDB file handle, FFmpeg container, codec, frames, and RGB conversion
 context stay open when a decoder is returned between buffers. A monotonic next
@@ -122,14 +141,18 @@ target, a larger gap, or an in-buffer cluster boundary seeks backward to the
 preceding keyframe. Once a decoded timestamp crosses a target, the decoder
 picks the closer of that frame and its predecessor; ties select the predecessor.
 A match farther away than the configured tolerance is rejected. The default
-tolerance is `0.5 / fps`, matching LeRobot and Daft. A no-progress budget of
-20,000 decoded frames prevents corrupt timestamp metadata from turning into an
-unbounded scan, while resetting after every matched target permits long dense
-episodes to stream normally.
+tolerance is `1e-4` seconds, matching current LeRobot; callers can explicitly
+select a wider tolerance for approximate legacy media. Seeking uses the video
+stream's own time base and starts one tick before the target, then aligns on
+frame PTS with best-effort timestamps only as a fallback. A 20,000-frame budget
+is shared by an entire target buffer, preventing a dense series of individually
+successful matches from hiding corrupt routing metadata.
 
-The table function emits at most 16 rows per call by default. Target buffers
-hold at most 256 entries by default, and a global LRU retains at most 8 idle or
-leased decoder sessions. Encountering an additional shard closes the
+The table function emits at most 16 rows and 64 MiB of image data per call by
+default. Target buffers hold at most 256 entries by default, and a global LRU
+retains at most 8 idle or leased decoder sessions. Decode worker count, open
+decoder count, queued target count, per-call image bytes, and FFmpeg codec
+threads are independent controls. Encountering an additional shard closes the
 least-recently-used idle decoder before opening the replacement. Each row
 includes the episode-local timestamp, absolute requested timestamp, actual
 decoded timestamp, dimensions, three channels, and an interleaved HWC RGB24
@@ -147,10 +170,20 @@ about every remote URI scheme. Decoder sessions move between the synchronized
 idle LRU and an exclusive worker lease; FFmpeg objects are never shared by two
 workers, so decoding needs no global codec lock.
 
-There is no decoded-frame cache. The dataset and video-route `ObjectCache`
-entries remain the small reusable control plane, DuckDB owns remote byte/block
-and Parquet caches, and Vane/model actors decide whether decoded tensors are
-worth retaining.
+The timestamp-producing Parquet result is fetched by a single producer without
+holding the scheduler mutex; decoder workers can finish and claim ready shards
+concurrently with remote reads. Partial shard buffers have an O(1) LRU and are
+flushed under the global pending-target budget. Projection pushdown is carried
+into execution: metadata-only columns, counts, and explicitly requested resize
+dimensions do not open FFmpeg. RGB conversion is skipped unless `image` is
+projected, and repeated targets selecting the same decoded frame reuse the most
+recent conversion.
+
+There is no persistent or cross-shard decoded-frame cache. A decoder retains
+only its most recent RGB conversion to coalesce repeated targets. The dataset
+and video-route `ObjectCache` entries remain the small reusable control plane,
+DuckDB owns remote byte/block and Parquet caches, and Vane/model actors decide
+whether decoded tensors are worth retaining.
 
 ## Compatibility
 

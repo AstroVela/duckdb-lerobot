@@ -25,16 +25,18 @@ struct LerobotEpisodeRoute {
 };
 
 struct LerobotVideoRoute {
-	LerobotVideoRoute(int64_t episode_index_p, idx_t video_key_index_p, idx_t video_file_index_p, int64_t chunk_index_p,
-	                  int64_t file_index_p, double from_timestamp_p, double to_timestamp_p)
+	LerobotVideoRoute(int64_t episode_index_p, int64_t episode_length_p, idx_t video_key_index_p,
+	                  idx_t video_file_index_p, int64_t chunk_index_p, int64_t file_index_p, double from_timestamp_p,
+	                  double to_timestamp_p)
 	    : episode_index(episode_index_p), video_key_index(video_key_index_p), video_file_index(video_file_index_p),
-	      chunk_index(chunk_index_p), file_index(file_index_p), from_timestamp(from_timestamp_p),
-	      to_timestamp(to_timestamp_p) {
+	      episode_length(episode_length_p), chunk_index(chunk_index_p), file_index(file_index_p),
+	      from_timestamp(from_timestamp_p), to_timestamp(to_timestamp_p) {
 	}
 
 	int64_t episode_index;
 	idx_t video_key_index;
 	idx_t video_file_index;
+	int64_t episode_length;
 	int64_t chunk_index;
 	int64_t file_index;
 	double from_timestamp;

@@ -459,7 +459,7 @@ shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Load(ClientContext &conte
 		                                             std::move(video_files), dataset.GetInfoFingerprint());
 	}
 
-	string query = "SELECT CAST(episode_index AS BIGINT)";
+	string query = "SELECT CAST(episode_index AS BIGINT), CAST(length AS BIGINT)";
 	for (const auto &video_key : video_keys) {
 		const auto prefix = "videos/" + video_key;
 		query += ", CAST(" + QuoteIdentifier(prefix + "/chunk_index") + " AS BIGINT)";
@@ -482,16 +482,20 @@ shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Load(ClientContext &conte
 			break;
 		}
 		for (idx_t row = 0; row < chunk->size(); row++) {
-			if (chunk->GetValue(0, row).IsNull()) {
-				throw BinderException("LeRobot episode_index must not be NULL in video metadata");
+			if (chunk->GetValue(0, row).IsNull() || chunk->GetValue(1, row).IsNull()) {
+				throw BinderException("LeRobot episode_index and length must not be NULL in video metadata");
 			}
 			const auto episode_index = chunk->GetValue(0, row).GetValue<int64_t>();
+			const auto episode_length = chunk->GetValue(1, row).GetValue<int64_t>();
 			if (episode_index < 0) {
 				throw BinderException("LeRobot episode indices must be non-negative");
 			}
+			if (episode_length <= 0) {
+				throw BinderException("LeRobot episode %d length must be positive", episode_index);
+			}
 
 			for (idx_t video_key_index = 0; video_key_index < video_keys.size(); video_key_index++) {
-				const auto first_column = 1 + video_key_index * 4;
+				const auto first_column = 2 + video_key_index * 4;
 				idx_t null_count = 0;
 				for (idx_t offset = 0; offset < 4; offset++) {
 					if (chunk->GetValue(first_column + offset, row).IsNull()) {
@@ -530,8 +534,8 @@ shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Load(ClientContext &conte
 				} else {
 					video_file_index = entry->second;
 				}
-				routes.emplace_back(episode_index, video_key_index, video_file_index, chunk_index, file_index,
-				                    from_timestamp, to_timestamp);
+				routes.emplace_back(episode_index, episode_length, video_key_index, video_file_index, chunk_index,
+				                    file_index, from_timestamp, to_timestamp);
 			}
 		}
 	}

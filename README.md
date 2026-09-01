@@ -39,6 +39,15 @@ pool closes least-recently-used idle decoders when more shards are encountered
 than can remain open. Results are small Arrow-compatible batches of interleaved
 RGB24 bytes, not Python image objects.
 
+`lerobot_video_windows` is the training-oriented entry point. It accepts an
+ordered list of `(request_id, episode_index, frame_index)` structs plus LeRobot
+`delta_timestamps`. Delta values are validated against the dataset FPS, target
+frames are clamped to episode `length`, and padding is reported explicitly. The
+function reads each clamped frame's authoritative Parquet timestamp before
+mapping it into the MP4 shard. Request and delta ordinals survive the internal
+shard/time reorder, so callers can restore the requested tensor order without
+discarding duplicates.
+
 `lerobot_layout(root)` and `lerobot_v3_shard_paths(...)` expose the canonical
 layout without touching storage. A bare Hugging Face repository ID such as
 `lerobot/droid_1.0.1` is normalized to `hf://datasets/lerobot/droid_1.0.1`.
@@ -100,6 +109,21 @@ FROM lerobot_video_frames(
   height := 240
 );
 
+-- Decode an ordered temporal observation window. The scheduler may emit rows
+-- in shard order; request_ordinal and delta_ordinal are the stable rejoin keys.
+SELECT request_id, request_ordinal, delta_ordinal, is_padding,
+       target_frame_index, decoded_timestamp, image
+FROM lerobot_video_windows(
+  'hf://datasets/lerobot/droid_1.0.1',
+  [
+    struct_pack(request_id := 1001, episode_index := 12, frame_index := 45),
+    struct_pack(request_id := 1002, episode_index := 12, frame_index := 90)
+  ],
+  video_keys := ['observation.images.wrist'],
+  delta_timestamps := [-0.2, -0.1, 0.0]
+)
+ORDER BY request_ordinal, delta_ordinal;
+
 -- Inspect the data route cache. Set refresh := true after an in-place
 -- metadata update that does not publish a new dataset revision.
 SELECT *
@@ -132,9 +156,9 @@ Hugging Face revisions should normally need no explicit refresh.
 
 The data route builder projects only `episode_index`, `data/chunk_index`, and
 `data/file_index` from episode metadata. The lazy video route builder projects
-only `episode_index` and each video feature's chunk, file, and timestamp-range
-columns. Once the extension has selected the relevant paths, native
-`parquet_scan` owns schema/footer reads, projection and filter pushdown,
+only `episode_index`, episode `length`, and each video feature's chunk, file,
+and timestamp-range columns. Once the extension has selected the relevant
+paths, native `parquet_scan` owns schema/footer reads, projection and filter pushdown,
 row-group min/max pruning, parallel reads, and external-file caching. DuckDB's
 optional `parquet_metadata_cache` setting can therefore be used without any
 LeRobot-specific footer cache.
@@ -144,7 +168,9 @@ often consumed once by training, and cache policy belongs with the Vane actor or
 model pipeline. Video reads go through DuckDB's `FileSystem`, so local files,
 `hf://`, credentials, and any caching provided by the host filesystem use the
 same path as native scans. Within one decode query the FFmpeg container and
-conversion context are reused for every target on the same shard.
+conversion context are reused for every target on the same shard. Consecutive
+requests that select the same decoded frame also reuse its RGB conversion until
+the decoder advances or seeks; output vectors still receive independent values.
 
 Model inference, such as hand-pose or reward scoring, remains a Vane GPU actor
 UDF concern; this extension owns the data-plane hot path.
@@ -178,15 +204,22 @@ H.264 decode test explicitly with:
 LEROBOT_FFMPEG_TESTS=1 make test
 ```
 
-`frame_indices` is the pre-decode sampling control and should be used for sparse
-training reads. `tolerance` defaults to half a frame period, `cluster_gap`
-defaults to 10 seconds, and `batch_size` defaults to 16 output rows so raw RGB
-frames do not inflate a standard DuckDB vector to excessive memory.
-`target_buffer_size` defaults to 256 alignment targets per shard buffer, while
-`max_open_shards` defaults to 8 decoder sessions and also bounds decode
-parallelism. The scheduler additionally caps globally queued targets at twice
-`target_buffer_size * max_open_shards`, flushing the least-recently-touched
-partial shard buffer when necessary.
+`frame_indices` is the pre-decode sampling control for the low-level frame API;
+training reads should normally use `lerobot_video_windows`. `tolerance`
+defaults to `1e-4` seconds like native LeRobot, `cluster_gap` defaults to 10
+seconds, and `batch_size` defaults to 16 output rows. `max_output_bytes`
+independently caps image bytes emitted by one call at 64 MiB (a single larger
+frame is still emitted).
+
+`target_buffer_size` defaults to 256 alignment targets per shard buffer.
+`max_open_shards` defaults to 8 cached decoder sessions, while
+`decode_threads` independently defaults to 8 workers. `max_pending_targets`
+defaults to twice `target_buffer_size * decode_threads`; the scheduler flushes
+the least-recently-used partial shard buffer before crossing that bound.
+`codec_threads` defaults to one FFmpeg thread per decoder to avoid nested
+oversubscription. Projection pushdown avoids opening video entirely unless the
+query needs `image`, `decoded_timestamp`, or unknown native dimensions, so
+metadata-only queries also work in an FFmpeg-disabled build.
 
 Vane integration is tested against the matching official DuckDB release; Vane
 fork-specific integration stays in the Vane repository rather than leaking

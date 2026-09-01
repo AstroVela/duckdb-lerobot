@@ -34,14 +34,15 @@ COPY (
 statement ok
 COPY (
     SELECT episodes.*, 0 AS metadata_chunk FROM (VALUES
-        (0::BIGINT, 0::BIGINT, 0::BIGINT,
+        (0::BIGINT, 5::BIGINT, 0::BIGINT, 0::BIGINT,
          0::BIGINT, 0::BIGINT, 0.0::DOUBLE, 0.5::DOUBLE,
          0::BIGINT, 1::BIGINT, 0.0::DOUBLE, 0.5::DOUBLE),
-        (1::BIGINT, 0::BIGINT, 0::BIGINT,
+        (1::BIGINT, 4::BIGINT, 0::BIGINT, 0::BIGINT,
          0::BIGINT, 0::BIGINT, 1.0::DOUBLE, 1.5::DOUBLE,
          0::BIGINT, 1::BIGINT, 1.0::DOUBLE, 1.5::DOUBLE)
     ) AS episodes(
         episode_index,
+        length,
         "data/chunk_index",
         "data/file_index",
         "videos/observation.images.front/chunk_index",
@@ -109,7 +110,8 @@ FROM lerobot_video_frames(
     frame_indices := [0, 1, 2, 3],
     batch_size := 1,
     target_buffer_size := 1,
-    max_open_shards := 1
+    max_open_shards := 1,
+    max_pending_targets := 1
 );
 ----
 8	2	4
@@ -172,10 +174,56 @@ FROM lerobot_video_frames(
     '{TEST_DIR}/lerobot_video_frames',
     [0],
     video_keys := ['observation.images.front'],
-    frame_indices := [0, 4]
+    frame_indices := [0, 4],
+    tolerance := 0.25
 );
 ----
 1	0.0
+
+# Temporal windows preserve request/delta ordinals and duplicates, while a
+# negative offset at the first frame is clamped and marked as padding.
+query IIIIIIIIRR
+SELECT request_id, request_ordinal, delta_ordinal, delta_frame_offset,
+       CAST(is_padding AS INTEGER), episode_index, frame_index,
+       target_frame_index, timestamp, video_timestamp
+FROM lerobot_video_windows(
+    '{TEST_DIR}/lerobot_video_frames',
+    [struct_pack(request_id := 10::BIGINT, episode_index := 0::BIGINT, frame_index := 0::BIGINT)],
+    video_keys := ['observation.images.front'],
+    delta_timestamps := [-0.5, 0.0, 0.5]
+)
+ORDER BY request_ordinal, delta_ordinal;
+----
+10	0	0	-1	1	0	0	0	0.0	0.0
+10	0	1	0	0	0	0	0	0.0	0.0
+10	0	2	1	0	0	0	1	0.5	0.5
+
+# Repeated padded targets select the same decoded frame. A one-byte output
+# budget forces one image per output chunk without changing the result.
+query IIRT
+SELECT delta_ordinal, target_frame_index, decoded_timestamp, md5(image)
+FROM lerobot_video_windows(
+    '{TEST_DIR}/lerobot_video_frames',
+    [struct_pack(request_id := 10::BIGINT, episode_index := 0::BIGINT, frame_index := 0::BIGINT)],
+    video_keys := ['observation.images.front'],
+    delta_timestamps := [-0.5, 0.0, 0.5],
+    max_output_bytes := 1
+)
+ORDER BY delta_ordinal;
+----
+0	0	0.0	520e780c7e7644f58eac8ad5c259a341
+1	0	0.0	520e780c7e7644f58eac8ad5c259a341
+2	1	0.5	09b3f62794209739b33ee60adadcae39
+
+statement error
+SELECT *
+FROM lerobot_video_windows(
+    '{TEST_DIR}/lerobot_video_frames',
+    [struct_pack(request_id := 1::BIGINT, episode_index := 0::BIGINT, frame_index := 0::BIGINT)],
+    delta_timestamps := [0.2]
+);
+----
+not a multiple of 1/fps
 
 statement error
 SELECT *
