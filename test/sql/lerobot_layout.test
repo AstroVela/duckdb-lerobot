@@ -1,0 +1,10 @@
+# name: test/sql/lerobot_layout.test
+# description: LeRobot layout paths are normalized without accessing storage
+# group: [lerobot]
+
+require lerobot
+
+query I
+SELECT * FROM lerobot_layout('hf://datasets/lerobot/droid_1.0.1/');
+----
+hf://datasets/lerobot/droid_1.0.1	hf://datasets/lerobot/droid_1.0.1/meta/info.json	hf://datasets/lerobot/droid_1.0.1/meta/episodes	hf://datasets/lerobot/droid_1.0.1/data	hf://datasets/lerobot/droid_1.0.1/videos
