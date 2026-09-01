@@ -29,6 +29,10 @@ authoritative info record. Callers filter episode metadata before the
 extension expands frame Parquet rows. This prevents a query that selects a
 small set of episodes from eagerly scanning or decoding the entire dataset.
 
+The initial SQL interface for that second phase is:
+
+    SELECT * FROM lerobot_episode_frames(root, [episode_index, ...]);
+
 The initial `lerobot_episodes` implementation is a C++-registered table
 macro over DuckDB's native Parquet scanner. The dedicated scan will replace it
 only after it preserves the same relational contract and demonstrates a

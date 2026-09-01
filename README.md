@@ -32,6 +32,13 @@ SELECT * FROM lerobot_episodes('hf://datasets/lerobot/droid_1.0.1');
 
 -- Read the authoritative version and path-template metadata.
 SELECT * FROM lerobot_info('hf://datasets/lerobot/droid_1.0.1');
+
+-- Expand only the episode rows selected by an earlier metadata query.
+SELECT *
+FROM lerobot_episode_frames(
+  'hf://datasets/lerobot/droid_1.0.1',
+  [4, 7, 12]
+);
 ```
 
 | root | info_path | episodes_path | data_path | videos_path |

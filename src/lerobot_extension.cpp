@@ -124,7 +124,7 @@ void LerobotV3ShardPathsFunction(ClientContext &, TableFunctionInput &input, Dat
 	bind_data.emitted = true;
 }
 
-unique_ptr<CreateMacroInfo> CreateTableMacro(const string &name, const string &parameter, const string &query) {
+unique_ptr<CreateMacroInfo> CreateTableMacro(const string &name, const vector<string> &parameters, const string &query) {
 	Parser parser;
 	parser.ParseQuery(query);
 	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
@@ -133,7 +133,9 @@ unique_ptr<CreateMacroInfo> CreateTableMacro(const string &name, const string &p
 
 	auto node = std::move(parser.statements[0]->Cast<SelectStatement>().node);
 	auto macro = make_uniq<TableMacroFunction>(std::move(node));
-	macro->parameters.push_back(make_uniq<ColumnRefExpression>(parameter));
+	for (const auto &parameter : parameters) {
+		macro->parameters.push_back(make_uniq<ColumnRefExpression>(parameter));
+	}
 
 	auto info = make_uniq<CreateMacroInfo>(CatalogType::TABLE_MACRO_ENTRY);
 	info->name = name;
@@ -144,7 +146,7 @@ unique_ptr<CreateMacroInfo> CreateTableMacro(const string &name, const string &p
 }
 
 unique_ptr<CreateMacroInfo> CreateLerobotEpisodesMacro() {
-	return CreateTableMacro("lerobot_episodes", "root", R"(
+	return CreateTableMacro("lerobot_episodes", {"root"}, R"(
 		SELECT *
 		FROM read_parquet(
 			root || '/meta/episodes/**/*.parquet',
@@ -154,9 +156,20 @@ unique_ptr<CreateMacroInfo> CreateLerobotEpisodesMacro() {
 }
 
 unique_ptr<CreateMacroInfo> CreateLerobotInfoMacro() {
-	return CreateTableMacro("lerobot_info", "root", R"(
+	return CreateTableMacro("lerobot_info", {"root"}, R"(
 		SELECT *
 		FROM read_json(root || '/meta/info.json')
+	)");
+}
+
+unique_ptr<CreateMacroInfo> CreateLerobotEpisodeFramesMacro() {
+	return CreateTableMacro("lerobot_episode_frames", {"root", "episode_indices"}, R"(
+		SELECT *
+		FROM read_parquet(
+			root || '/data/**/*.parquet',
+			union_by_name = true
+		)
+		WHERE list_contains(episode_indices, episode_index)
 	)");
 }
 
@@ -174,6 +187,8 @@ void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(*episodes);
 	auto info = CreateLerobotInfoMacro();
 	loader.RegisterFunction(*info);
+	auto frames = CreateLerobotEpisodeFramesMacro();
+	loader.RegisterFunction(*frames);
 }
 
 } // namespace

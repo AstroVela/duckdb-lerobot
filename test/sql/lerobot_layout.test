@@ -7,9 +7,10 @@ require lerobot
 query I
 SELECT function_name
 FROM duckdb_functions()
-WHERE function_name IN ('lerobot_episodes', 'lerobot_info')
+WHERE function_name IN ('lerobot_episode_frames', 'lerobot_episodes', 'lerobot_info')
 ORDER BY function_name;
 ----
+lerobot_episode_frames
 lerobot_episodes
 lerobot_info
 
