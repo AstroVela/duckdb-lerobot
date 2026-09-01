@@ -8,6 +8,7 @@ not an inferred directory convention:
 - [LeRobot v3 format](https://huggingface.co/docs/lerobot/lerobot-dataset-v3)
 - [LeRobot metadata implementation](https://github.com/huggingface/lerobot/blob/main/src/lerobot/datasets/dataset_metadata.py)
 - [Daft LeRobot reader](https://github.com/Eventual-Inc/Daft/blob/main/daft/datasets/lerobot.py)
+- [AstroVela DuckDB Iceberg scan](https://github.com/AstroVela/duckdb-iceberg/blob/main/src/function/scan/iceberg_scan.cpp)
 
 `meta/info.json` is authoritative. In particular, `codebase_version`,
 `data_path`, `video_path`, `fps`, and video-valued `features` control how a
@@ -33,10 +34,23 @@ The initial SQL interface for that second phase is:
 
     SELECT * FROM lerobot_episode_frames(root, [episode_index, ...]);
 
-The initial `lerobot_episodes` implementation is a C++-registered table
-macro over DuckDB's native Parquet scanner. The dedicated scan will replace it
-only after it preserves the same relational contract and demonstrates a
-measured benefit.
+`lerobot_info`, `lerobot_episodes`, and `lerobot_frames` are native C++ table
+functions. Following DuckDB Iceberg's implementation pattern, each clones a
+registered DuckDB scan function set and replaces only its `MultiFileReader`.
+The LeRobot reader normalizes the dataset root and expands it to the v3 JSON or
+Parquet glob, leaving schema inference, parallel reads, projection pushdown,
+filter pushdown, and row-group pruning to DuckDB.
+
+`lerobot_episode_frames` is a bind-replacement table function. It constructs a
+relational `episode_index IN (...)` predicate over `lerobot_frames`, rather
+than executing or materializing an intermediate result inside the extension.
+The optimizer can therefore push that predicate into the Parquet scan. An
+empty episode list becomes an empty relation, and negative or NULL indices are
+rejected during binding.
+
+The current scanner expands the standard v3 paths shown above. Reading custom
+`data_path` and `video_path` templates from the authoritative info record, then
+using episode metadata to prune whole frame files, is the next scanner stage.
 
 ## Metadata required for a v3 episode
 
@@ -63,3 +77,10 @@ for Vane's future C++ FFmpeg decoder.
 The first native scanner targets v3. v2.0/v2.1 support is a separate adapter:
 those datasets use `meta/episodes.jsonl` and episode-per-file media, so they
 must not be silently routed through the v3 scanner.
+
+The implementation follows DuckDB extension conventions and uses DuckDB's
+container and ownership types rather than `std::vector` or `std::unique_ptr`.
+Extension-owned syntax is limited to C++11, but the CMake project inherits its
+actual language standard from the host: official DuckDB currently requires
+C++17, whereas the Vane-compatible DuckDB tree can still build the extension
+with C++11.

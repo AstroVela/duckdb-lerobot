@@ -2,13 +2,18 @@ cmake_minimum_required(VERSION 3.16)
 
 project(DuckDBLerobotExtension)
 
-# DuckDB adds an out-of-tree extension as a subdirectory. In that mode its
-# build macros are already available, and only the extension sources belong in
-# this CMake scope. When this repository is configured directly, the pinned
-# DuckDB submodule supplies those macros and the shell target.
-if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    set(DUCKDB_EXTENSION_CONFIGS "${CMAKE_CURRENT_SOURCE_DIR}/extension_config.cmake")
-    add_subdirectory(duckdb)
-else()
-    add_subdirectory(src)
+# Inherit the standard selected by the embedding DuckDB build. The extension
+# source stays within the C++11 language subset, but current official DuckDB
+# headers require C++17 and must not be downgraded here.
+
+# This file is evaluated by DuckDB after extension_config.cmake points at this
+# repository. Configure from the pinned DuckDB source tree (or use `make`) so
+# DuckDB's extension build helpers are available here.
+if(NOT COMMAND build_loadable_extension)
+    message(FATAL_ERROR
+        "Configure with: cmake -S duckdb -B build/release "
+        "-DDUCKDB_EXTENSION_CONFIGS=${CMAKE_CURRENT_SOURCE_DIR}/extension_config.cmake"
+    )
 endif()
+
+add_subdirectory(src)

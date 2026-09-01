@@ -7,7 +7,7 @@ namespace duckdb {
 class LerobotExtension : public Extension {
 public:
 	void Load(ExtensionLoader &loader) override;
-	std::string Name() override;
+	string Name() override;
 };
 
 } // namespace duckdb

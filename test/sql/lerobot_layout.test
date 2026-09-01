@@ -2,24 +2,34 @@
 # description: LeRobot layout paths are normalized without accessing storage
 # group: [lerobot]
 
+require parquet
+
+require json
+
 require lerobot
 
-query I
-SELECT function_name
+query T
+SELECT DISTINCT function_name
 FROM duckdb_functions()
-WHERE function_name IN ('lerobot_episode_frames', 'lerobot_episodes', 'lerobot_info')
+WHERE function_name IN ('lerobot_episode_frames', 'lerobot_episodes', 'lerobot_frames', 'lerobot_info')
 ORDER BY function_name;
 ----
 lerobot_episode_frames
 lerobot_episodes
+lerobot_frames
 lerobot_info
 
-query I
+query TTTTT
 SELECT * FROM lerobot_layout('hf://datasets/lerobot/droid_1.0.1/');
 ----
 hf://datasets/lerobot/droid_1.0.1	hf://datasets/lerobot/droid_1.0.1/meta/info.json	hf://datasets/lerobot/droid_1.0.1/meta/episodes	hf://datasets/lerobot/droid_1.0.1/data	hf://datasets/lerobot/droid_1.0.1/videos
 
-query I
+query T
+SELECT root FROM lerobot_layout('lerobot/droid_1.0.1');
+----
+hf://datasets/lerobot/droid_1.0.1
+
+query TTT
 SELECT *
 FROM lerobot_v3_shard_paths('hf://datasets/lerobot/droid_1.0.1', 'observation.images.wrist', 2, 17);
 ----

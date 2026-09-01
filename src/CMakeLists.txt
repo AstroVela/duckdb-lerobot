@@ -1,4 +1,8 @@
-set(EXTENSION_SOURCES lerobot_extension.cpp)
+set(EXTENSION_SOURCES
+    lerobot_extension.cpp
+    function/lerobot_functions.cpp
+    function/scan/lerobot_scan.cpp
+)
 
 include_directories(include)
 
