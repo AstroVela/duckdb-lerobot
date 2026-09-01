@@ -27,6 +27,7 @@ private:
 	static TableFunctionSet GetVideoMetadataCacheFunction();
 	static TableFunctionSet GetVideoRoutesFunction();
 	static TableFunctionSet GetEpisodeFramesFunction();
+	static TableFunctionSet GetVideoFramesFunction();
 };
 
 } // namespace duckdb

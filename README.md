@@ -29,6 +29,15 @@ separate lazy cache, so a frame-only query does not pay their memory or metadata
 projection cost. Neither cache duplicates Parquet footers, row-group
 statistics, or data blocks; those remain native DuckDB responsibilities.
 
+Native video decode is available as the third stage. `lerobot_video_frames`
+reads only the selected episodes' frame timestamps, adds each episode's video
+offset, groups work by MP4 shard, and decodes independent shards in parallel.
+Targets within a shard are timestamp-sorted and split at gaps larger than 10
+seconds. Each shard is opened once; each cluster seeks backward to the
+preceding keyframe and decodes forward to the closest frame within half a frame
+period. Results are small Arrow-compatible batches of interleaved RGB24 bytes,
+not Python image objects.
+
 `lerobot_layout(root)` and `lerobot_v3_shard_paths(...)` expose the canonical
 layout without touching storage. A bare Hugging Face repository ID such as
 `lerobot/droid_1.0.1` is normalized to `hf://datasets/lerobot/droid_1.0.1`.
@@ -76,6 +85,20 @@ FROM lerobot_video_routes(
   video_keys := ['observation.images.wrist']
 );
 
+-- Decode selected frame rows. The image column is raw HWC RGB24; dimensions
+-- and the timestamp actually selected by FFmpeg are returned alongside it.
+SELECT episode_index, frame_index, video_key,
+       video_timestamp, decoded_timestamp,
+       width, height, channels, image
+FROM lerobot_video_frames(
+  'hf://datasets/lerobot/droid_1.0.1',
+  [0],
+  video_keys := ['observation.images.wrist'],
+  frame_indices := [0, 1, 2],
+  width := 320,
+  height := 240
+);
+
 -- Inspect the data route cache. Set refresh := true after an in-place
 -- metadata update that does not publish a new dataset revision.
 SELECT *
@@ -92,9 +115,10 @@ FROM lerobot_video_metadata_cache('hf://datasets/lerobot/droid_1.0.1');
 
 ## Roadmap
 
-1. Shard-aware, batched video decode into Arrow-compatible image batches.
-2. Native state/proprioception expressions and episode trimming.
-3. Remote-revision benchmark coverage for metadata cold/warm paths.
+1. Native state/proprioception expressions and episode trimming.
+2. Remote-revision benchmarks for decode cold/warm paths and byte ranges.
+3. Optional hardware-accelerated FFmpeg backends after the CPU contract is
+   stable.
 
 ## Metadata and Parquet caching
 
@@ -114,6 +138,13 @@ row-group min/max pruning, parallel reads, and external-file caching. DuckDB's
 optional `parquet_metadata_cache` setting can therefore be used without any
 LeRobot-specific footer cache.
 
+Decoded images are deliberately not cached by this extension: they are large,
+often consumed once by training, and cache policy belongs with the Vane actor or
+model pipeline. Video reads go through DuckDB's `FileSystem`, so local files,
+`hf://`, credentials, and any caching provided by the host filesystem use the
+same path as native scans. Within one decode query the FFmpeg container and
+conversion context are reused for every target on the same shard.
+
 Model inference, such as hand-pose or reward scoring, remains a Vane GPU actor
 UDF concern; this extension owns the data-plane hot path.
 
@@ -129,6 +160,27 @@ shell with the extension preloaded:
 git submodule update --init --recursive
 make
 ```
+
+The metadata and Parquet functions build without FFmpeg. Native video decode is
+enabled automatically when `pkg-config` can find `libavformat`, `libavcodec`,
+`libavutil`, and `libswscale`; on Debian/Ubuntu the corresponding development
+packages can be installed with:
+
+```bash
+sudo apt-get install pkg-config libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+```
+
+Use `-DLEROBOT_ENABLE_FFMPEG=OFF` for a metadata-only build. Run the deterministic
+H.264 decode test explicitly with:
+
+```bash
+LEROBOT_FFMPEG_TESTS=1 make test
+```
+
+`frame_indices` is the pre-decode sampling control and should be used for sparse
+training reads. `tolerance` defaults to half a frame period, `cluster_gap`
+defaults to 10 seconds, and `batch_size` defaults to 16 output rows so raw RGB
+frames do not inflate a standard DuckDB vector to excessive memory.
 
 Vane integration is tested against the matching official DuckDB release; Vane
 fork-specific integration stays in the Vane repository rather than leaking

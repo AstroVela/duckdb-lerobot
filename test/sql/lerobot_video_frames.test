@@ -1,0 +1,194 @@
+# name: test/sql/lerobot_video_frames.test
+# description: Shard-aware native FFmpeg decode aligns LeRobot frame timestamps
+# group: [lerobot]
+
+require-env LEROBOT_FFMPEG_TESTS
+
+require parquet
+
+require json
+
+require lerobot
+
+# Create the dataset and metadata directories without relying on shell helpers.
+statement ok
+COPY (SELECT 0 AS bootstrap, 1 AS payload)
+TO '{TEST_DIR}/lerobot_video_frames' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (SELECT 0 AS bootstrap, 1 AS payload)
+TO '{TEST_DIR}/lerobot_video_frames/meta' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version,
+           'data.parquet' AS data_path,
+           'video-{file_index:03d}.mp4' AS video_path,
+           2 AS fps,
+           struct_pack(
+               "observation.images.front" := struct_pack(dtype := 'video'),
+               "observation.images.wrist" := struct_pack(dtype := 'video')
+           ) AS features
+) TO '{TEST_DIR}/lerobot_video_frames/meta/info.json' (FORMAT JSON, ARRAY false);
+
+statement ok
+COPY (
+    SELECT episodes.*, 0 AS metadata_chunk FROM (VALUES
+        (0::BIGINT, 0::BIGINT, 0::BIGINT,
+         0::BIGINT, 0::BIGINT, 0.0::DOUBLE, 0.5::DOUBLE,
+         0::BIGINT, 1::BIGINT, 0.0::DOUBLE, 0.5::DOUBLE),
+        (1::BIGINT, 0::BIGINT, 0::BIGINT,
+         0::BIGINT, 0::BIGINT, 1.0::DOUBLE, 1.5::DOUBLE,
+         0::BIGINT, 1::BIGINT, 1.0::DOUBLE, 1.5::DOUBLE)
+    ) AS episodes(
+        episode_index,
+        "data/chunk_index",
+        "data/file_index",
+        "videos/observation.images.front/chunk_index",
+        "videos/observation.images.front/file_index",
+        "videos/observation.images.front/from_timestamp",
+        "videos/observation.images.front/to_timestamp",
+        "videos/observation.images.wrist/chunk_index",
+        "videos/observation.images.wrist/file_index",
+        "videos/observation.images.wrist/from_timestamp",
+        "videos/observation.images.wrist/to_timestamp"
+    )
+) TO '{TEST_DIR}/lerobot_video_frames/meta/episodes'
+  (FORMAT PARQUET, PARTITION_BY ('metadata_chunk'));
+
+statement ok
+COPY (
+    SELECT * FROM (VALUES
+        (0::BIGINT, 0::BIGINT, 0.0::DOUBLE),
+        (0::BIGINT, 1::BIGINT, 0.5::DOUBLE),
+        (0::BIGINT, 4::BIGINT, 0.25::DOUBLE),
+        (1::BIGINT, 2::BIGINT, 0.0::DOUBLE),
+        (1::BIGINT, 3::BIGINT, 0.5::DOUBLE)
+    ) AS frames(episode_index, frame_index, timestamp)
+) TO '{TEST_DIR}/lerobot_video_frames/data.parquet' (FORMAT PARQUET);
+
+# Four 16x16 H.264 frames at 2 FPS. Keeping the tiny fixture inline makes the
+# SQLLogic test independent of its process working directory.
+statement ok
+COPY (
+    SELECT unhex(
+        '000000206674797069736f6d0000020069736f6d69736f32617663316d703431000003556d6f6f760000006c6d766864000000000000000000000000000003e8000007d000010000010000000000000000000000000100000000000000000000000000000001000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000020000027f7472616b0000005c746b68640000000300000000000000000000000100000000000007d000000000000000000000000000000000000100000000000000000000000000000001000000000000000000000000000040000000001000000010000000000024656474730000001c656c73740000000000000001000007d00000200000010000000001f76d646961000000206d646864000000000000000000000000000040000000800055c400000000002d68646c72000000000000000076696465000000000000000000000000566964656f48616e646c657200000001a26d696e6600000014766d68640000000100000000000000000000002464696e660000001c6472656600000000000000010000000c75726c2000000001000001627374626c000000be737473640000000000000001000000ae61766331000000000000000100000000000000000000000000000000001000100048000000480000000000000001154c61766336302e33312e313032206c696278323634000000000000000000000018ffff00000034617663430164000affe100176764000aace47b011000000300100000030040f122512001000668ebe3cb22c0fdf8f80000000010706173700000000100000001000000146274727400000000000013bc000013bc0000001873747473000000000000000100000004000020000000001873747373000000000000000200000001000000030000001863747473000000000000000100000004000020000000001c737473630000000000000001000000010000000400000001000000247374737a0000000000000000000000040000038c0000004b000000eb0000002d000000147374636f00000000000000010000038500000062756474610000005a6d657461000000000000002168646c7200000000000000006d6469726170706c0000000000000000000000002d696c737400000025a9746f6f0000001d6461746100000001000000004c61766636302e31362e3130300000000866726565000004f76d646174000002a90605ffffa5dc45e9bde6d948b7962cd820d923eeef78323634202d20636f7265203136342072333130382033316531396639202d20482e3236342f4d5045472d342041564320636f646563202d20436f70796c65667420323030332d32303233202d20687474703a2f2f7777772e766964656f6c616e2e6f72672f783236342e68746d6c202d206f7074696f6e733a2063616261633d31207265663d33206465626c6f636b3d313a303a3020616e616c7973653d3078333a3078313133206d653d686578207375626d653d37207073793d31207073795f72643d312e30303a302e3030206d697865645f7265663d31206d655f72616e67653d3136206368726f6d615f6d653d31207472656c6c69733d31203878386463743d312063716d3d3020646561647a6f6e653d32312c313120666173745f70736b69703d31206368726f6d615f71705f6f66667365743d2d3220746872656164733d31206c6f6f6b61686561645f746872656164733d3120736c696365645f746872656164733d30206e723d3020646563696d6174653d3120696e7465726c616365643d3020626c757261795f636f6d7061743d3020636f6e73747261696e65645f696e7472613d3020626672616d65733d3120625f707972616d69643d3020625f61646170743d3120625f626961733d30206469726563743d3120776569676874623d31206f70656e5f676f703d3020776569676874703d32206b6579696e743d32206b6579696e745f6d696e3d32207363656e656375743d3020696e7472615f726566726573683d302072635f6c6f6f6b61686561643d322072633d637266206d62747265653d31206372663d32332e302071636f6d703d302e36302071706d696e3d302071706d61783d3639207170737465703d342069705f726174696f3d312e34302061713d313a312e30300080000000db65888407ff5df02c6397dc8e5de0367e650b7111853d7828e6f3ac70dc716b9fbcc0616b71a05860979c67a99e63c00922334832f120f5ffde06823ec08a2f582a3603521ae3854b4e8c40c5e9cedbe753d06c737918e2504c9631ecd0f4f79921bb7233f5db2faca6991c6f5acfd03bdf82268c5b914ec93442484453753d0721663082f2edc2031d4902b11f0c19600326257816b28d28a62f02a8be3e40c76567fb1dc742ad2b1b7c598640724addc2a44f88de252177268b097e0130fccf8421383d5814c3d3841028e96b6797e8b822205b9ecb2b79a325fd00000047419a25b127bbba60d13635ec749c38dccf18016c116116fe6055c14ad6b18657b6d47c8ea00469cac99027a2335a167f56cbfb428fea360f70f8c3e7877b9799c096ccb0d141bc000000e765888201ff5df02c6397dc8e5dae815fa11add80d88437cf94b3149981a01b256004c26a00d6a9edcb88140a3eb7554b260713e38001cf5c16d3243a5bdd2160557690e675892d10e94a31a0f13908093a74887f61382b591e83ffe46ed56a733225457a48a6641c287444fa29db2e9c861fa4201a36e805f5fab98dc1b4930041bdeb93122e82111a227f7847751cb48d2e23df1ab34d55679fc35522b81b71f9d4a0776b3d58e121d2ee87ec76156e06e197b122a044ca3086ab3b24f0ca898e53eda2e1ca14f399e02b7e18b5401a4376c8b690a6baf31d18407d0501daba9fa2eba6e69db900000029419a25b127bbbda3da8707d99c59811c047a2a2ee2d8a253bcdb177e75d048c3633a5a80494f62dda0'
+    ) AS content
+) TO '{TEST_DIR}/lerobot_video_frames/video-000.mp4' (FORMAT BLOB);
+
+statement ok
+COPY (
+    SELECT content
+    FROM read_blob('{TEST_DIR}/lerobot_video_frames/video-000.mp4')
+) TO '{TEST_DIR}/lerobot_video_frames/video-001.mp4' (FORMAT BLOB);
+
+query IIRRIIIII
+SELECT episode_index, frame_index, video_timestamp, decoded_timestamp,
+       width, height, channels, octet_length(image), length(md5(image))
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_frames',
+    [1, 0, 1],
+    video_keys := ['observation.images.front'],
+    frame_indices := [3, 2, 1, 0, 0],
+    cluster_gap := 0.1
+)
+ORDER BY frame_index;
+----
+0	0	0.0	0.0	16	16	3	768	32
+0	1	0.5	0.5	16	16	3	768	32
+1	2	1.0	1.0	16	16	3	768	32
+1	3	1.5	1.5	16	16	3	768	32
+
+# Two camera shards become independent parallel jobs; each shard is opened
+# once for this contiguous timestamp cluster.
+query III
+SELECT count(*), count(DISTINCT video_path), count(DISTINCT md5(image))
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_frames',
+    [0, 1],
+    frame_indices := [0, 1, 2, 3],
+    batch_size := 1
+);
+----
+8	2	4
+
+query IIII
+SELECT min(width), max(width), min(octet_length(image)), max(octet_length(image))
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_frames',
+    [0],
+    video_keys := ['observation.images.front'],
+    frame_indices := [0, 1],
+    width := 8,
+    height := 6
+);
+----
+8	8	144	144
+
+# These hashes are the PyAV rgb24 output resized with Pillow NEAREST, matching
+# the current Daft LeRobot decoder's pixel contract.
+query IT
+SELECT frame_index, md5(image)
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_frames',
+    [0],
+    video_keys := ['observation.images.front'],
+    frame_indices := [0, 1],
+    width := 8,
+    height := 6
+)
+ORDER BY frame_index;
+----
+0	499a430c62bdd056e51ccd6dab4ea9c3
+1	6fc8ed6bd6221ef2e8f6303f2d34c5bf
+
+# A target exactly between two frames resolves to the earlier frame, matching
+# LeRobot/PyTorch argmin tie behaviour.
+query IR
+SELECT count(DISTINCT md5(image)), max(decoded_timestamp)
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_frames',
+    [0],
+    video_keys := ['observation.images.front'],
+    frame_indices := [0, 4]
+);
+----
+1	0.0
+
+statement error
+SELECT *
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_frames',
+    [0],
+    video_keys := ['observation.images.front'],
+    frame_indices := [4],
+    tolerance := 0.01
+);
+----
+No frame in LeRobot video
+
+query I
+SELECT count(*)
+FROM lerobot_video_frames('{TEST_DIR}/lerobot_video_frames', []);
+----
+0
+
+statement error
+SELECT *
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_frames',
+    [0],
+    width := 8
+);
+----
+width and height must either both be zero or both be positive
+
+statement error
+SELECT *
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_frames',
+    [0],
+    batch_size := 0
+);
+----
+batch_size must be between 1

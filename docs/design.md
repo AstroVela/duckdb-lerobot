@@ -94,7 +94,7 @@ per video key plus `episode_index`.
 - for each camera, `videos/{key}/chunk_index`,
   `videos/{key}/file_index`, `from_timestamp`, and `to_timestamp`.
 
-## Video invariant
+## Video decode
 
 MP4 shards contain several episodes. `lerobot_video_routes` implements the
 episode-to-shard and timestamp-range portion of the mapping. A requested frame
@@ -102,11 +102,42 @@ is then located by:
 
     absolute_timestamp = videos/{key}/from_timestamp + frame.timestamp
 
-It must never be addressed by `frame_index` alone. The future decoder groups
-batch rows by full video-file identity, sorts timestamps, clusters nearby
-targets, seeks to the preceding keyframe, and decodes forward to the closest
-frame within half a frame period. This is the approach Daft uses and is the
-contract for Vane's C++ FFmpeg decoder stage.
+It must never be addressed by `frame_index` alone. `lerobot_video_frames`
+materializes the three alignment columns from only the routed data shards,
+expands the requested camera routes, and creates one parallel work item per
+distinct video path. Targets are sorted within each work item. A gap greater
+than 10 seconds starts a new seek cluster, but the DuckDB file handle, FFmpeg
+container, codec, and RGB conversion context remain open for the whole shard.
+
+Every cluster seeks backward to the preceding keyframe and decodes in display
+timestamp order. Once a decoded timestamp crosses a target, the decoder picks
+the closer of that frame and its predecessor; ties select the predecessor. A
+match farther away than the configured tolerance is rejected. The default
+tolerance is `0.5 / fps`, matching LeRobot and Daft. A no-progress budget of
+20,000 decoded frames prevents corrupt timestamp metadata from turning into an
+unbounded scan, while resetting after every matched target permits long dense
+episodes to stream normally.
+
+The table function emits at most 16 rows per call by default. Each row includes
+the episode-local timestamp, absolute requested timestamp, actual decoded
+timestamp, dimensions, three channels, and an interleaved HWC RGB24 `BLOB`.
+Optional width and height use the same two-stage pixel contract as Daft: PyAV
+RGB24 conversion at native dimensions followed by Pillow-compatible
+nearest-neighbour resize. A `frame_indices` named argument filters the native
+Parquet timestamp query before decode; callers should prefer it over an outer
+SQL filter for sparse sampling.
+
+FFmpeg reads through a seekable custom `AVIOContext` backed by DuckDB's
+`FileSystem`. This preserves `hf://` and other filesystem extensions, secrets,
+and any caching supplied by the host filesystem instead of teaching FFmpeg
+about every remote URI scheme. Shard jobs share only immutable bind data; each
+DuckDB worker owns its file, codec, frames, and scaler, so decoding needs no
+global codec lock.
+
+There is no decoded-frame cache. The dataset and video-route `ObjectCache`
+entries remain the small reusable control plane, DuckDB owns remote byte/block
+and Parquet caches, and Vane/model actors decide whether decoded tensors are
+worth retaining.
 
 ## Compatibility
 
