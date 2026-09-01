@@ -20,15 +20,25 @@ projection, filter, parallel I/O, and row-group pruning paths.
 Episode-scoped scans additionally cache the small LeRobot control plane:
 `meta/info.json` plus the `episode_index` to data-shard mapping from
 `meta/episodes`. The cache resolves custom `data_path` templates and hands an
-explicit, deduplicated file list to DuckDB before Parquet binding. It does not
-duplicate Parquet footer metadata, row-group statistics, or block caching;
-those remain native DuckDB responsibilities.
+explicit, deduplicated file list to DuckDB before Parquet binding.
+
+Video routing is available as a metadata-only second stage. It resolves each
+requested episode and video feature to its full MP4 path and timestamp range,
+without opening or decoding the MP4. Its episode-camera routes live in a
+separate lazy cache, so a frame-only query does not pay their memory or metadata
+projection cost. Neither cache duplicates Parquet footers, row-group
+statistics, or data blocks; those remain native DuckDB responsibilities.
 
 `lerobot_layout(root)` and `lerobot_v3_shard_paths(...)` expose the canonical
 layout without touching storage. A bare Hugging Face repository ID such as
 `lerobot/droid_1.0.1` is normalized to `hf://datasets/lerobot/droid_1.0.1`.
+Remote `hf://` reads require the host's `httpfs` extension; released DuckDB
+builds can normally auto-install and auto-load it, or it can be loaded
+explicitly before `lerobot`.
 
 ```sql
+INSTALL httpfs;
+LOAD httpfs;
 LOAD lerobot;
 
 SELECT * FROM lerobot_layout('hf://datasets/lerobot/droid_1.0.1');
@@ -56,10 +66,24 @@ FROM lerobot_episode_frames(
   [4, 7, 12]
 );
 
--- Inspect the derived route cache. Set refresh := true after an in-place
+-- Resolve the cameras for those episodes without opening the video files.
+-- Omit video_keys to select every video-valued feature in info.json.
+SELECT episode_index, video_key, video_path,
+       from_timestamp, to_timestamp, fps
+FROM lerobot_video_routes(
+  'hf://datasets/lerobot/droid_1.0.1',
+  [4, 7, 12],
+  video_keys := ['observation.images.wrist']
+);
+
+-- Inspect the data route cache. Set refresh := true after an in-place
 -- metadata update that does not publish a new dataset revision.
 SELECT *
 FROM lerobot_metadata_cache('hf://datasets/lerobot/droid_1.0.1');
+
+-- Materialize and inspect the separate lazy video route cache.
+SELECT *
+FROM lerobot_video_metadata_cache('hf://datasets/lerobot/droid_1.0.1');
 ```
 
 | root | info_path | episodes_path | data_path | videos_path |
@@ -68,25 +92,27 @@ FROM lerobot_metadata_cache('hf://datasets/lerobot/droid_1.0.1');
 
 ## Roadmap
 
-1. Episode-to-video-shard timestamp mapping.
-2. Shard-aware, batched video decode into Arrow-compatible image batches.
-3. Native state/proprioception expressions and episode trimming.
+1. Shard-aware, batched video decode into Arrow-compatible image batches.
+2. Native state/proprioception expressions and episode trimming.
+3. Remote-revision benchmark coverage for metadata cold/warm paths.
 
 ## Metadata and Parquet caching
 
-The route cache is a database-instance `ObjectCache` entry keyed by normalized
-dataset root. Entries are immutable and memory-accounted, so DuckDB can evict
-them. A size/mtime/version-tag fingerprint of `meta/info.json` invalidates a
-stale entry automatically; `refresh := true` forces a rebuild for non-versioned
-or manually edited datasets. Versioned Hugging Face revisions should normally
-need no explicit refresh.
+The data and video route caches are separate database-instance `ObjectCache`
+entries keyed by normalized dataset root. Entries are immutable and
+memory-accounted, so DuckDB can evict them. A size/mtime/version-tag fingerprint
+of `meta/info.json` invalidates stale entries automatically; `refresh := true`
+forces a rebuild for non-versioned or manually edited datasets. Versioned
+Hugging Face revisions should normally need no explicit refresh.
 
-The route builder projects only `episode_index`, `data/chunk_index`, and
-`data/file_index` from episode metadata. Once it has selected the relevant data
-shards, the native `parquet_scan` owns schema/footer reads, projection and
-filter pushdown, row-group min/max pruning, parallel reads, and external-file
-caching. DuckDB's optional `parquet_metadata_cache` setting can therefore be
-used without any LeRobot-specific footer cache.
+The data route builder projects only `episode_index`, `data/chunk_index`, and
+`data/file_index` from episode metadata. The lazy video route builder projects
+only `episode_index` and each video feature's chunk, file, and timestamp-range
+columns. Once the extension has selected the relevant paths, native
+`parquet_scan` owns schema/footer reads, projection and filter pushdown,
+row-group min/max pruning, parallel reads, and external-file caching. DuckDB's
+optional `parquet_metadata_cache` setting can therefore be used without any
+LeRobot-specific footer cache.
 
 Model inference, such as hand-pose or reward scoring, remains a Vane GPU actor
 UDF concern; this extension owns the data-plane hot path.
@@ -115,6 +141,7 @@ Extension-owned code uses DuckDB's native `string`, `vector`, `unique_ptr`,
 language subset so the same source remains compatible with Vane's DuckDB fork.
 
 The build does not force `-std=c++11`; it inherits the standard selected by the
-host DuckDB tree. Current official DuckDB and AstroVela's current
-`duckdb-iceberg` both require C++17, while older/Vane DuckDB builds can compile
-this extension as C++11.
+host DuckDB tree. Current official DuckDB builds as C++17 and the current Vane
+tree builds as C++20. Extension-owned translation units are additionally
+syntax-checked with `-std=c++11` against the Vane headers, keeping this layer
+portable even though either host can require a newer standard internally.

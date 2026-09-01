@@ -16,7 +16,9 @@ WHERE function_name IN (
     'lerobot_episodes',
     'lerobot_frames',
     'lerobot_info',
-    'lerobot_metadata_cache'
+    'lerobot_metadata_cache',
+    'lerobot_video_metadata_cache',
+    'lerobot_video_routes'
 )
 ORDER BY function_name;
 ----
@@ -25,6 +27,8 @@ lerobot_episodes
 lerobot_frames
 lerobot_info
 lerobot_metadata_cache
+lerobot_video_metadata_cache
+lerobot_video_routes
 
 query TTTTT
 SELECT * FROM lerobot_layout('hf://datasets/lerobot/droid_1.0.1/');

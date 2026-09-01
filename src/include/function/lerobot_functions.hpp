@@ -24,6 +24,8 @@ private:
 	static TableFunctionSet GetEpisodesFunction(ExtensionLoader &loader);
 	static TableFunctionSet GetFramesFunction(ExtensionLoader &loader);
 	static TableFunctionSet GetMetadataCacheFunction();
+	static TableFunctionSet GetVideoMetadataCacheFunction();
+	static TableFunctionSet GetVideoRoutesFunction();
 	static TableFunctionSet GetEpisodeFramesFunction();
 };
 

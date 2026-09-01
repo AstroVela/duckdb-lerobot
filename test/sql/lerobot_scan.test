@@ -23,17 +23,41 @@ statement ok
 COPY (
     SELECT 'v3.0' AS codebase_version,
            'frames/chunk-{chunk_index:02d}/part-{file_index:04d}.parquet' AS data_path,
-           'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
-           30 AS fps
+           'media/{video_key}/chunk-{chunk_index:02d}/clip-{file_index:04d}.mp4' AS video_path,
+           30 AS fps,
+           struct_pack(
+               "observation.images.front" := struct_pack(dtype := 'video'),
+               action := struct_pack(dtype := 'float32'),
+               "observation.images.wrist" := struct_pack(dtype := 'video')
+           ) AS features
 ) TO '{TEST_DIR}/lerobot_scan/meta/info.json' (FORMAT JSON, ARRAY false);
 
 statement ok
 COPY (
     SELECT episodes.*, 0 AS metadata_chunk FROM (VALUES
-        (0::BIGINT, 2::BIGINT, 0::BIGINT, 0::BIGINT),
-        (1::BIGINT, 2::BIGINT, 0::BIGINT, 0::BIGINT),
-        (2::BIGINT, 2::BIGINT, 0::BIGINT, 1::BIGINT)
-    ) AS episodes(episode_index, length, "data/chunk_index", "data/file_index")
+        (0::BIGINT, 2::BIGINT, 0::BIGINT, 0::BIGINT,
+         0::BIGINT, 0::BIGINT, 0.0::DOUBLE, 0.066666::DOUBLE,
+         0::BIGINT, 5::BIGINT, 1.0::DOUBLE, 1.066666::DOUBLE),
+        (1::BIGINT, 2::BIGINT, 0::BIGINT, 0::BIGINT,
+         0::BIGINT, 0::BIGINT, 0.1::DOUBLE, 0.166666::DOUBLE,
+         0::BIGINT, 5::BIGINT, 1.1::DOUBLE, 1.166666::DOUBLE),
+        (2::BIGINT, 2::BIGINT, 0::BIGINT, 1::BIGINT,
+         0::BIGINT, 1::BIGINT, 0.2::DOUBLE, 0.266666::DOUBLE,
+         NULL::BIGINT, NULL::BIGINT, NULL::DOUBLE, NULL::DOUBLE)
+    ) AS episodes(
+        episode_index,
+        length,
+        "data/chunk_index",
+        "data/file_index",
+        "videos/observation.images.front/chunk_index",
+        "videos/observation.images.front/file_index",
+        "videos/observation.images.front/from_timestamp",
+        "videos/observation.images.front/to_timestamp",
+        "videos/observation.images.wrist/chunk_index",
+        "videos/observation.images.wrist/file_index",
+        "videos/observation.images.wrist/from_timestamp",
+        "videos/observation.images.wrist/to_timestamp"
+    )
 ) TO '{TEST_DIR}/lerobot_scan/meta/episodes' (FORMAT PARQUET, PARTITION_BY (metadata_chunk));
 
 # Besides creating frames/chunk-00, this leaves an incompatible, unreferenced
@@ -91,11 +115,73 @@ ORDER BY frame_index;
 2	4
 2	5
 
-query TTIIII
+query TTTIII
 SELECT root, codebase_version, data_path, episode_count, data_file_count, cache_hit
 FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_scan');
 ----
 {TEST_DIR}/lerobot_scan	v3.0	frames/chunk-{chunk_index:02d}/part-{file_index:04d}.parquet	3	2	true
+
+query TIII
+SELECT video_path, fps, video_key_count, cache_hit
+FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_scan');
+----
+media/{video_key}/chunk-{chunk_index:02d}/clip-{file_index:04d}.mp4	30	2	true
+
+query ITTIIRRI
+SELECT episode_index, video_key, video_path, chunk_index, file_index,
+       from_timestamp, to_timestamp, fps
+FROM lerobot_video_routes(
+    '{TEST_DIR}/lerobot_scan',
+    [2, 1, 1],
+    video_keys := [
+        'observation.images.wrist',
+        'observation.images.front',
+        'observation.images.front'
+    ]
+)
+ORDER BY episode_index, video_key;
+----
+1	observation.images.front	{TEST_DIR}/lerobot_scan/media/observation.images.front/chunk-00/clip-0000.mp4	0	0	0.1	0.166666	30
+1	observation.images.wrist	{TEST_DIR}/lerobot_scan/media/observation.images.wrist/chunk-00/clip-0005.mp4	0	5	1.1	1.166666	30
+2	observation.images.front	{TEST_DIR}/lerobot_scan/media/observation.images.front/chunk-00/clip-0001.mp4	0	1	0.2	0.266666	30
+
+query TIIIII
+SELECT video_path, fps, video_key_count, route_count, video_file_count, cache_hit
+FROM lerobot_video_metadata_cache('{TEST_DIR}/lerobot_scan');
+----
+media/{video_key}/chunk-{chunk_index:02d}/clip-{file_index:04d}.mp4	30	2	5	3	true
+
+query I
+SELECT cache_hit
+FROM lerobot_video_metadata_cache('{TEST_DIR}/lerobot_scan', refresh := true);
+----
+false
+
+query I
+SELECT count(*)
+FROM lerobot_video_routes('{TEST_DIR}/lerobot_scan', [0]);
+----
+2
+
+query I
+SELECT count(*)
+FROM lerobot_video_routes(
+    '{TEST_DIR}/lerobot_scan',
+    [0, 1],
+    video_keys := []
+);
+----
+0
+
+statement error
+SELECT *
+FROM lerobot_video_routes(
+    '{TEST_DIR}/lerobot_scan',
+    [0],
+    video_keys := ['observation.images.missing']
+);
+----
+Unknown LeRobot video key 'observation.images.missing'
 
 query I
 SELECT cache_hit
@@ -109,15 +195,26 @@ statement ok
 COPY (
     SELECT 'v3.0' AS codebase_version,
            'frames/chunk-{chunk_index:02d}/part-{file_index:04d}.parquet' AS data_path,
-           'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
+           'media/{video_key}/chunk-{chunk_index:02d}/clip-{file_index:04d}.mp4' AS video_path,
            30 AS fps,
-           3 AS total_episodes
+           3 AS total_episodes,
+           struct_pack(
+               "observation.images.front" := struct_pack(dtype := 'video'),
+               action := struct_pack(dtype := 'float32'),
+               "observation.images.wrist" := struct_pack(dtype := 'video')
+           ) AS features
 ) TO '{TEST_DIR}/lerobot_scan/meta/info.json'
   (FORMAT JSON, ARRAY false, OVERWRITE_OR_IGNORE);
 
 query I
 SELECT cache_hit
 FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_scan');
+----
+false
+
+query I
+SELECT cache_hit
+FROM lerobot_video_metadata_cache('{TEST_DIR}/lerobot_scan');
 ----
 false
 
@@ -138,3 +235,54 @@ SELECT *
 FROM lerobot_episode_frames('{TEST_DIR}/lerobot_scan', [-1]);
 ----
 LeRobot episode indices must be non-negative
+
+statement error
+SELECT *
+FROM lerobot_video_routes('{TEST_DIR}/lerobot_scan', [-1]);
+----
+LeRobot episode indices must be non-negative
+
+# A frame-only v3 dataset does not need video_path or video routing columns.
+statement ok
+COPY (
+    SELECT 0 AS bootstrap, 1 AS payload
+) TO '{TEST_DIR}/lerobot_no_video' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (
+    SELECT 0 AS bootstrap, 1 AS payload
+) TO '{TEST_DIR}/lerobot_no_video/meta' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version,
+           'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet' AS data_path,
+           30 AS fps,
+           struct_pack(action := struct_pack(dtype := 'float32')) AS features
+) TO '{TEST_DIR}/lerobot_no_video/meta/info.json' (FORMAT JSON, ARRAY false);
+
+statement ok
+COPY (
+    SELECT 0::BIGINT AS episode_index,
+           0::BIGINT AS "data/chunk_index",
+           0::BIGINT AS "data/file_index",
+           0 AS metadata_chunk
+) TO '{TEST_DIR}/lerobot_no_video/meta/episodes' (FORMAT PARQUET, PARTITION_BY (metadata_chunk));
+
+query III
+SELECT fps, video_key_count, episode_count
+FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_no_video');
+----
+30	0	1
+
+query IIII
+SELECT video_key_count, route_count, video_file_count, cache_hit
+FROM lerobot_video_metadata_cache('{TEST_DIR}/lerobot_no_video');
+----
+0	0	0	false
+
+query I
+SELECT count(*)
+FROM lerobot_video_routes('{TEST_DIR}/lerobot_no_video', [0]);
+----
+0

@@ -34,6 +34,22 @@ The initial SQL interface for that second phase is:
 
     SELECT * FROM lerobot_episode_frames(root, [episode_index, ...]);
 
+Video alignment is a separate metadata-only phase:
+
+    SELECT *
+    FROM lerobot_video_routes(
+      root,
+      [episode_index, ...],
+      video_keys := ['observation.images.front', ...]
+    );
+
+If `video_keys` is omitted, every feature whose `dtype` is `video` in
+`info.json` is selected. The result contains the episode and key, resolved full
+MP4 path, chunk/file indices, episode-local `from_timestamp` and
+`to_timestamp`, and dataset FPS. Missing all-NULL camera metadata for an
+episode is skipped; a partially NULL route is rejected as corrupt metadata.
+The function does not open the MP4.
+
 `lerobot_info`, `lerobot_episodes`, and `lerobot_frames` are native C++ table
 functions. Following DuckDB Iceberg's implementation pattern, each clones a
 registered DuckDB scan function set and replaces only its `MultiFileReader`.
@@ -50,18 +66,25 @@ pushes the row predicate into those files. An empty or unknown episode set uses
 one known shard only to bind the output schema, then produces no rows; negative
 or NULL indices are rejected during binding.
 
-The route cache stores the authoritative `codebase_version` and `data_path`
-from `meta/info.json`, a sorted compact episode-to-file index, and one copy of
-each resolved shard path. Its database-instance `ObjectCache` entry is
-memory-accounted and immutable. `info.json` size, modification time, and
-version tag form the invalidation marker; callers can also pass
-`refresh := true` to `lerobot_episode_frames` or `lerobot_metadata_cache`.
+The base route cache stores the authoritative `codebase_version`, `data_path`,
+`video_path`, `fps`, and sorted video feature keys from `meta/info.json`, a
+sorted compact episode-to-data-file index, and one copy of each resolved data
+path. A second lazy cache stores compact episode/key/video-file indices,
+timestamps, and one copy of each resolved MP4 path. Keeping the caches separate
+means ordinary frame scans never materialize the larger episode-by-camera
+table. Both database-instance `ObjectCache` entries are memory-accounted and
+immutable. `info.json` size, modification time, and version tag form the
+invalidation marker; callers can also pass `refresh := true` to route or cache
+functions.
 
 This is intentionally above the Parquet layer. DuckDB continues to own footer
 metadata, row-group statistics, the optional `parquet_metadata_cache`, and the
 external file/block cache. The extension neither parses nor duplicates those
-caches. On a route-cache miss, its metadata query projects only the three route
-columns through DuckDB's native Parquet reader.
+caches. On a base route-cache miss, its metadata query projects only the three
+data route columns through DuckDB's native Parquet reader. The video cache is
+not populated until `lerobot_video_routes` or
+`lerobot_video_metadata_cache` is bound; that query projects only four columns
+per video key plus `episode_index`.
 
 ## Metadata required for a v3 episode
 
@@ -73,15 +96,17 @@ columns through DuckDB's native Parquet reader.
 
 ## Video invariant
 
-MP4 shards contain several episodes. A requested frame is located by:
+MP4 shards contain several episodes. `lerobot_video_routes` implements the
+episode-to-shard and timestamp-range portion of the mapping. A requested frame
+is then located by:
 
     absolute_timestamp = videos/{key}/from_timestamp + frame.timestamp
 
-It must never be addressed by `frame_index` alone. The decoder groups batch
-rows by full video-file identity, sorts timestamps, clusters nearby targets,
-seeks to the preceding keyframe, and decodes forward to the closest frame
-within half a frame period. This is the approach Daft uses and is the contract
-for Vane's future C++ FFmpeg decoder.
+It must never be addressed by `frame_index` alone. The future decoder groups
+batch rows by full video-file identity, sorts timestamps, clusters nearby
+targets, seeks to the preceding keyframe, and decodes forward to the closest
+frame within half a frame period. This is the approach Daft uses and is the
+contract for Vane's C++ FFmpeg decoder stage.
 
 ## Compatibility
 
@@ -92,6 +117,7 @@ must not be silently routed through the v3 scanner.
 The implementation follows DuckDB extension conventions and uses DuckDB's
 container and ownership types rather than `std::vector` or `std::unique_ptr`.
 Extension-owned syntax is limited to C++11, but the CMake project inherits its
-actual language standard from the host: official DuckDB currently requires
-C++17, whereas the Vane-compatible DuckDB tree can still build the extension
-with C++11.
+actual language standard from the host: official DuckDB currently builds as
+C++17 and the current Vane tree as C++20. A separate C++11 syntax-only check of
+the extension translation units against Vane's headers enforces the portable
+subset without incorrectly forcing the whole host engine to C++11.

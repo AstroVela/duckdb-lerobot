@@ -10,6 +10,7 @@
 #include "duckdb/main/connection.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 namespace duckdb {
 
@@ -25,6 +26,14 @@ string MetadataQueryPath(const string &path) {
 void ThrowQueryError(const char *description, const QueryResult &result) {
 	throw BinderException("Failed to read LeRobot %s: %s", description, result.GetError());
 }
+
+struct ParsedLerobotInfo {
+	string codebase_version;
+	string data_path_template;
+	string video_path_template;
+	int64_t fps;
+	vector<string> video_keys;
+};
 
 string FormatDecimal(int64_t value, const string &format_spec, const string &field_name) {
 	if (value < 0) {
@@ -64,7 +73,8 @@ string FormatDecimal(int64_t value, const string &format_spec, const string &fie
 	return string(width - result.size(), fill) + result;
 }
 
-string FormatDataPath(const string &path_template, int64_t chunk_index, int64_t file_index) {
+string FormatPathTemplate(const string &path_template, int64_t chunk_index, int64_t file_index, const string *video_key,
+                          const char *path_name) {
 	string result;
 	result.reserve(path_template.size());
 	for (idx_t index = 0; index < path_template.size();) {
@@ -77,7 +87,7 @@ string FormatDataPath(const string &path_template, int64_t chunk_index, int64_t 
 			}
 			const auto close = path_template.find('}', index + 1);
 			if (close == string::npos) {
-				throw BinderException("Unclosed placeholder in LeRobot data_path '%s'", path_template);
+				throw BinderException("Unclosed placeholder in LeRobot %s '%s'", path_name, path_template);
 			}
 			auto placeholder = path_template.substr(index + 1, close - index - 1);
 			const auto colon = placeholder.find(':');
@@ -87,8 +97,13 @@ string FormatDataPath(const string &path_template, int64_t chunk_index, int64_t 
 				result += FormatDecimal(chunk_index, format_spec, field_name);
 			} else if (field_name == "file_index") {
 				result += FormatDecimal(file_index, format_spec, field_name);
+			} else if (field_name == "video_key" && video_key) {
+				if (!format_spec.empty()) {
+					throw BinderException("Unsupported LeRobot path format specifier '%s' for video_key", format_spec);
+				}
+				result += *video_key;
 			} else {
-				throw BinderException("Unsupported placeholder {%s} in LeRobot data_path", placeholder);
+				throw BinderException("Unsupported placeholder {%s} in LeRobot %s", placeholder, path_name);
 			}
 			index = close + 1;
 			continue;
@@ -99,7 +114,7 @@ string FormatDataPath(const string &path_template, int64_t chunk_index, int64_t 
 				index += 2;
 				continue;
 			}
-			throw BinderException("Unmatched closing brace in LeRobot data_path '%s'", path_template);
+			throw BinderException("Unmatched closing brace in LeRobot %s '%s'", path_name, path_template);
 		}
 		result.push_back(ch);
 		index++;
@@ -107,17 +122,41 @@ string FormatDataPath(const string &path_template, int64_t chunk_index, int64_t 
 	return result;
 }
 
-string ResolveDataPath(const string &root, const string &path_template, int64_t chunk_index, int64_t file_index) {
-	auto relative_path = FormatDataPath(path_template, chunk_index, file_index);
+string ResolveDatasetPath(const string &root, const string &path_template, int64_t chunk_index, int64_t file_index,
+                          const string *video_key, const char *path_name) {
+	auto relative_path = FormatPathTemplate(path_template, chunk_index, file_index, video_key, path_name);
 	if (relative_path.empty()) {
-		throw BinderException("LeRobot data_path must not be empty");
+		throw BinderException("LeRobot %s must not be empty", path_name);
 	}
 	if (relative_path[0] == '/' || StringUtil::Contains(relative_path, "://") ||
 	    StringUtil::StartsWith(relative_path, "../") || StringUtil::Contains(relative_path, "/../") ||
 	    StringUtil::EndsWith(relative_path, "/..")) {
-		throw BinderException("LeRobot data_path must stay relative to the dataset root: '%s'", relative_path);
+		throw BinderException("LeRobot %s must stay relative to the dataset root: '%s'", path_name, relative_path);
 	}
 	return root + "/" + relative_path;
+}
+
+string ResolveDataPath(const string &root, const string &path_template, int64_t chunk_index, int64_t file_index) {
+	return ResolveDatasetPath(root, path_template, chunk_index, file_index, nullptr, "data_path");
+}
+
+string ResolveVideoPath(const string &root, const string &path_template, const string &video_key, int64_t chunk_index,
+                        int64_t file_index) {
+	return ResolveDatasetPath(root, path_template, chunk_index, file_index, &video_key, "video_path");
+}
+
+string QuoteIdentifier(const string &identifier) {
+	string result;
+	result.reserve(identifier.size() + 2);
+	result.push_back('"');
+	for (const auto ch : identifier) {
+		if (ch == '"') {
+			result.push_back('"');
+		}
+		result.push_back(ch);
+	}
+	result.push_back('"');
+	return result;
 }
 
 bool IsV3Version(const string &version) {
@@ -125,14 +164,92 @@ bool IsV3Version(const string &version) {
 	       StringUtil::StartsWith(version, "3.");
 }
 
+ParsedLerobotInfo ReadLerobotInfo(Connection &connection, const string &info_path) {
+	auto info_result = connection.Query(
+	    "WITH info AS (SELECT row_number() OVER () AS record_index, json FROM read_json_objects(" +
+	    MetadataQueryPath(info_path) +
+	    ")) SELECT CAST(record_index AS BIGINT), json_extract_string(info.json, '$.codebase_version'), "
+	    "json_extract_string(info.json, '$.data_path'), json_extract_string(info.json, '$.video_path'), "
+	    "CAST(json_extract_string(info.json, '$.fps') AS BIGINT), features.key FROM info LEFT JOIN LATERAL "
+	    "json_each(json_extract(info.json, '$.features')) features ON "
+	    "json_extract_string(features.value, '$.dtype') = 'video' ORDER BY record_index, features.key");
+	if (info_result->HasError()) {
+		ThrowQueryError("info.json", *info_result);
+	}
+
+	ParsedLerobotInfo info;
+	bool found_record = false;
+	while (true) {
+		auto chunk = info_result->Fetch();
+		if (!chunk) {
+			break;
+		}
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			if (chunk->GetValue(0, row).IsNull()) {
+				throw BinderException("LeRobot info.json produced a NULL metadata record index: '%s'", info_path);
+			}
+			const auto record_index = chunk->GetValue(0, row).GetValue<int64_t>();
+			if (record_index != 1) {
+				throw BinderException("LeRobot info.json must contain exactly one metadata record: '%s'", info_path);
+			}
+			if (!found_record) {
+				if (chunk->GetValue(1, row).IsNull() || chunk->GetValue(2, row).IsNull() ||
+				    chunk->GetValue(4, row).IsNull()) {
+					throw BinderException(
+					    "LeRobot info.json requires non-NULL codebase_version, data_path, and fps fields");
+				}
+				info.codebase_version = StringValue::Get(chunk->GetValue(1, row));
+				info.data_path_template = StringValue::Get(chunk->GetValue(2, row));
+				if (!chunk->GetValue(3, row).IsNull()) {
+					info.video_path_template = StringValue::Get(chunk->GetValue(3, row));
+				}
+				info.fps = chunk->GetValue(4, row).GetValue<int64_t>();
+				found_record = true;
+			}
+			if (!chunk->GetValue(5, row).IsNull()) {
+				auto video_key = StringValue::Get(chunk->GetValue(5, row));
+				if (video_key.empty()) {
+					throw BinderException("LeRobot video feature keys must not be empty");
+				}
+				info.video_keys.push_back(std::move(video_key));
+			}
+		}
+	}
+	if (!found_record) {
+		throw BinderException("LeRobot info.json contains no metadata record: '%s'", info_path);
+	}
+	if (info.codebase_version.empty() || info.data_path_template.empty()) {
+		throw BinderException("LeRobot info.json codebase_version and data_path fields must not be empty");
+	}
+	if (!IsV3Version(info.codebase_version)) {
+		throw BinderException("LeRobot route pruning currently requires a v3 dataset, found codebase_version '%s'",
+		                      info.codebase_version);
+	}
+	if (info.fps <= 0) {
+		throw BinderException("LeRobot info.json fps must be positive");
+	}
+	std::sort(info.video_keys.begin(), info.video_keys.end());
+	for (idx_t index = 1; index < info.video_keys.size(); index++) {
+		if (info.video_keys[index - 1] == info.video_keys[index]) {
+			throw BinderException("Duplicate LeRobot video feature key '%s' in info.json", info.video_keys[index]);
+		}
+	}
+	if (!info.video_keys.empty() && info.video_path_template.empty()) {
+		throw BinderException("LeRobot info.json requires video_path when video features are present");
+	}
+	return info;
+}
+
 } // namespace
 
 LerobotDatasetMetadata::LerobotDatasetMetadata(string root_p, string codebase_version_p, string data_path_template_p,
+                                               string video_path_template_p, int64_t fps_p, vector<string> video_keys_p,
                                                vector<LerobotEpisodeRoute> routes_p, vector<string> data_files_p,
                                                FileFingerprint info_fingerprint_p)
     : root(std::move(root_p)), codebase_version(std::move(codebase_version_p)),
-      data_path_template(std::move(data_path_template_p)), routes(std::move(routes_p)),
-      data_files(std::move(data_files_p)), info_fingerprint(std::move(info_fingerprint_p)) {
+      data_path_template(std::move(data_path_template_p)), video_path_template(std::move(video_path_template_p)),
+      fps(fps_p), video_keys(std::move(video_keys_p)), routes(std::move(routes_p)), data_files(std::move(data_files_p)),
+      info_fingerprint(std::move(info_fingerprint_p)) {
 }
 
 string LerobotDatasetMetadata::ObjectType() {
@@ -145,7 +262,12 @@ string LerobotDatasetMetadata::GetObjectType() {
 
 optional_idx LerobotDatasetMetadata::GetEstimatedCacheMemory() const {
 	idx_t memory = sizeof(*this);
-	memory += root.capacity() + codebase_version.capacity() + data_path_template.capacity();
+	memory +=
+	    root.capacity() + codebase_version.capacity() + data_path_template.capacity() + video_path_template.capacity();
+	memory += video_keys.capacity() * sizeof(string);
+	for (const auto &video_key : video_keys) {
+		memory += video_key.capacity();
+	}
 	memory += routes.capacity() * sizeof(LerobotEpisodeRoute);
 	memory += data_files.capacity() * sizeof(string);
 	for (const auto &path : data_files) {
@@ -175,28 +297,7 @@ shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Load(ClientContext &c
                                                                 const FileFingerprint &info_fingerprint) {
 	Connection connection(*context.db);
 	const auto info_path = root + LEROBOT_INFO_SUFFIX;
-	auto info_result = connection.Query("SELECT CAST(codebase_version AS VARCHAR), CAST(data_path AS VARCHAR) "
-	                                    "FROM read_json_auto(" +
-	                                    MetadataQueryPath(info_path) + ") LIMIT 2");
-	if (info_result->HasError()) {
-		ThrowQueryError("info.json", *info_result);
-	}
-	auto info_chunk = info_result->Fetch();
-	if (!info_chunk || info_chunk->size() == 0) {
-		throw BinderException("LeRobot info.json contains no metadata record: '%s'", info_path);
-	}
-	if (info_chunk->GetValue(0, 0).IsNull() || info_chunk->GetValue(1, 0).IsNull()) {
-		throw BinderException("LeRobot info.json requires non-NULL codebase_version and data_path fields");
-	}
-	auto codebase_version = StringValue::Get(info_chunk->GetValue(0, 0));
-	auto data_path_template = StringValue::Get(info_chunk->GetValue(1, 0));
-	if (info_chunk->size() > 1) {
-		throw BinderException("LeRobot info.json must contain exactly one metadata record: '%s'", info_path);
-	}
-	if (!IsV3Version(codebase_version)) {
-		throw BinderException("LeRobot route pruning currently requires a v3 dataset, found codebase_version '%s'",
-		                      codebase_version);
-	}
+	auto info = ReadLerobotInfo(connection, info_path);
 
 	const auto episodes_path = root + LEROBOT_EPISODES_SUFFIX;
 	auto episode_result =
@@ -228,7 +329,7 @@ shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Load(ClientContext &c
 				throw BinderException("LeRobot episode indices must be non-negative");
 			}
 
-			auto data_file = ResolveDataPath(root, data_path_template, chunk_index, file_index);
+			auto data_file = ResolveDataPath(root, info.data_path_template, chunk_index, file_index);
 			auto entry = data_file_indexes.find(data_file);
 			idx_t data_file_index;
 			if (entry == data_file_indexes.end()) {
@@ -252,8 +353,9 @@ shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Load(ClientContext &c
 		}
 	}
 
-	return make_shared_ptr<LerobotDatasetMetadata>(root, std::move(codebase_version), std::move(data_path_template),
-	                                               std::move(routes), std::move(data_files), info_fingerprint);
+	return make_shared_ptr<LerobotDatasetMetadata>(
+	    root, std::move(info.codebase_version), std::move(info.data_path_template), std::move(info.video_path_template),
+	    info.fps, std::move(info.video_keys), std::move(routes), std::move(data_files), info_fingerprint);
 }
 
 shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Get(ClientContext &context, const string &root, bool refresh,
@@ -304,6 +406,212 @@ vector<string> LerobotDatasetMetadata::ResolveDataFiles(const vector<int64_t> &e
 const string &LerobotDatasetMetadata::GetSchemaDataFile() const {
 	static const string empty;
 	return data_files.empty() ? empty : data_files[0];
+}
+
+LerobotVideoMetadata::LerobotVideoMetadata(string root_p, string video_path_template_p, int64_t fps_p,
+                                           vector<string> video_keys_p, vector<LerobotVideoRoute> routes_p,
+                                           vector<string> video_files_p,
+                                           LerobotDatasetMetadata::FileFingerprint info_fingerprint_p)
+    : root(std::move(root_p)), video_path_template(std::move(video_path_template_p)), fps(fps_p),
+      video_keys(std::move(video_keys_p)), routes(std::move(routes_p)), video_files(std::move(video_files_p)),
+      info_fingerprint(std::move(info_fingerprint_p)) {
+}
+
+string LerobotVideoMetadata::ObjectType() {
+	return "lerobot_video_metadata";
+}
+
+string LerobotVideoMetadata::GetObjectType() {
+	return ObjectType();
+}
+
+optional_idx LerobotVideoMetadata::GetEstimatedCacheMemory() const {
+	idx_t memory = sizeof(*this) + root.capacity() + video_path_template.capacity();
+	memory += video_keys.capacity() * sizeof(string);
+	for (const auto &video_key : video_keys) {
+		memory += video_key.capacity();
+	}
+	memory += routes.capacity() * sizeof(LerobotVideoRoute);
+	memory += video_files.capacity() * sizeof(string);
+	for (const auto &video_file : video_files) {
+		memory += video_file.capacity();
+	}
+	memory += info_fingerprint.version_tag.capacity();
+	return memory;
+}
+
+string LerobotVideoMetadata::CacheKey(const string &root) {
+	return ObjectType() + ":" + root;
+}
+
+bool LerobotVideoMetadata::IsValid(const LerobotDatasetMetadata &dataset) const {
+	return info_fingerprint == dataset.GetInfoFingerprint();
+}
+
+shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Load(ClientContext &context,
+                                                            const LerobotDatasetMetadata &dataset) {
+	vector<LerobotVideoRoute> routes;
+	vector<string> video_files;
+	const auto &video_keys = dataset.GetVideoKeys();
+	if (video_keys.empty()) {
+		return make_shared_ptr<LerobotVideoMetadata>(dataset.GetRoot(), dataset.GetVideoPathTemplate(),
+		                                             dataset.GetFPS(), video_keys, std::move(routes),
+		                                             std::move(video_files), dataset.GetInfoFingerprint());
+	}
+
+	string query = "SELECT CAST(episode_index AS BIGINT)";
+	for (const auto &video_key : video_keys) {
+		const auto prefix = "videos/" + video_key;
+		query += ", CAST(" + QuoteIdentifier(prefix + "/chunk_index") + " AS BIGINT)";
+		query += ", CAST(" + QuoteIdentifier(prefix + "/file_index") + " AS BIGINT)";
+		query += ", CAST(" + QuoteIdentifier(prefix + "/from_timestamp") + " AS DOUBLE)";
+		query += ", CAST(" + QuoteIdentifier(prefix + "/to_timestamp") + " AS DOUBLE)";
+	}
+	query += " FROM read_parquet(" + MetadataQueryPath(dataset.GetRoot() + LEROBOT_EPISODES_SUFFIX) + ")";
+
+	Connection connection(*context.db);
+	auto episode_result = connection.Query(query);
+	if (episode_result->HasError()) {
+		ThrowQueryError("episode video metadata", *episode_result);
+	}
+
+	unordered_map<string, idx_t> video_file_indexes;
+	while (true) {
+		auto chunk = episode_result->Fetch();
+		if (!chunk) {
+			break;
+		}
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			if (chunk->GetValue(0, row).IsNull()) {
+				throw BinderException("LeRobot episode_index must not be NULL in video metadata");
+			}
+			const auto episode_index = chunk->GetValue(0, row).GetValue<int64_t>();
+			if (episode_index < 0) {
+				throw BinderException("LeRobot episode indices must be non-negative");
+			}
+
+			for (idx_t video_key_index = 0; video_key_index < video_keys.size(); video_key_index++) {
+				const auto first_column = 1 + video_key_index * 4;
+				idx_t null_count = 0;
+				for (idx_t offset = 0; offset < 4; offset++) {
+					if (chunk->GetValue(first_column + offset, row).IsNull()) {
+						null_count++;
+					}
+				}
+				if (null_count == 4) {
+					continue;
+				}
+				if (null_count != 0) {
+					throw BinderException("LeRobot video route for episode %d and key '%s' is partially NULL",
+					                      episode_index, video_keys[video_key_index]);
+				}
+
+				const auto chunk_index = chunk->GetValue(first_column, row).GetValue<int64_t>();
+				const auto file_index = chunk->GetValue(first_column + 1, row).GetValue<int64_t>();
+				const auto from_timestamp = chunk->GetValue(first_column + 2, row).GetValue<double>();
+				const auto to_timestamp = chunk->GetValue(first_column + 3, row).GetValue<double>();
+				if (chunk_index < 0 || file_index < 0) {
+					throw BinderException("LeRobot video chunk and file indices must be non-negative");
+				}
+				if (!std::isfinite(from_timestamp) || !std::isfinite(to_timestamp) || from_timestamp < 0 ||
+				    to_timestamp < from_timestamp) {
+					throw BinderException("Invalid LeRobot video timestamp range for episode %d and key '%s'",
+					                      episode_index, video_keys[video_key_index]);
+				}
+
+				auto video_file = ResolveVideoPath(dataset.GetRoot(), dataset.GetVideoPathTemplate(),
+				                                   video_keys[video_key_index], chunk_index, file_index);
+				auto entry = video_file_indexes.find(video_file);
+				idx_t video_file_index;
+				if (entry == video_file_indexes.end()) {
+					video_file_index = video_files.size();
+					video_file_indexes.emplace(video_file, video_file_index);
+					video_files.push_back(std::move(video_file));
+				} else {
+					video_file_index = entry->second;
+				}
+				routes.emplace_back(episode_index, video_key_index, video_file_index, chunk_index, file_index,
+				                    from_timestamp, to_timestamp);
+			}
+		}
+	}
+
+	std::sort(routes.begin(), routes.end(), [](const LerobotVideoRoute &left, const LerobotVideoRoute &right) {
+		if (left.episode_index != right.episode_index) {
+			return left.episode_index < right.episode_index;
+		}
+		return left.video_key_index < right.video_key_index;
+	});
+	for (idx_t index = 1; index < routes.size(); index++) {
+		if (routes[index - 1].episode_index == routes[index].episode_index &&
+		    routes[index - 1].video_key_index == routes[index].video_key_index) {
+			throw BinderException("Duplicate LeRobot video route for episode %d and key '%s'",
+			                      routes[index].episode_index, video_keys[routes[index].video_key_index]);
+		}
+	}
+
+	return make_shared_ptr<LerobotVideoMetadata>(dataset.GetRoot(), dataset.GetVideoPathTemplate(), dataset.GetFPS(),
+	                                             video_keys, std::move(routes), std::move(video_files),
+	                                             dataset.GetInfoFingerprint());
+}
+
+shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Get(ClientContext &context, const string &root, bool refresh,
+                                                           bool &cache_hit) {
+	auto &cache = ObjectCache::GetObjectCache(context);
+	const auto cache_key = CacheKey(root);
+	bool dataset_cache_hit;
+	auto dataset = LerobotDatasetMetadata::Get(context, root, refresh, dataset_cache_hit);
+	cache_hit = false;
+	if (!refresh) {
+		auto cached = cache.Get<LerobotVideoMetadata>(cache_key);
+		if (cached && cached->IsValid(*dataset)) {
+			cache_hit = true;
+			return cached;
+		}
+	}
+
+	for (idx_t attempt = 0; attempt < 2; attempt++) {
+		auto loaded = Load(context, *dataset);
+		bool current_cache_hit;
+		auto current = LerobotDatasetMetadata::Get(context, root, false, current_cache_hit);
+		if (loaded->IsValid(*current)) {
+			cache.Put(cache_key, loaded);
+			return loaded;
+		}
+		dataset = std::move(current);
+	}
+	throw IOException("LeRobot info.json changed while video metadata was being loaded for '%s'", root);
+}
+
+vector<LerobotVideoRoute> LerobotVideoMetadata::ResolveRoutes(const vector<int64_t> &episode_indices,
+                                                              const vector<string> &requested_video_keys) const {
+	vector<idx_t> requested_key_indices;
+	requested_key_indices.reserve(requested_video_keys.size());
+	for (const auto &video_key : requested_video_keys) {
+		auto entry = std::lower_bound(video_keys.begin(), video_keys.end(), video_key);
+		if (entry == video_keys.end() || *entry != video_key) {
+			throw BinderException("Unknown LeRobot video key '%s'", video_key);
+		}
+		requested_key_indices.push_back(static_cast<idx_t>(entry - video_keys.begin()));
+	}
+	std::sort(requested_key_indices.begin(), requested_key_indices.end());
+	requested_key_indices.erase(std::unique(requested_key_indices.begin(), requested_key_indices.end()),
+	                            requested_key_indices.end());
+
+	vector<LerobotVideoRoute> result;
+	for (const auto episode_index : episode_indices) {
+		auto route = std::lower_bound(
+		    routes.begin(), routes.end(), episode_index,
+		    [](const LerobotVideoRoute &candidate, int64_t value) { return candidate.episode_index < value; });
+		while (route != routes.end() && route->episode_index == episode_index) {
+			if (std::binary_search(requested_key_indices.begin(), requested_key_indices.end(),
+			                       route->video_key_index)) {
+				result.push_back(*route);
+			}
+			route++;
+		}
+	}
+	return result;
 }
 
 } // namespace duckdb

@@ -152,6 +152,27 @@ bool GetRefreshParameter(TableFunctionBindInput &input) {
 	return BooleanValue::Get(refresh->second);
 }
 
+vector<int64_t> GetEpisodeIndices(const Value &value, const char *function_name) {
+	if (value.IsNull()) {
+		throw BinderException("%s episode_indices must not be NULL", function_name);
+	}
+
+	vector<int64_t> episode_indices;
+	for (const auto &child : ListValue::GetChildren(value)) {
+		if (child.IsNull()) {
+			throw BinderException("%s episode_indices must not contain NULL", function_name);
+		}
+		auto episode_index = child.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+		if (episode_index < 0) {
+			throw BinderException("LeRobot episode indices must be non-negative");
+		}
+		episode_indices.push_back(episode_index);
+	}
+	std::sort(episode_indices.begin(), episode_indices.end());
+	episode_indices.erase(std::unique(episode_indices.begin(), episode_indices.end()), episode_indices.end());
+	return episode_indices;
+}
+
 unique_ptr<FunctionData> LerobotLayoutBind(ClientContext &, TableFunctionBindInput &input,
                                            vector<LogicalType> &return_types, LerobotColumnNames &names) {
 	if (input.inputs[0].IsNull()) {
@@ -289,8 +310,10 @@ unique_ptr<FunctionData> LerobotMetadataCacheBind(ClientContext &context, TableF
 	bool cache_hit;
 	auto metadata = LerobotDatasetMetadata::Get(context, root, GetRefreshParameter(input), cache_hit);
 
-	names = {"root", "codebase_version", "data_path", "episode_count", "data_file_count", "cache_hit"};
+	names = {"root",          "codebase_version", "data_path",       "video_path", "fps",
+	         "episode_count", "data_file_count",  "video_key_count", "cache_hit"};
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::BIGINT,
 	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BOOLEAN};
 	return make_uniq<LerobotMetadataCacheBindData>(std::move(metadata), cache_hit);
 }
@@ -306,35 +329,150 @@ void LerobotMetadataCacheFunction(ClientContext &, TableFunctionInput &input, Da
 	output.data[0].SetValue(0, Value(metadata.GetRoot()));
 	output.data[1].SetValue(0, Value(metadata.GetCodebaseVersion()));
 	output.data[2].SetValue(0, Value(metadata.GetDataPathTemplate()));
-	output.data[3].SetValue(0, Value::BIGINT(static_cast<int64_t>(metadata.GetEpisodeCount())));
-	output.data[4].SetValue(0, Value::BIGINT(static_cast<int64_t>(metadata.GetDataFileCount())));
-	output.data[5].SetValue(0, Value::BOOLEAN(bind_data.cache_hit));
+	output.data[3].SetValue(0, Value(metadata.GetVideoPathTemplate()));
+	output.data[4].SetValue(0, Value::BIGINT(metadata.GetFPS()));
+	output.data[5].SetValue(0, Value::BIGINT(static_cast<int64_t>(metadata.GetEpisodeCount())));
+	output.data[6].SetValue(0, Value::BIGINT(static_cast<int64_t>(metadata.GetDataFileCount())));
+	output.data[7].SetValue(0, Value::BIGINT(static_cast<int64_t>(metadata.GetVideoKeyCount())));
+	output.data[8].SetValue(0, Value::BOOLEAN(bind_data.cache_hit));
 	SetOutputCardinality(output, 1, 0);
 	state.emitted = true;
+}
+
+struct LerobotVideoMetadataCacheBindData final : public TableFunctionData {
+	LerobotVideoMetadataCacheBindData(shared_ptr<LerobotVideoMetadata> metadata_p, bool cache_hit_p)
+	    : metadata(std::move(metadata_p)), cache_hit(cache_hit_p) {
+	}
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<LerobotVideoMetadataCacheBindData>(metadata, cache_hit);
+	}
+
+	shared_ptr<LerobotVideoMetadata> metadata;
+	bool cache_hit;
+};
+
+unique_ptr<FunctionData> LerobotVideoMetadataCacheBind(ClientContext &context, TableFunctionBindInput &input,
+                                                       vector<LogicalType> &return_types, LerobotColumnNames &names) {
+	if (input.inputs[0].IsNull()) {
+		throw BinderException("lerobot_video_metadata_cache root must not be NULL");
+	}
+	auto root = NormalizeLerobotRoot(StringValue::Get(input.inputs[0]));
+	bool cache_hit;
+	auto metadata = LerobotVideoMetadata::Get(context, root, GetRefreshParameter(input), cache_hit);
+
+	names = {"root", "video_path", "fps", "video_key_count", "route_count", "video_file_count", "cache_hit"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT,
+	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BOOLEAN};
+	return make_uniq<LerobotVideoMetadataCacheBindData>(std::move(metadata), cache_hit);
+}
+
+void LerobotVideoMetadataCacheFunction(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+	auto &bind_data = input.bind_data->Cast<LerobotVideoMetadataCacheBindData>();
+	auto &state = input.global_state->Cast<LerobotSingleRowGlobalState>();
+	if (state.emitted) {
+		return;
+	}
+
+	auto &metadata = *bind_data.metadata;
+	output.data[0].SetValue(0, Value(metadata.GetRoot()));
+	output.data[1].SetValue(0, Value(metadata.GetVideoPathTemplate()));
+	output.data[2].SetValue(0, Value::BIGINT(metadata.GetFPS()));
+	output.data[3].SetValue(0, Value::BIGINT(static_cast<int64_t>(metadata.GetVideoKeys().size())));
+	output.data[4].SetValue(0, Value::BIGINT(static_cast<int64_t>(metadata.GetRouteCount())));
+	output.data[5].SetValue(0, Value::BIGINT(static_cast<int64_t>(metadata.GetVideoFileCount())));
+	output.data[6].SetValue(0, Value::BOOLEAN(bind_data.cache_hit));
+	SetOutputCardinality(output, 1, 0);
+	state.emitted = true;
+}
+
+struct LerobotVideoRoutesBindData final : public TableFunctionData {
+	LerobotVideoRoutesBindData(shared_ptr<LerobotVideoMetadata> metadata_p, vector<LerobotVideoRoute> routes_p)
+	    : metadata(std::move(metadata_p)), routes(std::move(routes_p)) {
+	}
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<LerobotVideoRoutesBindData>(metadata, routes);
+	}
+
+	shared_ptr<LerobotVideoMetadata> metadata;
+	vector<LerobotVideoRoute> routes;
+};
+
+struct LerobotVideoRoutesGlobalState final : public GlobalTableFunctionState {
+	idx_t next_route = 0;
+};
+
+unique_ptr<GlobalTableFunctionState> LerobotVideoRoutesInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<LerobotVideoRoutesGlobalState>();
+}
+
+unique_ptr<FunctionData> LerobotVideoRoutesBind(ClientContext &context, TableFunctionBindInput &input,
+                                                vector<LogicalType> &return_types, LerobotColumnNames &names) {
+	if (input.inputs[0].IsNull()) {
+		throw BinderException("lerobot_video_routes root must not be NULL");
+	}
+	auto root = NormalizeLerobotRoot(StringValue::Get(input.inputs[0]));
+	auto episode_indices = GetEpisodeIndices(input.inputs[1], "lerobot_video_routes");
+
+	bool cache_hit;
+	auto metadata = LerobotVideoMetadata::Get(context, root, GetRefreshParameter(input), cache_hit);
+	vector<string> video_keys;
+	auto requested_keys = input.named_parameters.find("video_keys");
+	if (requested_keys == input.named_parameters.end()) {
+		video_keys = metadata->GetVideoKeys();
+	} else {
+		if (requested_keys->second.IsNull()) {
+			throw BinderException("lerobot_video_routes video_keys must not be NULL");
+		}
+		for (const auto &value : ListValue::GetChildren(requested_keys->second)) {
+			if (value.IsNull()) {
+				throw BinderException("lerobot_video_routes video_keys must not contain NULL");
+			}
+			auto video_key = StringValue::Get(value);
+			if (video_key.empty()) {
+				throw BinderException("lerobot_video_routes video_keys must not contain an empty key");
+			}
+			video_keys.push_back(std::move(video_key));
+		}
+		std::sort(video_keys.begin(), video_keys.end());
+		video_keys.erase(std::unique(video_keys.begin(), video_keys.end()), video_keys.end());
+	}
+
+	names = {"episode_index", "video_key",      "video_path",   "chunk_index",
+	         "file_index",    "from_timestamp", "to_timestamp", "fps"};
+	return_types = {LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,
+	                LogicalType::BIGINT, LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::BIGINT};
+	auto routes = metadata->ResolveRoutes(episode_indices, video_keys);
+	return make_uniq<LerobotVideoRoutesBindData>(std::move(metadata), std::move(routes));
+}
+
+void LerobotVideoRoutesFunction(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+	auto &bind_data = input.bind_data->Cast<LerobotVideoRoutesBindData>();
+	auto &state = input.global_state->Cast<LerobotVideoRoutesGlobalState>();
+	idx_t count = 0;
+	while (state.next_route < bind_data.routes.size() && count < STANDARD_VECTOR_SIZE) {
+		const auto &route = bind_data.routes[state.next_route++];
+		output.data[0].SetValue(count, Value::BIGINT(route.episode_index));
+		output.data[1].SetValue(count, Value(bind_data.metadata->GetVideoKey(route)));
+		output.data[2].SetValue(count, Value(bind_data.metadata->GetVideoFile(route)));
+		output.data[3].SetValue(count, Value::BIGINT(route.chunk_index));
+		output.data[4].SetValue(count, Value::BIGINT(route.file_index));
+		output.data[5].SetValue(count, Value::DOUBLE(route.from_timestamp));
+		output.data[6].SetValue(count, Value::DOUBLE(route.to_timestamp));
+		output.data[7].SetValue(count, Value::BIGINT(bind_data.metadata->GetFPS()));
+		count++;
+	}
+	SetOutputCardinality(output, count, 0);
 }
 
 unique_ptr<TableRef> LerobotEpisodeFramesBindReplace(ClientContext &context, TableFunctionBindInput &input) {
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("lerobot_episode_frames root must not be NULL");
 	}
-	if (input.inputs[1].IsNull()) {
-		throw BinderException("lerobot_episode_frames episode_indices must not be NULL");
-	}
 
 	auto root = NormalizeLerobotRoot(StringValue::Get(input.inputs[0]));
-	vector<int64_t> episode_indices;
-	for (const auto &value : ListValue::GetChildren(input.inputs[1])) {
-		if (value.IsNull()) {
-			throw BinderException("lerobot_episode_frames episode_indices must not contain NULL");
-		}
-		auto episode_index = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
-		if (episode_index < 0) {
-			throw BinderException("LeRobot episode indices must be non-negative");
-		}
-		episode_indices.push_back(episode_index);
-	}
-	std::sort(episode_indices.begin(), episode_indices.end());
-	episode_indices.erase(std::unique(episode_indices.begin(), episode_indices.end()), episode_indices.end());
+	auto episode_indices = GetEpisodeIndices(input.inputs[1], "lerobot_episode_frames");
 
 	vector<unique_ptr<ParsedExpression>> filter_children;
 	filter_children.push_back(make_uniq<ColumnRefExpression>("episode_index"));
@@ -440,6 +578,21 @@ TableFunctionSet LerobotFunctions::GetFramesFunction(ExtensionLoader &loader) {
 TableFunctionSet LerobotFunctions::GetMetadataCacheFunction() {
 	TableFunction function("lerobot_metadata_cache", {LogicalType::VARCHAR}, LerobotMetadataCacheFunction,
 	                       LerobotMetadataCacheBind, LerobotSingleRowInit);
+	function.named_parameters["refresh"] = LogicalType::BOOLEAN;
+	return TableFunctionSet(std::move(function));
+}
+
+TableFunctionSet LerobotFunctions::GetVideoMetadataCacheFunction() {
+	TableFunction function("lerobot_video_metadata_cache", {LogicalType::VARCHAR}, LerobotVideoMetadataCacheFunction,
+	                       LerobotVideoMetadataCacheBind, LerobotSingleRowInit);
+	function.named_parameters["refresh"] = LogicalType::BOOLEAN;
+	return TableFunctionSet(std::move(function));
+}
+
+TableFunctionSet LerobotFunctions::GetVideoRoutesFunction() {
+	TableFunction function("lerobot_video_routes", {LogicalType::VARCHAR, LogicalType::LIST(LogicalType::BIGINT)},
+	                       LerobotVideoRoutesFunction, LerobotVideoRoutesBind, LerobotVideoRoutesInit);
+	function.named_parameters["video_keys"] = LogicalType::LIST(LogicalType::VARCHAR);
 	function.named_parameters["refresh"] = LogicalType::BOOLEAN;
 	return TableFunctionSet(std::move(function));
 }

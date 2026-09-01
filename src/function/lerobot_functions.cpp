@@ -10,6 +10,8 @@ vector<TableFunctionSet> LerobotFunctions::GetTableFunctions(ExtensionLoader &lo
 	functions.push_back(GetEpisodesFunction(loader));
 	functions.push_back(GetFramesFunction(loader));
 	functions.push_back(GetMetadataCacheFunction());
+	functions.push_back(GetVideoMetadataCacheFunction());
+	functions.push_back(GetVideoRoutesFunction());
 	functions.push_back(GetEpisodeFramesFunction());
 	return functions;
 }
