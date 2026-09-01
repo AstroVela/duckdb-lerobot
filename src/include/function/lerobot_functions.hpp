@@ -23,6 +23,7 @@ private:
 	static TableFunctionSet GetInfoFunction(ExtensionLoader &loader);
 	static TableFunctionSet GetEpisodesFunction(ExtensionLoader &loader);
 	static TableFunctionSet GetFramesFunction(ExtensionLoader &loader);
+	static TableFunctionSet GetMetadataCacheFunction();
 	static TableFunctionSet GetEpisodeFramesFunction();
 };
 

@@ -16,7 +16,9 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 
 #include "function/lerobot_multi_file_reader.hpp"
+#include "storage/lerobot_metadata_cache.hpp"
 
+#include <algorithm>
 #include <type_traits>
 
 namespace duckdb {
@@ -139,6 +141,17 @@ unique_ptr<GlobalTableFunctionState> LerobotSingleRowInit(ClientContext &, Table
 	return make_uniq<LerobotSingleRowGlobalState>();
 }
 
+bool GetRefreshParameter(TableFunctionBindInput &input) {
+	auto refresh = input.named_parameters.find("refresh");
+	if (refresh == input.named_parameters.end()) {
+		return false;
+	}
+	if (refresh->second.IsNull()) {
+		throw BinderException("refresh must not be NULL");
+	}
+	return BooleanValue::Get(refresh->second);
+}
+
 unique_ptr<FunctionData> LerobotLayoutBind(ClientContext &, TableFunctionBindInput &input,
                                            vector<LogicalType> &return_types, LerobotColumnNames &names) {
 	if (input.inputs[0].IsNull()) {
@@ -245,7 +258,62 @@ unique_ptr<TableFunctionRef> CreateTableFunctionRef(const char *name, Value argu
 	return result;
 }
 
-unique_ptr<TableRef> LerobotEpisodeFramesBindReplace(ClientContext &, TableFunctionBindInput &input) {
+Value CreatePathList(const vector<string> &paths) {
+	vector<Value> values;
+	values.reserve(paths.size());
+	for (const auto &path : paths) {
+		values.push_back(Value(path));
+	}
+	return Value::LIST(LogicalType::VARCHAR, std::move(values));
+}
+
+struct LerobotMetadataCacheBindData final : public TableFunctionData {
+	LerobotMetadataCacheBindData(shared_ptr<LerobotDatasetMetadata> metadata_p, bool cache_hit_p)
+	    : metadata(std::move(metadata_p)), cache_hit(cache_hit_p) {
+	}
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<LerobotMetadataCacheBindData>(metadata, cache_hit);
+	}
+
+	shared_ptr<LerobotDatasetMetadata> metadata;
+	bool cache_hit;
+};
+
+unique_ptr<FunctionData> LerobotMetadataCacheBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, LerobotColumnNames &names) {
+	if (input.inputs[0].IsNull()) {
+		throw BinderException("lerobot_metadata_cache root must not be NULL");
+	}
+	auto root = NormalizeLerobotRoot(StringValue::Get(input.inputs[0]));
+	bool cache_hit;
+	auto metadata = LerobotDatasetMetadata::Get(context, root, GetRefreshParameter(input), cache_hit);
+
+	names = {"root", "codebase_version", "data_path", "episode_count", "data_file_count", "cache_hit"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BOOLEAN};
+	return make_uniq<LerobotMetadataCacheBindData>(std::move(metadata), cache_hit);
+}
+
+void LerobotMetadataCacheFunction(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+	auto &bind_data = input.bind_data->Cast<LerobotMetadataCacheBindData>();
+	auto &state = input.global_state->Cast<LerobotSingleRowGlobalState>();
+	if (state.emitted) {
+		return;
+	}
+
+	auto &metadata = *bind_data.metadata;
+	output.data[0].SetValue(0, Value(metadata.GetRoot()));
+	output.data[1].SetValue(0, Value(metadata.GetCodebaseVersion()));
+	output.data[2].SetValue(0, Value(metadata.GetDataPathTemplate()));
+	output.data[3].SetValue(0, Value::BIGINT(static_cast<int64_t>(metadata.GetEpisodeCount())));
+	output.data[4].SetValue(0, Value::BIGINT(static_cast<int64_t>(metadata.GetDataFileCount())));
+	output.data[5].SetValue(0, Value::BOOLEAN(bind_data.cache_hit));
+	SetOutputCardinality(output, 1, 0);
+	state.emitted = true;
+}
+
+unique_ptr<TableRef> LerobotEpisodeFramesBindReplace(ClientContext &context, TableFunctionBindInput &input) {
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("lerobot_episode_frames root must not be NULL");
 	}
@@ -254,8 +322,7 @@ unique_ptr<TableRef> LerobotEpisodeFramesBindReplace(ClientContext &, TableFunct
 	}
 
 	auto root = NormalizeLerobotRoot(StringValue::Get(input.inputs[0]));
-	vector<unique_ptr<ParsedExpression>> filter_children;
-	filter_children.push_back(make_uniq<ColumnRefExpression>("episode_index"));
+	vector<int64_t> episode_indices;
 	for (const auto &value : ListValue::GetChildren(input.inputs[1])) {
 		if (value.IsNull()) {
 			throw BinderException("lerobot_episode_frames episode_indices must not contain NULL");
@@ -264,12 +331,33 @@ unique_ptr<TableRef> LerobotEpisodeFramesBindReplace(ClientContext &, TableFunct
 		if (episode_index < 0) {
 			throw BinderException("LeRobot episode indices must be non-negative");
 		}
+		episode_indices.push_back(episode_index);
+	}
+	std::sort(episode_indices.begin(), episode_indices.end());
+	episode_indices.erase(std::unique(episode_indices.begin(), episode_indices.end()), episode_indices.end());
+
+	vector<unique_ptr<ParsedExpression>> filter_children;
+	filter_children.push_back(make_uniq<ColumnRefExpression>("episode_index"));
+	for (const auto episode_index : episode_indices) {
 		filter_children.push_back(make_uniq<ConstantExpression>(Value::BIGINT(episode_index)));
+	}
+
+	bool cache_hit;
+	auto metadata = LerobotDatasetMetadata::Get(context, root, GetRefreshParameter(input), cache_hit);
+	auto data_files = metadata->ResolveDataFiles(episode_indices);
+	if (data_files.empty() && !metadata->GetSchemaDataFile().empty()) {
+		// DuckDB still needs one footer to bind the output schema for an empty or
+		// unknown episode set. The false/IN predicate prevents data rows from it.
+		data_files.push_back(metadata->GetSchemaDataFile());
 	}
 
 	auto select = make_uniq<SelectNode>();
 	select->select_list.push_back(make_uniq<StarExpression>());
-	select->from_table = CreateTableFunctionRef("lerobot_frames", Value(std::move(root)));
+	if (data_files.empty()) {
+		select->from_table = CreateTableFunctionRef("lerobot_frames", Value(std::move(root)));
+	} else {
+		select->from_table = CreateTableFunctionRef("parquet_scan", CreatePathList(data_files));
+	}
 	if (filter_children.size() == 1) {
 		select->where_clause = make_uniq<ConstantExpression>(Value::BOOLEAN(false));
 	} else {
@@ -349,10 +437,18 @@ TableFunctionSet LerobotFunctions::GetFramesFunction(ExtensionLoader &loader) {
 	return CreateNativeScan(loader, "parquet_scan", "lerobot_frames", LerobotMultiFileReader::CreateFrames);
 }
 
+TableFunctionSet LerobotFunctions::GetMetadataCacheFunction() {
+	TableFunction function("lerobot_metadata_cache", {LogicalType::VARCHAR}, LerobotMetadataCacheFunction,
+	                       LerobotMetadataCacheBind, LerobotSingleRowInit);
+	function.named_parameters["refresh"] = LogicalType::BOOLEAN;
+	return TableFunctionSet(std::move(function));
+}
+
 TableFunctionSet LerobotFunctions::GetEpisodeFramesFunction() {
 	TableFunction function("lerobot_episode_frames", {LogicalType::VARCHAR, LogicalType::LIST(LogicalType::BIGINT)},
 	                       nullptr, nullptr);
 	function.bind_replace = LerobotEpisodeFramesBindReplace;
+	function.named_parameters["refresh"] = LogicalType::BOOLEAN;
 	return TableFunctionSet(std::move(function));
 }
 

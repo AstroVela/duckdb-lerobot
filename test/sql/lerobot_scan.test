@@ -8,22 +8,45 @@ require json
 
 require lerobot
 
+# Partitioned COPY creates the otherwise-empty fixture directories.
 statement ok
 COPY (
-    SELECT 'v3.0' AS codebase_version,
-           'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet' AS data_path,
-           'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
-           30 AS fps
-) TO '__TEST_DIR__/lerobot_scan/meta/info.json' (FORMAT JSON, ARRAY false);
+    SELECT 0 AS bootstrap, 1 AS payload
+) TO '{TEST_DIR}/lerobot_scan' (FORMAT PARQUET, PARTITION_BY (bootstrap));
 
 statement ok
 COPY (
-    SELECT * FROM (VALUES
+    SELECT 0 AS bootstrap, 1 AS payload
+) TO '{TEST_DIR}/lerobot_scan/meta' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version,
+           'frames/chunk-{chunk_index:02d}/part-{file_index:04d}.parquet' AS data_path,
+           'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
+           30 AS fps
+) TO '{TEST_DIR}/lerobot_scan/meta/info.json' (FORMAT JSON, ARRAY false);
+
+statement ok
+COPY (
+    SELECT episodes.*, 0 AS metadata_chunk FROM (VALUES
         (0::BIGINT, 2::BIGINT, 0::BIGINT, 0::BIGINT),
         (1::BIGINT, 2::BIGINT, 0::BIGINT, 0::BIGINT),
         (2::BIGINT, 2::BIGINT, 0::BIGINT, 1::BIGINT)
     ) AS episodes(episode_index, length, "data/chunk_index", "data/file_index")
-) TO '__TEST_DIR__/lerobot_scan/meta/episodes/chunk-000/file-000.parquet' (FORMAT PARQUET);
+) TO '{TEST_DIR}/lerobot_scan/meta/episodes' (FORMAT PARQUET, PARTITION_BY (metadata_chunk));
+
+# Besides creating frames/chunk-00, this leaves an incompatible, unreferenced
+# Parquet file beneath the same tree. An episode-scoped scan must ignore it.
+statement ok
+COPY (
+    SELECT 0 AS bootstrap, 'not a frame shard' AS poison
+) TO '{TEST_DIR}/lerobot_scan/frames' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (
+    SELECT 0 AS bootstrap, 'not a frame shard' AS poison
+) TO '{TEST_DIR}/lerobot_scan/frames/chunk-00' (FORMAT PARQUET, PARTITION_BY (bootstrap));
 
 statement ok
 COPY (
@@ -33,7 +56,7 @@ COPY (
         (1::BIGINT, 2::BIGINT, 0.0::DOUBLE),
         (1::BIGINT, 3::BIGINT, 0.033333::DOUBLE)
     ) AS frames(episode_index, frame_index, timestamp)
-) TO '__TEST_DIR__/lerobot_scan/data/chunk-000/file-000.parquet' (FORMAT PARQUET);
+) TO '{TEST_DIR}/lerobot_scan/frames/chunk-00/part-0000.parquet' (FORMAT PARQUET);
 
 statement ok
 COPY (
@@ -41,17 +64,17 @@ COPY (
         (2::BIGINT, 4::BIGINT, 0.0::DOUBLE),
         (2::BIGINT, 5::BIGINT, 0.033333::DOUBLE)
     ) AS frames(episode_index, frame_index, timestamp)
-) TO '__TEST_DIR__/lerobot_scan/data/chunk-000/file-001.parquet' (FORMAT PARQUET);
+) TO '{TEST_DIR}/lerobot_scan/frames/chunk-00/part-0001.parquet' (FORMAT PARQUET);
 
 query TTI
 SELECT codebase_version, data_path, fps
-FROM lerobot_info('__TEST_DIR__/lerobot_scan');
+FROM lerobot_info('{TEST_DIR}/lerobot_scan');
 ----
-v3.0	data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet	30
+v3.0	frames/chunk-{chunk_index:02d}/part-{file_index:04d}.parquet	30
 
 query III
 SELECT episode_index, length, "data/file_index"
-FROM lerobot_episodes('__TEST_DIR__/lerobot_scan')
+FROM lerobot_episodes('{TEST_DIR}/lerobot_scan')
 ORDER BY episode_index;
 ----
 0	2	0
@@ -60,7 +83,7 @@ ORDER BY episode_index;
 
 query II
 SELECT episode_index, frame_index
-FROM lerobot_episode_frames('__TEST_DIR__/lerobot_scan', [1, 2])
+FROM lerobot_episode_frames('{TEST_DIR}/lerobot_scan', [2, 1, 1])
 ORDER BY frame_index;
 ----
 1	2
@@ -68,14 +91,50 @@ ORDER BY frame_index;
 2	4
 2	5
 
+query TTIIII
+SELECT root, codebase_version, data_path, episode_count, data_file_count, cache_hit
+FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_scan');
+----
+{TEST_DIR}/lerobot_scan	v3.0	frames/chunk-{chunk_index:02d}/part-{file_index:04d}.parquet	3	2	true
+
+query I
+SELECT cache_hit
+FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_scan', refresh := true);
+----
+false
+
+# Changing the info.json commit marker invalidates the route cache without an
+# explicit refresh. The extra field also changes the file size deterministically.
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version,
+           'frames/chunk-{chunk_index:02d}/part-{file_index:04d}.parquet' AS data_path,
+           'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
+           30 AS fps,
+           3 AS total_episodes
+) TO '{TEST_DIR}/lerobot_scan/meta/info.json'
+  (FORMAT JSON, ARRAY false, OVERWRITE_OR_IGNORE);
+
+query I
+SELECT cache_hit
+FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_scan');
+----
+false
+
 query I
 SELECT count(*)
-FROM lerobot_episode_frames('__TEST_DIR__/lerobot_scan', []);
+FROM lerobot_episode_frames('{TEST_DIR}/lerobot_scan', []);
+----
+0
+
+query I
+SELECT count(*)
+FROM lerobot_episode_frames('{TEST_DIR}/lerobot_scan', [999]);
 ----
 0
 
 statement error
 SELECT *
-FROM lerobot_episode_frames('__TEST_DIR__/lerobot_scan', [-1]);
+FROM lerobot_episode_frames('{TEST_DIR}/lerobot_scan', [-1]);
 ----
 LeRobot episode indices must be non-negative

@@ -2,6 +2,7 @@ set(EXTENSION_SOURCES
     lerobot_extension.cpp
     function/lerobot_functions.cpp
     function/scan/lerobot_scan.cpp
+    storage/lerobot_metadata_cache.cpp
 )
 
 include_directories(include)

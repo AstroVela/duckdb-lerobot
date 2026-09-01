@@ -42,15 +42,26 @@ Parquet glob, leaving schema inference, parallel reads, projection pushdown,
 filter pushdown, and row-group pruning to DuckDB.
 
 `lerobot_episode_frames` is a bind-replacement table function. It constructs a
-relational `episode_index IN (...)` predicate over `lerobot_frames`, rather
-than executing or materializing an intermediate result inside the extension.
-The optimizer can therefore push that predicate into the Parquet scan. An
-empty episode list becomes an empty relation, and negative or NULL indices are
-rejected during binding.
+relational `episode_index IN (...)` predicate over a native `parquet_scan`.
+Before constructing that relation it resolves the selected episode indices
+through the cached v3 metadata route table, so the Parquet scan receives only
+the distinct data shards that can contain those episodes. The optimizer still
+pushes the row predicate into those files. An empty or unknown episode set uses
+one known shard only to bind the output schema, then produces no rows; negative
+or NULL indices are rejected during binding.
 
-The current scanner expands the standard v3 paths shown above. Reading custom
-`data_path` and `video_path` templates from the authoritative info record, then
-using episode metadata to prune whole frame files, is the next scanner stage.
+The route cache stores the authoritative `codebase_version` and `data_path`
+from `meta/info.json`, a sorted compact episode-to-file index, and one copy of
+each resolved shard path. Its database-instance `ObjectCache` entry is
+memory-accounted and immutable. `info.json` size, modification time, and
+version tag form the invalidation marker; callers can also pass
+`refresh := true` to `lerobot_episode_frames` or `lerobot_metadata_cache`.
+
+This is intentionally above the Parquet layer. DuckDB continues to own footer
+metadata, row-group statistics, the optional `parquet_metadata_cache`, and the
+external file/block cache. The extension neither parses nor duplicates those
+caches. On a route-cache miss, its metadata query projects only the three route
+columns through DuckDB's native Parquet reader.
 
 ## Metadata required for a v3 episode
 
