@@ -16,11 +16,12 @@ namespace duckdb {
 class ClientContext;
 
 struct LerobotEpisodeRoute {
-	LerobotEpisodeRoute(int64_t episode_index_p, idx_t data_file_index_p)
-	    : episode_index(episode_index_p), data_file_index(data_file_index_p) {
+	LerobotEpisodeRoute(int64_t episode_index_p, int64_t episode_length_p, idx_t data_file_index_p)
+	    : episode_index(episode_index_p), episode_length(episode_length_p), data_file_index(data_file_index_p) {
 	}
 
 	int64_t episode_index;
+	int64_t episode_length;
 	idx_t data_file_index;
 };
 
@@ -75,6 +76,7 @@ public:
 	optional_idx GetEstimatedCacheMemory() const override;
 
 	vector<string> ResolveDataFiles(const vector<int64_t> &episode_indices) const;
+	const LerobotEpisodeRoute *FindEpisodeRoute(int64_t episode_index) const;
 	const string &GetSchemaDataFile() const;
 
 	const string &GetRoot() const {

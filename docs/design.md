@@ -15,6 +15,7 @@ not an inferred directory convention:
 dataset is read. The familiar v3 paths are defaults, not an ABI:
 
     meta/episodes/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet
+    meta/tasks.parquet
     data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet
     videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4
 
@@ -23,10 +24,12 @@ dataset is read. The familiar v3 paths are defaults, not an ABI:
 The public API is episode-first:
 
     SELECT * FROM lerobot_episodes('hf://datasets/org/dataset');
+    SELECT task_index, task FROM lerobot_tasks('hf://datasets/org/dataset');
     SELECT * FROM lerobot_info('hf://datasets/org/dataset');
 
-The first query returns one row per episode; the second returns the
-authoritative info record. Callers filter episode metadata before the
+The episode query returns one row per episode, the task query returns the
+current task-index mapping, and the info query returns the authoritative info
+record. Callers filter episode metadata before the
 extension expands frame Parquet rows. This prevents a query that selects a
 small set of episodes from eagerly scanning or decoding the entire dataset.
 
@@ -72,6 +75,34 @@ unique rejoin key, while `request_id`, `video_key`, and `delta_index` retain the
 caller's semantic identity. Filters and projections inside the input subquery
 are optimized before routing and decode.
 
+Non-video temporal features use the corresponding relation operator:
+
+    WITH targets AS (
+      SELECT *
+      FROM lerobot_temporal_targets(
+        root,
+        (SELECT request_id, episode_index, frame_index, delta_index
+         FROM training_targets),
+        delta_timestamps := [-0.2, -0.1, 0.0]
+      )
+    )
+    SELECT targets.*, frames."observation.state", frames.action, tasks.task
+    FROM targets
+    JOIN lerobot_frames(root) frames
+      ON frames.episode_index = targets.episode_index
+     AND frames.frame_index = targets.target_frame_index
+    JOIN lerobot_tasks(root) tasks USING (task_index);
+
+The four named input columns are cast to `BIGINT` and consumed as DuckDB typed
+vectors. Delta timestamps must be integer frame offsets at the dataset FPS.
+The operator looks up the requested episode's cached `length`, clamps the
+target into `[0, length - 1]`, and emits `is_padding`. It does not read feature
+values itself, so the following native Parquet join keeps projection and filter
+pushdown for arbitrary state/action schemas. `target_ordinal` distinguishes
+exact duplicate relation rows. `lerobot_tasks` directly scans the current v3
+`meta/tasks.parquet` schema (`task_index`, `task`); no legacy schema inference
+or fallback is performed.
+
 Video alignment is a separate metadata-only phase:
 
     SELECT *
@@ -88,8 +119,9 @@ MP4 path, chunk/file indices, episode-local `from_timestamp` and
 episode is skipped; a partially NULL route is rejected as corrupt metadata.
 The function does not open the MP4.
 
-`lerobot_info`, `lerobot_episodes`, and `lerobot_frames` are native C++ table
-functions. Following DuckDB Iceberg's implementation pattern, each clones a
+`lerobot_info`, `lerobot_episodes`, `lerobot_tasks`, and `lerobot_frames` are
+native C++ table functions. Following DuckDB Iceberg's implementation pattern,
+each clones a
 registered DuckDB scan function set and replaces only its `MultiFileReader`.
 The LeRobot reader normalizes the dataset root and expands it to the v3 JSON or
 Parquet glob, leaving schema inference, parallel reads, projection pushdown,
@@ -106,8 +138,8 @@ or NULL indices are rejected during binding.
 
 The base route cache stores the authoritative `codebase_version`, `data_path`,
 `video_path`, `fps`, and sorted video feature keys from `meta/info.json`, a
-sorted compact episode-to-data-file index, and one copy of each resolved data
-path. A second lazy cache stores compact episode/key/video-file indices,
+sorted compact episode-to-length/data-file index, and one copy of each resolved
+data path. A second lazy cache stores compact episode/key/video-file indices,
 timestamps, and one copy of each resolved MP4 path. Keeping the caches separate
 means ordinary frame scans never materialize the larger episode-by-camera
 table. Both database-instance `ObjectCache` entries are memory-accounted and
@@ -118,8 +150,9 @@ functions.
 This is intentionally above the Parquet layer. DuckDB continues to own footer
 metadata, row-group statistics, the optional `parquet_metadata_cache`, and the
 external file/block cache. The extension neither parses nor duplicates those
-caches. On a base route-cache miss, its metadata query projects only the three
-data route columns through DuckDB's native Parquet reader. The video cache is
+caches. On a base route-cache miss, its metadata query projects only the four
+episode length/data route columns through DuckDB's native Parquet reader. The
+video cache is
 not populated until `lerobot_video_routes` or
 `lerobot_video_metadata_cache` is bound; that query projects only four columns
 per video key plus `episode_index` and episode `length`.

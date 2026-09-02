@@ -300,10 +300,10 @@ shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Load(ClientContext &c
 	auto info = ReadLerobotInfo(connection, info_path);
 
 	const auto episodes_path = root + LEROBOT_EPISODES_SUFFIX;
-	auto episode_result =
-	    connection.Query("SELECT CAST(episode_index AS BIGINT), CAST(\"data/chunk_index\" AS BIGINT), "
-	                     "CAST(\"data/file_index\" AS BIGINT) FROM read_parquet(" +
-	                     MetadataQueryPath(episodes_path) + ")");
+	auto episode_result = connection.Query(
+	    "SELECT CAST(episode_index AS BIGINT), CAST(length AS BIGINT), CAST(\"data/chunk_index\" AS BIGINT), "
+	    "CAST(\"data/file_index\" AS BIGINT) FROM read_parquet(" +
+	    MetadataQueryPath(episodes_path) + ")");
 	if (episode_result->HasError()) {
 		ThrowQueryError("episode metadata", *episode_result);
 	}
@@ -317,16 +317,20 @@ shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Load(ClientContext &c
 			break;
 		}
 		for (idx_t row = 0; row < chunk->size(); row++) {
-			for (idx_t column = 0; column < 3; column++) {
+			for (idx_t column = 0; column < 4; column++) {
 				if (chunk->GetValue(column, row).IsNull()) {
 					throw BinderException("LeRobot episode routing columns must not contain NULL");
 				}
 			}
 			const auto episode_index = chunk->GetValue(0, row).GetValue<int64_t>();
-			const auto chunk_index = chunk->GetValue(1, row).GetValue<int64_t>();
-			const auto file_index = chunk->GetValue(2, row).GetValue<int64_t>();
+			const auto episode_length = chunk->GetValue(1, row).GetValue<int64_t>();
+			const auto chunk_index = chunk->GetValue(2, row).GetValue<int64_t>();
+			const auto file_index = chunk->GetValue(3, row).GetValue<int64_t>();
 			if (episode_index < 0) {
 				throw BinderException("LeRobot episode indices must be non-negative");
+			}
+			if (episode_length <= 0) {
+				throw BinderException("LeRobot episode %d length must be positive", episode_index);
 			}
 
 			auto data_file = ResolveDataPath(root, info.data_path_template, chunk_index, file_index);
@@ -339,7 +343,7 @@ shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Load(ClientContext &c
 			} else {
 				data_file_index = entry->second;
 			}
-			routes.emplace_back(episode_index, data_file_index);
+			routes.emplace_back(episode_index, episode_length, data_file_index);
 		}
 	}
 
@@ -401,6 +405,16 @@ vector<string> LerobotDatasetMetadata::ResolveDataFiles(const vector<int64_t> &e
 	}
 	std::sort(result.begin(), result.end());
 	return result;
+}
+
+const LerobotEpisodeRoute *LerobotDatasetMetadata::FindEpisodeRoute(int64_t episode_index) const {
+	auto route = std::lower_bound(
+	    routes.begin(), routes.end(), episode_index,
+	    [](const LerobotEpisodeRoute &candidate, int64_t value) { return candidate.episode_index < value; });
+	if (route == routes.end() || route->episode_index != episode_index) {
+		return nullptr;
+	}
+	return &*route;
 }
 
 const string &LerobotDatasetMetadata::GetSchemaDataFile() const {

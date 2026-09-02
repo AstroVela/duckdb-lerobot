@@ -11,14 +11,14 @@ version compatibility matrix.
 
 ## Current status
 
-The extension now exposes native dataset-root scans for LeRobot v3 metadata
-and frame Parquet files. Like the Iceberg extension, it copies DuckDB's
+The extension now exposes native dataset-root scans for LeRobot v3 episode,
+task, and frame Parquet files. Like the Iceberg extension, it copies DuckDB's
 registered `read_json_auto` and `parquet_scan` function sets and injects only a
 format-specific `MultiFileReader`. DuckDB therefore retains its native
 projection, filter, parallel I/O, and row-group pruning paths.
 
 Episode-scoped scans additionally cache the small LeRobot control plane:
-`meta/info.json` plus the `episode_index` to data-shard mapping from
+`meta/info.json` plus each episode's `length` and data-shard mapping from
 `meta/episodes`. The cache resolves custom `data_path` templates and hands an
 explicit, deduplicated file list to DuckDB before Parquet binding.
 
@@ -59,6 +59,15 @@ distinct. Use an order-bearing `request_id` together with `delta_index` and
 `target_ordinal` to restore the caller's tensor order. Padding and the resolved
 target frame are returned explicitly.
 
+`lerobot_temporal_targets` applies the same LeRobot FPS validation, integer
+frame-offset conversion, episode-boundary clamp, and padding semantics without
+opening video. Its input relation has exactly `request_id`, `episode_index`,
+`frame_index`, and `delta_index`. Join the returned `target_frame_index` to
+`lerobot_frames` to fetch any state, action, or other non-video feature.
+`lerobot_tasks` scans the current v3 `meta/tasks.parquet` contract directly, so
+joining a frame's `task_index` yields its `task` string while retaining native
+Parquet projection and filter pushdown. Legacy task layouts are not inferred.
+
 `lerobot_layout(root)` and `lerobot_v3_shard_paths(...)` expose the canonical
 layout without touching storage. A bare Hugging Face repository ID such as
 `lerobot/droid_1.0.1` is normalized to `hf://datasets/lerobot/droid_1.0.1`.
@@ -81,6 +90,10 @@ SELECT * FROM lerobot_v3_shard_paths(
 
 -- Read all v3 episode-metadata shards through DuckDB's native Parquet scan.
 SELECT * FROM lerobot_episodes('hf://datasets/lerobot/droid_1.0.1');
+
+-- Read the current v3 task-index to task-text mapping.
+SELECT task_index, task
+FROM lerobot_tasks('hf://datasets/lerobot/droid_1.0.1');
 
 -- Read the authoritative version and path-template metadata.
 SELECT * FROM lerobot_info('hf://datasets/lerobot/droid_1.0.1');
@@ -157,6 +170,31 @@ FROM lerobot_video_targets(
 )
 ORDER BY target_ordinal;
 
+-- Resolve temporal state/action targets without decoding video. Every input
+-- row chooses one delta; exact duplicates remain distinct via target_ordinal.
+WITH requests AS (
+  SELECT * FROM (VALUES
+    (1001::BIGINT, 12::BIGINT, 45::BIGINT, 0::BIGINT),
+    (1001::BIGINT, 12::BIGINT, 45::BIGINT, 1::BIGINT),
+    (1001::BIGINT, 12::BIGINT, 45::BIGINT, 2::BIGINT)
+  ) t(request_id, episode_index, frame_index, delta_index)
+), targets AS (
+  SELECT *
+  FROM lerobot_temporal_targets(
+    'hf://datasets/lerobot/droid_1.0.1',
+    (SELECT * FROM requests),
+    delta_timestamps := [-0.2, -0.1, 0.0]
+  )
+)
+SELECT targets.request_id, targets.delta_index, targets.is_padding,
+       frames."observation.state", frames.action, tasks.task
+FROM targets
+JOIN lerobot_frames('hf://datasets/lerobot/droid_1.0.1') frames
+  ON frames.episode_index = targets.episode_index
+ AND frames.frame_index = targets.target_frame_index
+JOIN lerobot_tasks('hf://datasets/lerobot/droid_1.0.1') tasks USING (task_index)
+ORDER BY targets.request_id, targets.delta_index, targets.target_ordinal;
+
 -- Inspect the data route cache. Set refresh := true after an in-place
 -- metadata update that does not publish a new dataset revision.
 SELECT *
@@ -167,16 +205,17 @@ SELECT *
 FROM lerobot_video_metadata_cache('hf://datasets/lerobot/droid_1.0.1');
 ```
 
-| root | info_path | episodes_path | data_path | videos_path |
-| --- | --- | --- | --- | --- |
-| `hf://datasets/lerobot/droid_1.0.1` | `…/meta/info.json` | `…/meta/episodes` | `…/data` | `…/videos` |
+| root | info_path | episodes_path | tasks_path | data_path | videos_path |
+| --- | --- | --- | --- | --- | --- |
+| `hf://datasets/lerobot/droid_1.0.1` | `…/meta/info.json` | `…/meta/episodes` | `…/meta/tasks.parquet` | `…/data` | `…/videos` |
 
 ## Roadmap
 
-1. Native state/proprioception expressions and episode trimming.
-2. Optional adaptive seek clustering if cross-storage benchmarks beat the
+1. Vane-side tensor layout and image-transform materialization.
+2. Optional depth-video decoding and dequantization when a target dataset requires it.
+3. Optional adaptive seek clustering if cross-storage benchmarks beat the
    fixed 10-second policy materially.
-3. Optional hardware-accelerated FFmpeg backends after the CPU contract is
+4. Optional hardware-accelerated FFmpeg backends after the CPU contract is
    stable.
 
 ## Metadata and Parquet caching
@@ -188,11 +227,12 @@ of `meta/info.json` invalidates stale entries automatically; `refresh := true`
 forces a rebuild for non-versioned or manually edited datasets. Versioned
 Hugging Face revisions should normally need no explicit refresh.
 
-The data route builder projects only `episode_index`, `data/chunk_index`, and
-`data/file_index` from episode metadata. The lazy video route builder projects
-only `episode_index`, episode `length`, and each video feature's chunk, file,
-and timestamp-range columns. Once the extension has selected the relevant
-paths, native `parquet_scan` owns schema/footer reads, projection and filter pushdown,
+The data route builder projects only `episode_index`, `length`,
+`data/chunk_index`, and `data/file_index` from episode metadata. The lazy video
+route builder projects only `episode_index`, episode `length`, and each video
+feature's chunk, file, and timestamp-range columns. Once the extension has
+selected the relevant paths, native `parquet_scan` owns schema/footer reads,
+projection and filter pushdown,
 row-group min/max pruning, parallel reads, and external-file caching. DuckDB's
 optional `parquet_metadata_cache` setting can therefore be used without any
 LeRobot-specific footer cache.

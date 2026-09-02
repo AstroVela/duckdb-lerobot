@@ -60,6 +60,14 @@ COPY (
     )
 ) TO '{TEST_DIR}/lerobot_scan/meta/episodes' (FORMAT PARQUET, PARTITION_BY (metadata_chunk));
 
+statement ok
+COPY (
+    SELECT * FROM (VALUES
+        (0::BIGINT, 'pick up the cube'::VARCHAR),
+        (1::BIGINT, 'place the cube'::VARCHAR)
+    ) AS tasks(task_index, task)
+) TO '{TEST_DIR}/lerobot_scan/meta/tasks.parquet' (FORMAT PARQUET);
+
 # Besides creating frames/chunk-00, this leaves an incompatible, unreferenced
 # Parquet file beneath the same tree. An episode-scoped scan must ignore it.
 statement ok
@@ -104,6 +112,13 @@ ORDER BY episode_index;
 0	2	0
 1	2	0
 2	2	1
+
+query IT
+SELECT task_index, task
+FROM lerobot_tasks('{TEST_DIR}/lerobot_scan')
+WHERE task_index = 1;
+----
+1	place the cube
 
 query II
 SELECT episode_index, frame_index
@@ -264,6 +279,7 @@ COPY (
 statement ok
 COPY (
     SELECT 0::BIGINT AS episode_index,
+	       1::BIGINT AS length,
            0::BIGINT AS "data/chunk_index",
            0::BIGINT AS "data/file_index",
            0 AS metadata_chunk

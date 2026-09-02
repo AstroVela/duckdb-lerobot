@@ -27,6 +27,7 @@
 #endif
 
 #include "function/lerobot_multi_file_reader.hpp"
+#include "function/lerobot_temporal.hpp"
 #include "storage/lerobot_metadata_cache.hpp"
 
 #if defined(__has_include)
@@ -83,7 +84,6 @@ static const idx_t LEROBOT_MAX_PENDING_TARGETS = 10 * 1024 * 1024;
 static const idx_t LEROBOT_MAX_WINDOW_TARGETS = 100000;
 static const idx_t LEROBOT_DECODE_FRAME_BUDGET = 20000;
 static const double LEROBOT_DEFAULT_CLUSTER_GAP_SECONDS = 10.0;
-static const double LEROBOT_DEFAULT_TOLERANCE_SECONDS = 1e-4;
 
 template <typename CALLBACK>
 struct BindColumnNames;
@@ -329,7 +329,7 @@ LerobotVideoOptions GetVideoOptions(TableFunctionBindInput &input, const char *f
 		throw BinderException("%s width and height must be between 0 and 32768", function_name);
 	}
 
-	const auto tolerance = GetNamedDouble(input, "tolerance", LEROBOT_DEFAULT_TOLERANCE_SECONDS);
+	const auto tolerance = GetNamedDouble(input, "tolerance", LEROBOT_DEFAULT_TEMPORAL_TOLERANCE_SECONDS);
 	if (!std::isfinite(tolerance) || tolerance <= 0) {
 		throw BinderException("%s tolerance must be finite and positive", function_name);
 	}
@@ -612,11 +612,6 @@ struct LerobotVideoWindowRequest {
 	int64_t frame_index;
 };
 
-struct LerobotVideoWindowDelta {
-	double timestamp;
-	int64_t frame_offset;
-};
-
 vector<LerobotVideoWindowRequest> GetVideoWindowRequests(const Value &value) {
 	if (value.IsNull()) {
 		throw BinderException("lerobot_video_windows requests must not be NULL");
@@ -645,52 +640,8 @@ vector<LerobotVideoWindowRequest> GetVideoWindowRequests(const Value &value) {
 	return result;
 }
 
-vector<LerobotVideoWindowDelta> GetVideoWindowDeltas(TableFunctionBindInput &input, int64_t fps, double tolerance,
-                                                     const char *function_name) {
-	vector<double> timestamps;
-	auto entry = input.named_parameters.find("delta_timestamps");
-	if (entry == input.named_parameters.end()) {
-		timestamps.push_back(0);
-	} else {
-		if (entry->second.IsNull()) {
-			throw BinderException("%s delta_timestamps must not be NULL", function_name);
-		}
-		for (const auto &child : ListValue::GetChildren(entry->second)) {
-			if (child.IsNull()) {
-				throw BinderException("%s delta_timestamps must not contain NULL", function_name);
-			}
-			timestamps.push_back(child.DefaultCastAs(LogicalType::DOUBLE).GetValue<double>());
-		}
-	}
-
-	vector<LerobotVideoWindowDelta> result;
-	result.reserve(timestamps.size());
-	for (const auto timestamp : timestamps) {
-		if (!std::isfinite(timestamp)) {
-			throw BinderException("%s delta_timestamps must be finite", function_name);
-		}
-		const long double scaled = static_cast<long double>(timestamp) * static_cast<long double>(fps);
-		if (scaled < static_cast<long double>(std::numeric_limits<int64_t>::min()) ||
-		    scaled > static_cast<long double>(std::numeric_limits<int64_t>::max())) {
-			throw BinderException("%s delta timestamp %.17g is too large", function_name, timestamp);
-		}
-		const auto frame_offset = static_cast<int64_t>(std::llround(scaled));
-		const auto canonical_timestamp = static_cast<double>(frame_offset) / static_cast<double>(fps);
-		if (std::fabs(timestamp - canonical_timestamp) > tolerance) {
-			throw BinderException("%s delta timestamp %.17g is not a multiple of 1/fps (%d) "
-			                      "within tolerance %.17g",
-			                      function_name, timestamp, fps, tolerance);
-		}
-		LerobotVideoWindowDelta delta;
-		delta.timestamp = timestamp;
-		delta.frame_offset = frame_offset;
-		result.push_back(delta);
-	}
-	return result;
-}
-
 string BuildVideoWindowQuery(const vector<LerobotVideoWindowRequest> &requests,
-                             const vector<LerobotVideoWindowDelta> &deltas,
+                             const vector<LerobotTemporalDelta> &deltas,
                              const unordered_map<int64_t, int64_t> &episode_lengths, const vector<string> &data_files,
                              const vector<int64_t> &episode_indices) {
 	if (requests.empty() || deltas.empty() || data_files.empty()) {
@@ -765,7 +716,7 @@ unique_ptr<FunctionData> LerobotVideoWindowsBind(ClientContext &context, TableFu
 	    LerobotVideoMetadata::Get(context, root, GetRefreshParameter(input, "lerobot_video_windows"), cache_hit);
 	auto video_keys = GetVideoKeys(input, *video_metadata);
 	auto options = GetVideoOptions(input, "lerobot_video_windows");
-	auto deltas = GetVideoWindowDeltas(input, video_metadata->GetFPS(), options.tolerance, "lerobot_video_windows");
+	auto deltas = GetLerobotTemporalDeltas(input, video_metadata->GetFPS(), options.tolerance, "lerobot_video_windows");
 	if (!deltas.empty() && requests.size() > LEROBOT_MAX_WINDOW_TARGETS / deltas.size()) {
 		throw BinderException("lerobot_video_windows expands to more than %d frame targets",
 		                      LEROBOT_MAX_WINDOW_TARGETS);
@@ -830,7 +781,7 @@ unique_ptr<FunctionData> LerobotVideoWindowsBind(ClientContext &context, TableFu
 
 struct LerobotVideoTargetsBindData final : public TableFunctionData {
 	LerobotVideoTargetsBindData(shared_ptr<LerobotDatasetMetadata> dataset_p,
-	                            shared_ptr<LerobotVideoMetadata> metadata_p, vector<LerobotVideoWindowDelta> deltas_p,
+	                            shared_ptr<LerobotVideoMetadata> metadata_p, vector<LerobotTemporalDelta> deltas_p,
 	                            vector<idx_t> input_columns_p, const LerobotVideoOptions &options_p)
 	    : dataset(std::move(dataset_p)), metadata(std::move(metadata_p)), deltas(std::move(deltas_p)),
 	      input_columns(std::move(input_columns_p)), options(options_p) {
@@ -842,7 +793,7 @@ struct LerobotVideoTargetsBindData final : public TableFunctionData {
 
 	shared_ptr<LerobotDatasetMetadata> dataset;
 	shared_ptr<LerobotVideoMetadata> metadata;
-	vector<LerobotVideoWindowDelta> deltas;
+	vector<LerobotTemporalDelta> deltas;
 	//! Physical input indexes in request_id, episode_index, frame_index,
 	//! video_key, delta_index order.
 	vector<idx_t> input_columns;
@@ -896,7 +847,7 @@ unique_ptr<FunctionData> LerobotVideoTargetsBind(ClientContext &context, TableFu
 	bool dataset_cache_hit;
 	auto dataset = LerobotDatasetMetadata::Get(context, root, false, dataset_cache_hit);
 	auto options = GetVideoOptions(input, "lerobot_video_targets");
-	auto deltas = GetVideoWindowDeltas(input, metadata->GetFPS(), options.tolerance, "lerobot_video_targets");
+	auto deltas = GetLerobotTemporalDeltas(input, metadata->GetFPS(), options.tolerance, "lerobot_video_targets");
 
 	names = {"request_id",      "target_ordinal",
 	         "episode_index",   "frame_index",

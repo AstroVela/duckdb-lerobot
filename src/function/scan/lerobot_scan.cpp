@@ -63,6 +63,8 @@ string ScanSuffix(LerobotScanKind kind) {
 		return "/meta/info.json";
 	case LerobotScanKind::EPISODES:
 		return "/meta/episodes/**/*.parquet";
+	case LerobotScanKind::TASKS:
+		return "/meta/tasks.parquet";
 	case LerobotScanKind::FRAMES:
 		return "/data/**/*.parquet";
 	default:
@@ -180,9 +182,9 @@ unique_ptr<FunctionData> LerobotLayoutBind(ClientContext &, TableFunctionBindInp
 	}
 
 	auto root = NormalizeLerobotRoot(StringValue::Get(input.inputs[0]));
-	names = {"root", "info_path", "episodes_path", "data_path", "videos_path"};
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::VARCHAR};
+	names = {"root", "info_path", "episodes_path", "tasks_path", "data_path", "videos_path"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
 	return make_uniq<LerobotLayoutBindData>(std::move(root));
 }
 
@@ -197,8 +199,9 @@ void LerobotLayoutFunction(ClientContext &, TableFunctionInput &input, DataChunk
 	output.data[0].SetValue(0, Value(root));
 	output.data[1].SetValue(0, Value(root + "/meta/info.json"));
 	output.data[2].SetValue(0, Value(root + "/meta/episodes"));
-	output.data[3].SetValue(0, Value(root + "/data"));
-	output.data[4].SetValue(0, Value(root + "/videos"));
+	output.data[3].SetValue(0, Value(root + "/meta/tasks.parquet"));
+	output.data[4].SetValue(0, Value(root + "/data"));
+	output.data[5].SetValue(0, Value(root + "/videos"));
 	SetOutputCardinality(output, 1, 0);
 	state.emitted = true;
 }
@@ -534,6 +537,10 @@ unique_ptr<MultiFileReader> LerobotMultiFileReader::CreateEpisodes(const TableFu
 	return CreateLerobotReader(LerobotScanKind::EPISODES, function);
 }
 
+unique_ptr<MultiFileReader> LerobotMultiFileReader::CreateTasks(const TableFunction &function) {
+	return CreateLerobotReader(LerobotScanKind::TASKS, function);
+}
+
 unique_ptr<MultiFileReader> LerobotMultiFileReader::CreateFrames(const TableFunction &function) {
 	return CreateLerobotReader(LerobotScanKind::FRAMES, function);
 }
@@ -569,6 +576,10 @@ TableFunctionSet LerobotFunctions::GetInfoFunction(ExtensionLoader &loader) {
 
 TableFunctionSet LerobotFunctions::GetEpisodesFunction(ExtensionLoader &loader) {
 	return CreateNativeScan(loader, "parquet_scan", "lerobot_episodes", LerobotMultiFileReader::CreateEpisodes);
+}
+
+TableFunctionSet LerobotFunctions::GetTasksFunction(ExtensionLoader &loader) {
+	return CreateNativeScan(loader, "parquet_scan", "lerobot_tasks", LerobotMultiFileReader::CreateTasks);
 }
 
 TableFunctionSet LerobotFunctions::GetFramesFunction(ExtensionLoader &loader) {

@@ -1,0 +1,217 @@
+# name: test/sql/lerobot_temporal_targets.test
+# description: LeRobot temporal targets align state and action windows without video decode
+# group: [lerobot]
+
+require parquet
+
+require json
+
+require lerobot
+
+statement ok
+COPY (
+    SELECT 0 AS bootstrap, 1 AS payload
+) TO '{TEST_DIR}/lerobot_temporal' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (
+    SELECT 0 AS bootstrap, 1 AS payload
+) TO '{TEST_DIR}/lerobot_temporal/meta' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version,
+           'data/data_chunk={chunk_index}/data_0.parquet' AS data_path,
+           10 AS fps,
+           struct_pack(
+               "observation.state" := struct_pack(dtype := 'float32'),
+               action := struct_pack(dtype := 'float32')
+           ) AS features
+) TO '{TEST_DIR}/lerobot_temporal/meta/info.json' (FORMAT JSON, ARRAY false);
+
+statement ok
+COPY (
+    SELECT episodes.*, 0 AS metadata_chunk FROM (VALUES
+        (0::BIGINT, 3::BIGINT, 0::BIGINT, 3::BIGINT, 0::BIGINT, 0::BIGINT),
+        (2::BIGINT, 2::BIGINT, 3::BIGINT, 5::BIGINT, 1::BIGINT, 0::BIGINT)
+    ) AS episodes(
+        episode_index,
+        length,
+        dataset_from_index,
+        dataset_to_index,
+        "data/chunk_index",
+        "data/file_index"
+    )
+) TO '{TEST_DIR}/lerobot_temporal/meta/episodes' (FORMAT PARQUET, PARTITION_BY (metadata_chunk));
+
+statement ok
+COPY (
+    SELECT * FROM (VALUES
+        (0::BIGINT, 0::BIGINT, 0::BIGINT, 0.0::DOUBLE, 10::INTEGER, 100::INTEGER, 0::BIGINT, 0),
+        (0::BIGINT, 1::BIGINT, 1::BIGINT, 0.1::DOUBLE, 11::INTEGER, 101::INTEGER, 0::BIGINT, 0),
+        (0::BIGINT, 2::BIGINT, 2::BIGINT, 0.2::DOUBLE, 12::INTEGER, 102::INTEGER, 1::BIGINT, 0),
+        (2::BIGINT, 0::BIGINT, 3::BIGINT, 0.0::DOUBLE, 20::INTEGER, 200::INTEGER, 1::BIGINT, 1),
+        (2::BIGINT, 1::BIGINT, 4::BIGINT, 0.1::DOUBLE, 21::INTEGER, 201::INTEGER, 1::BIGINT, 1)
+    ) AS frames(episode_index, frame_index, "index", timestamp, state, action, task_index, data_chunk)
+) TO '{TEST_DIR}/lerobot_temporal/data' (FORMAT PARQUET, PARTITION_BY (data_chunk));
+
+statement ok
+COPY (
+    SELECT * FROM (VALUES
+        (0::BIGINT, 'pick'::VARCHAR),
+        (1::BIGINT, 'place'::VARCHAR)
+    ) AS tasks(task_index, task)
+) TO '{TEST_DIR}/lerobot_temporal/meta/tasks.parquet' (FORMAT PARQUET);
+
+query II
+SELECT frame_index, state
+FROM lerobot_episode_frames('{TEST_DIR}/lerobot_temporal', [2])
+ORDER BY frame_index;
+----
+0	20
+1	21
+
+# Each relation row selects one delta. Boundary offsets clamp exactly like
+# LeRobot and duplicate input rows remain distinct through target_ordinal.
+query IIIIIRIII
+SELECT request_id, delta_index, delta_frame_offset, CAST(is_padding AS INTEGER),
+       target_frame_index, delta_timestamp, episode_index, frame_index,
+       count(*) OVER (PARTITION BY request_id, delta_index, target_frame_index)
+FROM lerobot_temporal_targets(
+    '{TEST_DIR}/lerobot_temporal',
+    (SELECT * FROM (VALUES
+        (10, 0, 0, 0),
+        (10, 0, 0, 1),
+        (10, 0, 0, 2),
+        (11, 2, 1, 2),
+        (11, 2, 1, 3),
+        (11, 2, 1, 4),
+        (99, 0, 1, 2),
+        (99, 0, 1, 2)
+    ) requests(request_id, episode_index, frame_index, delta_index)),
+    delta_timestamps := [-0.2, -0.1, 0.0, 0.1, 0.2]
+)
+ORDER BY request_id, delta_index, target_ordinal;
+----
+10	0	-2	1	0	-0.2	0	0	1
+10	1	-1	1	0	-0.1	0	0	1
+10	2	0	0	0	0.0	0	0	1
+11	2	0	0	1	0.0	2	1	1
+11	3	1	1	1	0.1	2	1	1
+11	4	2	1	1	0.2	2	1	1
+99	2	0	0	1	0.0	0	1	2
+99	2	0	0	1	0.0	0	1	2
+
+# The resolved relation joins ordinary Parquet rows for arbitrary non-video
+# features and task text; no values are boxed in the extension.
+query IIIIIIT
+WITH targets AS (
+    SELECT *
+    FROM lerobot_temporal_targets(
+        '{TEST_DIR}/lerobot_temporal',
+        (SELECT * FROM (VALUES
+            (20, 0, 0, 0),
+            (20, 0, 0, 1),
+            (20, 0, 0, 2),
+            (21, 2, 1, 2),
+            (21, 2, 1, 3),
+            (21, 2, 1, 4)
+        ) requests(request_id, episode_index, frame_index, delta_index)),
+        delta_timestamps := [-0.2, -0.1, 0.0, 0.1, 0.2]
+    )
+)
+SELECT targets.request_id, targets.delta_index, CAST(targets.is_padding AS INTEGER),
+       frames.state, frames.action, frames.task_index, tasks.task
+FROM targets
+JOIN lerobot_frames('{TEST_DIR}/lerobot_temporal') frames
+  ON frames.episode_index = targets.episode_index
+ AND frames.frame_index = targets.target_frame_index
+JOIN lerobot_tasks('{TEST_DIR}/lerobot_temporal') tasks USING (task_index)
+ORDER BY targets.request_id, targets.delta_index;
+----
+20	0	1	10	100	0	pick
+20	1	1	10	100	0	pick
+20	2	0	10	100	0	pick
+21	2	0	21	201	1	place
+21	3	1	21	201	1	place
+21	4	1	21	201	1	place
+
+# DuckDB may request only one projected vector while counting every row.
+query I
+SELECT count(*)
+FROM lerobot_temporal_targets(
+    '{TEST_DIR}/lerobot_temporal',
+    (SELECT i AS request_id, 0 AS episode_index, 1 AS frame_index, 2 AS delta_index
+     FROM range(4097) requests(i)),
+    delta_timestamps := [-0.2, -0.1, 0.0, 0.1, 0.2]
+);
+----
+4097
+
+# Input columns are matched by name, then cast once by DuckDB before the C++
+# operator consumes their vectors.
+query IIIII
+SELECT request_id, episode_index, frame_index, delta_index, target_frame_index
+FROM lerobot_temporal_targets(
+    '{TEST_DIR}/lerobot_temporal',
+    (SELECT '0' AS delta_index, '1' AS frame_index,
+            '2' AS episode_index, '42' AS request_id)
+);
+----
+42	2	1	0	1
+
+statement error
+SELECT *
+FROM lerobot_temporal_targets(
+    '{TEST_DIR}/lerobot_temporal',
+    (SELECT 1 AS request_id, 0 AS episode_index, 0 AS frame_index, 0 AS delta_index),
+    delta_timestamps := [0.05]
+);
+----
+not a multiple of 1/fps
+
+statement error
+SELECT *
+FROM lerobot_temporal_targets(
+    '{TEST_DIR}/lerobot_temporal',
+    (SELECT 1 AS request_id, 1 AS episode_index, 0 AS frame_index, 0 AS delta_index)
+);
+----
+episode 1 does not exist
+
+statement error
+SELECT *
+FROM lerobot_temporal_targets(
+    '{TEST_DIR}/lerobot_temporal',
+    (SELECT 1 AS request_id, 2 AS episode_index, 2 AS frame_index, 0 AS delta_index)
+);
+----
+frame 2 is outside episode 2 length 2
+
+statement error
+SELECT *
+FROM lerobot_temporal_targets(
+    '{TEST_DIR}/lerobot_temporal',
+    (SELECT 1 AS request_id, 0 AS episode_index, 0 AS frame_index, NULL AS delta_index)
+);
+----
+input column 'delta_index' must not contain NULL
+
+statement error
+SELECT *
+FROM lerobot_temporal_targets(
+    '{TEST_DIR}/lerobot_temporal',
+    (SELECT 1 AS request_id, 0 AS episode_index, 0 AS frame_index, 1 AS delta_index),
+    delta_timestamps := [0.0]
+);
+----
+delta_index 1 is outside delta_timestamps length 1
+
+statement error
+SELECT *
+FROM lerobot_temporal_targets(
+    '{TEST_DIR}/lerobot_temporal',
+    (SELECT 1 AS request_id, 0 AS episode_index, 0 AS frame_index, 0 AS delta_index, 42 AS extra)
+);
+----
+input relation must contain exactly request_id, episode_index, frame_index, and delta_index
