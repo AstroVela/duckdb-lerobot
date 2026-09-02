@@ -112,23 +112,24 @@ def canonical_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def time_callable(
-    function: Callable[[], list[dict[str, Any]]], warmups: int, repeats: int
-) -> tuple[list[float], list[dict[str, Any]]]:
+    function: Callable[[], dict[str, int]], warmups: int, repeats: int
+) -> tuple[list[float], dict[str, int]]:
     for _ in range(warmups):
         function()
     durations: list[float] = []
-    expected: list[dict[str, Any]] | None = None
+    expected: dict[str, int] | None = None
     for _ in range(repeats):
         started = time.perf_counter()
-        rows = canonical_rows(function())
+        summary = function()
         durations.append(time.perf_counter() - started)
         if expected is None:
-            expected = rows
-        elif rows != expected:
+            expected = summary
+        elif summary != expected:
             raise RuntimeError(
-                "one engine produced non-deterministic pixels between repeats"
+                "one engine produced a non-deterministic materialization summary "
+                "between repeats"
             )
-    return durations, expected or []
+    return durations, expected or {}
 
 
 def find_profile_metrics(value: Any, output: dict[str, int]) -> None:
@@ -157,7 +158,21 @@ def selection_query(args: argparse.Namespace, root: str) -> str:
     )
 
 
-def duckdb_decode_query(args: argparse.Namespace, hash_images: bool) -> str:
+def selected_frames_values(selected_rows: list[dict[str, Any]]) -> str:
+    if not selected_rows:
+        raise RuntimeError("frame selection returned no rows")
+    return ", ".join(
+        f"({int(row['episode_index'])}, {int(row['frame_index'])})"
+        for row in selected_rows
+    )
+
+
+def duckdb_decode_query(
+    args: argparse.Namespace,
+    selected_rows: list[dict[str, Any]],
+    hash_images: bool,
+    order_output: bool,
+) -> str:
     cameras_sql = ", ".join(
         f"({sql_string(camera)}, {index})" for index, camera in enumerate(args.camera)
     )
@@ -168,9 +183,10 @@ def duckdb_decode_query(args: argparse.Namespace, hash_images: bool) -> str:
         resize_sql = f", width := {args.width}, height := {args.height}"
     root = sql_string(args.dataset)
     image_sql = "sha256(image) AS sha256" if hash_images else "image"
+    order_sql = "ORDER BY episode_index, frame_index, video_key" if order_output else ""
     return f"""
-        WITH selected_frames AS (
-            {selection_query(args, root)}
+        WITH selected_frames(episode_index, frame_index) AS (
+            VALUES {selected_frames_values(selected_rows)}
         ), targets AS (
             SELECT row_number() OVER (
                        ORDER BY episode_index, frame_index, camera_ordinal
@@ -195,7 +211,20 @@ def duckdb_decode_query(args: argparse.Namespace, hash_images: bool) -> str:
             codec_threads := {args.codec_threads}
             {resize_sql}
         )
-        ORDER BY episode_index, frame_index, video_key
+        {order_sql}
+    """
+
+
+def duckdb_timed_query(
+    args: argparse.Namespace, selected_rows: list[dict[str, Any]]
+) -> str:
+    decode_query = duckdb_decode_query(
+        args, selected_rows, hash_images=False, order_output=False
+    )
+    return f"""
+        SELECT count(image) AS decoded_images,
+               coalesce(sum(octet_length(image)), 0) AS decoded_bytes
+        FROM ({decode_query}) decoded
     """
 
 
@@ -344,52 +373,77 @@ def configure_duckdb_connection(
 
 def run_duckdb_python(
     args: argparse.Namespace,
-) -> tuple[float, Callable[[], list[dict[str, Any]]], dict[str, Any]]:
+) -> tuple[
+    float,
+    Callable[[], dict[str, int]],
+    Callable[[], list[dict[str, Any]]],
+    dict[str, Any],
+]:
     import duckdb
 
     started = time.perf_counter()
     connection = duckdb.connect()
     configure_duckdb_connection(args, connection.execute)
     version_row = connection.execute("PRAGMA version").fetchone()
-    setup_seconds = time.perf_counter() - started
     root = sql_string(args.dataset)
-    query = duckdb_decode_query(args, hash_images=False)
+    selection_started = time.perf_counter()
+    selected = connection.execute(selection_query(args, root)).fetchall()
+    selection_seconds = time.perf_counter() - selection_started
+    selected_rows = [
+        {"episode_index": int(row[0]), "frame_index": int(row[1])} for row in selected
+    ]
+    if len(selected_rows) != args.rows:
+        raise RuntimeError(
+            f"requested {args.rows} frame rows, but selected {len(selected_rows)}"
+        )
+    timed_query = duckdb_timed_query(args, selected_rows)
+    validation_query = duckdb_decode_query(
+        args, selected_rows, hash_images=True, order_output=True
+    )
+    setup_seconds = time.perf_counter() - started
 
-    def execute() -> list[dict[str, Any]]:
-        result = connection.execute(query).fetchall()
-        rows = []
-        for episode_index, frame_index, video_key, width, height, image in result:
-            expected_bytes = int(width) * int(height) * 3
-            pixels = bytes(image)
-            if len(pixels) != expected_bytes:
-                raise RuntimeError(
-                    f"DuckDB returned {len(pixels)} bytes, expected {expected_bytes}"
-                )
-            rows.append(
-                {
-                    "episode_index": int(episode_index),
-                    "frame_index": int(frame_index),
-                    "video_key": video_key,
-                    "shape": [int(height), int(width), 3],
-                    "sha256": hashlib.sha256(pixels).hexdigest(),
-                }
-            )
-        return rows
+    def execute() -> dict[str, int]:
+        decoded_images, decoded_bytes = connection.execute(timed_query).fetchone()
+        return {
+            "frame_rows": int(decoded_images) // len(args.camera),
+            "decoded_images": int(decoded_images),
+            "decoded_bytes": int(decoded_bytes),
+        }
+
+    def validate() -> list[dict[str, Any]]:
+        result = connection.execute(validation_query).fetchall()
+        return [
+            {
+                "episode_index": int(episode_index),
+                "frame_index": int(frame_index),
+                "video_key": video_key,
+                "shape": [int(height), int(width), 3],
+                "sha256": sha256,
+            }
+            for episode_index, frame_index, video_key, width, height, sha256 in result
+        ]
 
     extra: dict[str, Any] = {
         "duckdb_version": str(version_row[0]),
         "duckdb_source_id": str(version_row[1]),
         "duckdb_python_version": duckdb.__version__,
-        "query": query.strip(),
+        "selection_seconds": selection_seconds,
+        "selection_strategy": "metadata-only lerobot_frames query",
+        "timed_query": timed_query.strip(),
+        "validation_query": validation_query.strip(),
+        "timing_boundary": (
+            "DuckDB executes lerobot_video_targets and consumes every BLOB with "
+            "octet_length; BLOB transfer and SHA-256 are excluded"
+        ),
+        "validation_boundary": (
+            "DuckDB replays the target query, hashes RGB BLOBs with SQL sha256, "
+            "and transfers only keys, shapes, and digests"
+        ),
     }
 
     def collect_profile() -> None:
         metrics: dict[str, int] = {}
         paths = []
-        selected = connection.execute(selection_query(args, root)).fetchall()
-        selected_rows = [
-            {"episode_index": row[0], "frame_index": row[1]} for row in selected
-        ]
         for label, profile_query in source_profile_queries(args, selected_rows):
             profile_path = (
                 Path(args.output).with_suffix(f".{label}.profile.json").resolve()
@@ -413,24 +467,55 @@ def run_duckdb_python(
 
     extra["collect_profile"] = collect_profile
     extra["close"] = connection.close
-    return setup_seconds, execute, extra
+    return setup_seconds, execute, validate, extra
 
 
 def run_duckdb_cli(
     args: argparse.Namespace,
-) -> tuple[float, Callable[[], list[dict[str, Any]]], dict[str, Any]]:
+) -> tuple[
+    float,
+    Callable[[], dict[str, int]],
+    Callable[[], list[dict[str, Any]]],
+    dict[str, Any],
+]:
     started = time.perf_counter()
     connection = DuckDBCLIConnection(
         args.duckdb_cli, allow_unsigned=bool(args.extension)
     )
     configure_duckdb_connection(args, connection.execute)
     version_rows = connection.execute("PRAGMA version")
-    setup_seconds = time.perf_counter() - started
-    query = duckdb_decode_query(args, hash_images=True)
     root = sql_string(args.dataset)
+    selection_started = time.perf_counter()
+    selected_rows = connection.execute(selection_query(args, root))
+    selection_seconds = time.perf_counter() - selection_started
+    selected_rows = [
+        {
+            "episode_index": int(row["episode_index"]),
+            "frame_index": int(row["frame_index"]),
+        }
+        for row in selected_rows
+    ]
+    if len(selected_rows) != args.rows:
+        raise RuntimeError(
+            f"requested {args.rows} frame rows, but selected {len(selected_rows)}"
+        )
+    timed_query = duckdb_timed_query(args, selected_rows)
+    validation_query = duckdb_decode_query(
+        args, selected_rows, hash_images=True, order_output=True
+    )
+    setup_seconds = time.perf_counter() - started
 
-    def execute() -> list[dict[str, Any]]:
-        result = connection.execute(query)
+    def execute() -> dict[str, int]:
+        result = connection.execute(timed_query)[0]
+        decoded_images = int(result["decoded_images"])
+        return {
+            "frame_rows": decoded_images // len(args.camera),
+            "decoded_images": decoded_images,
+            "decoded_bytes": int(result["decoded_bytes"]),
+        }
+
+    def validate() -> list[dict[str, Any]]:
+        result = connection.execute(validation_query)
         return [
             {
                 "episode_index": int(row["episode_index"]),
@@ -446,15 +531,25 @@ def run_duckdb_cli(
         "duckdb_version": version_rows[0]["library_version"],
         "duckdb_source_id": version_rows[0]["source_id"],
         "duckdb_cli": connection.executable,
-        "query": query.strip(),
+        "selection_seconds": selection_seconds,
+        "selection_strategy": "metadata-only lerobot_frames query",
+        "timed_query": timed_query.strip(),
+        "validation_query": validation_query.strip(),
+        "timing_boundary": (
+            "DuckDB executes lerobot_video_targets and consumes every BLOB with "
+            "octet_length; BLOB transfer and SHA-256 are excluded"
+        ),
+        "validation_boundary": (
+            "DuckDB replays the target query, hashes RGB BLOBs with SQL sha256, "
+            "and transfers only keys, shapes, and digests"
+        ),
         "close": connection.close,
     }
 
     def collect_profile() -> None:
-        selected = connection.execute(selection_query(args, root))
         metrics: dict[str, int] = {}
         paths = []
-        for label, profile_query in source_profile_queries(args, selected):
+        for label, profile_query in source_profile_queries(args, selected_rows):
             profile_path = (
                 Path(args.output).with_suffix(f".{label}.profile.json").resolve()
             )
@@ -476,12 +571,17 @@ def run_duckdb_cli(
         extra["profile_metrics"] = metrics
 
     extra["collect_profile"] = collect_profile
-    return setup_seconds, execute, extra
+    return setup_seconds, execute, validate, extra
 
 
 def run_duckdb(
     args: argparse.Namespace,
-) -> tuple[float, Callable[[], list[dict[str, Any]]], dict[str, Any]]:
+) -> tuple[
+    float,
+    Callable[[], dict[str, int]],
+    Callable[[], list[dict[str, Any]]],
+    dict[str, Any],
+]:
     if args.duckdb_cli:
         return run_duckdb_cli(args)
     return run_duckdb_python(args)
@@ -489,18 +589,54 @@ def run_duckdb(
 
 def run_daft(
     args: argparse.Namespace,
-) -> tuple[float, Callable[[], list[dict[str, Any]]], dict[str, Any]]:
+) -> tuple[
+    float,
+    Callable[[], dict[str, int]],
+    Callable[[], list[dict[str, Any]]],
+    dict[str, Any],
+]:
     import daft
     from daft.datasets import lerobot
 
-    setup_seconds = 0.0
+    started = time.perf_counter()
+    selection_started = time.perf_counter()
+    metadata = lerobot.read(args.dataset, load_video_frames=False)
+    if not args.all_episodes:
+        metadata = metadata.where(daft.col("episode_index") == args.episode)
+    selected = (
+        metadata.select("index", "episode_index", "frame_index")
+        .sort(["episode_index", "frame_index"])
+        .limit(args.rows)
+        .collect()
+        .to_pydict()
+    )
+    selection_seconds = time.perf_counter() - selection_started
+    selected_indices = [int(index) for index in selected["index"]]
+    if len(selected_indices) != args.rows:
+        raise RuntimeError(
+            f"requested {args.rows} frame rows, but selected {len(selected_indices)}"
+        )
 
-    def execute() -> list[dict[str, Any]]:
+    setup_seconds = time.perf_counter() - started
+
+    def decode_frame() -> Any:
+        # collect() materializes a Daft DataFrame in place. Reusing the same
+        # object would turn later repeats into cached no-ops rather than decode
+        # measurements, so construct a fresh lazy plan for every invocation.
         frame = lerobot.read(args.dataset, load_video_frames=args.camera)
-        if not args.all_episodes:
-            frame = frame.where(daft.col("episode_index") == args.episode)
-        frame = frame.sort(["episode_index", "frame_index"]).limit(args.rows)
-        data = frame.collect().to_pydict()
+        frame = frame.where(daft.col("index").is_in(selected_indices))
+        return frame.select("episode_index", "frame_index", "index", *args.camera)
+
+    def execute() -> dict[str, int]:
+        materialized = decode_frame().collect()
+        frame_rows = len(materialized)
+        return {
+            "frame_rows": frame_rows,
+            "decoded_images": frame_rows * len(args.camera),
+        }
+
+    def validate() -> list[dict[str, Any]]:
+        data = decode_frame().collect().to_pydict()
         rows: list[dict[str, Any]] = []
         for row_index in range(len(data["frame_index"])):
             for camera in args.camera:
@@ -517,13 +653,37 @@ def run_daft(
     return (
         setup_seconds,
         execute,
-        {"daft_version": getattr(daft, "__version__", "unknown")},
+        validate,
+        {
+            "daft_version": getattr(daft, "__version__", "unknown"),
+            "selection_seconds": selection_seconds,
+            "selection_strategy": (
+                "metadata-only sorted selection followed by an index filter "
+                "that Daft pushes below the video UDF"
+            ),
+            "selected_index_min": min(selected_indices),
+            "selected_index_max": max(selected_indices),
+            "timing_boundary": (
+                "Daft constructs a fresh lazy plan and collects only the selected "
+                "image columns into a materialized DataFrame; to_pydict and "
+                "SHA-256 are excluded"
+            ),
+            "validation_boundary": (
+                "Daft replays a fresh plan, converts collected images to contiguous "
+                "uint8 HWC bytes in Python, and hashes those bytes"
+            ),
+        },
     )
 
 
 def run_lerobot(
     args: argparse.Namespace,
-) -> tuple[float, Callable[[], list[dict[str, Any]]], dict[str, Any]]:
+) -> tuple[
+    float,
+    Callable[[], dict[str, int]],
+    Callable[[], list[dict[str, Any]]],
+    dict[str, Any],
+]:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     started = time.perf_counter()
@@ -539,17 +699,28 @@ def run_lerobot(
     if args.revision:
         dataset_kwargs["revision"] = args.revision
     dataset = LeRobotDataset(args.dataset, **dataset_kwargs)
+    count = min(args.rows, len(dataset))
+    if count != args.rows:
+        raise RuntimeError(f"requested {args.rows} frame rows, but selected {count}")
     setup_seconds = time.perf_counter() - started
 
     def scalar(value: Any) -> int:
         return int(value.item()) if hasattr(value, "item") else int(value)
 
-    def execute() -> list[dict[str, Any]]:
-        count = min(args.rows, len(dataset))
+    def load_items() -> list[dict[str, Any]]:
         if hasattr(dataset, "__getitems__"):
-            items = dataset.__getitems__(list(range(count)))
-        else:
-            items = [dataset[index] for index in range(count)]
+            return dataset.__getitems__(list(range(count)))
+        return [dataset[index] for index in range(count)]
+
+    def execute() -> dict[str, int]:
+        items = load_items()
+        return {
+            "frame_rows": len(items),
+            "decoded_images": len(items) * len(args.camera),
+        }
+
+    def validate() -> list[dict[str, Any]]:
+        items = load_items()
         rows: list[dict[str, Any]] = []
         for item in items:
             for camera in args.camera:
@@ -572,11 +743,24 @@ def run_lerobot(
     return (
         setup_seconds,
         execute,
+        validate,
         {
             "video_backend": args.video_backend,
             "lerobot_version": lerobot_version,
             "lerobot_root": (
                 str(Path(args.lerobot_root).resolve()) if args.lerobot_root else None
+            ),
+            "selection_seconds": 0.0,
+            "selection_strategy": (
+                "native dataset episode subset followed by positional prefix selection"
+            ),
+            "timing_boundary": (
+                "LeRobot returns selected uint8 Torch image tensors; NumPy conversion "
+                "and SHA-256 are excluded"
+            ),
+            "validation_boundary": (
+                "LeRobot replays the native batch read, converts tensors to "
+                "contiguous uint8 HWC bytes in Python, and hashes those bytes"
             ),
         },
     )
@@ -586,11 +770,14 @@ def run_command(args: argparse.Namespace) -> int:
     adapters = {"duckdb": run_duckdb, "daft": run_daft, "lerobot": run_lerobot}
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    setup_seconds, execute, extra = adapters[args.engine](args)
+    setup_seconds, execute, validate, extra = adapters[args.engine](args)
     collect_profile = extra.pop("collect_profile", None)
     close = extra.pop("close", None)
     try:
-        durations, rows = time_callable(execute, args.warmups, args.repeats)
+        durations, timed_summary = time_callable(execute, args.warmups, args.repeats)
+        validation_started = time.perf_counter()
+        rows = canonical_rows(validate())
+        validation_seconds = time.perf_counter() - validation_started
         if collect_profile is not None and not args.no_profile:
             collect_profile()
     finally:
@@ -601,8 +788,19 @@ def run_command(args: argparse.Namespace) -> int:
         raise RuntimeError(
             f"expected {expected_rows} decoded rows, received {len(rows)}"
         )
+    if timed_summary.get("frame_rows") != args.rows:
+        raise RuntimeError(
+            f"timed execution materialized {timed_summary.get('frame_rows')} frame "
+            f"rows, expected {args.rows}"
+        )
+    if timed_summary.get("decoded_images") != expected_rows:
+        raise RuntimeError(
+            "timed execution materialized "
+            f"{timed_summary.get('decoded_images')} images, expected {expected_rows}"
+        )
+    decode_median = statistics.median(durations)
     result = {
-        "schema_version": 2,
+        "schema_version": 3,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "engine": args.engine,
         "dataset": args.dataset,
@@ -616,8 +814,22 @@ def run_command(args: argparse.Namespace) -> int:
         "repeats": args.repeats,
         "cache_state": args.cache_state,
         "setup_seconds": setup_seconds,
+        "decode_durations_seconds": durations,
+        "decode_median_seconds": decode_median,
+        "decode_min_seconds": min(durations),
+        "timed_summary": timed_summary,
+        "validation_seconds": validation_seconds,
+        "timing_scope": (
+            "decode and native-engine image materialization after target selection; "
+            "excludes per-image SHA-256 validation"
+        ),
+        "validation_scope": (
+            "one additional decode/materialization pass, canonical ordering, and "
+            "per-image SHA-256; see validation_boundary for engine-specific work"
+        ),
+        # Backward-compatible aliases used by existing result consumers.
         "durations_seconds": durations,
-        "median_seconds": statistics.median(durations),
+        "median_seconds": decode_median,
         "min_seconds": min(durations),
         "configuration": {
             "tolerance": args.tolerance,
@@ -638,8 +850,9 @@ def run_command(args: argparse.Namespace) -> int:
     }
     output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     print(
-        f"{args.engine}: {len(rows)} images, median {result['median_seconds']:.3f}s "
-        f"({result['median_seconds'] / len(rows):.4f}s/image) -> {output}"
+        f"{args.engine}: {len(rows)} images, decode median {decode_median:.3f}s "
+        f"({decode_median / len(rows):.4f}s/image), validation "
+        f"{validation_seconds:.3f}s -> {output}"
     )
     return 0
 
@@ -667,12 +880,17 @@ def compare_command(args: argparse.Namespace) -> int:
                 f"PIXEL MISMATCH: {baseline['engine']} vs {result['engine']}: {different} rows",
                 file=sys.stderr,
             )
-    fastest = min(result["median_seconds"] for result in results)
-    for result in results:
+    medians = [
+        result.get("decode_median_seconds", result["median_seconds"])
+        for result in results
+    ]
+    fastest = min(medians)
+    for result, median in zip(results, medians):
         print(
-            f"{result['engine']:<8} {result['median_seconds']:>9.3f}s  "
-            f"{result['median_seconds'] / fastest:>6.2f}x fastest  "
-            f"{result['decoded_images']} images"
+            f"{result['engine']:<8} {median:>9.3f}s decode  "
+            f"{median / fastest:>6.2f}x fastest  "
+            f"{result['decoded_images']} images  "
+            f"validation {result.get('validation_seconds', float('nan')):.3f}s"
         )
     return 1 if mismatch else 0
 

@@ -2,10 +2,11 @@
 
 `lerobot_ab.py` runs DuckDB, current Daft, and native LeRobot in separate
 Python environments against the same episode/frame/camera contract. Every
-result records machine details, exact configuration, warmup/repeat timings,
-per-image shape and SHA-256, and (for DuckDB) a JSON profile containing decoder
-opens, cache hits/evictions, decoder and AVIO seeks, bytes read, decoded frame
-count, and RGB conversion/fan-out counts.
+schema-version-3 result records machine details, exact configuration,
+warmup/repeat decode timings, a separate validation time, per-image shape and
+SHA-256, and (for DuckDB) a JSON profile containing decoder opens, cache
+hits/evictions, decoder and AVIO seeks, bytes read, decoded frame count, and RGB
+conversion/fan-out counts.
 
 The common cross-engine comparison intentionally uses `delta_timestamps =
 [0.0]`: Daft's public dataset reader does not expose LeRobot temporal-window
@@ -82,7 +83,34 @@ the caller remains responsible for OS and remote-object cache control.
 Use the same immutable dataset revision and machine for all runs. A local
 snapshot is preferred when measuring decoder CPU; an `hf://` URI is useful when
 measuring remote open/seek/read amplification. The setup phase is reported
-separately; timed repeats cover materialization and decode after engine setup.
+separately.
+
+The benchmark has three explicit phases so target selection and correctness
+work cannot distort decoder timing:
+
+1. During setup, select only `(episode_index, frame_index)` metadata, sort it,
+   and take the requested prefix. DuckDB embeds those rows as a `VALUES` target
+   relation. Daft filters by the selected global `index`; its optimizer pushes
+   that predicate into the Parquet scan below the video UDF. Native LeRobot
+   selects the same positional prefix from its episode subset.
+2. Timed repeats decode and materialize the selected image columns without
+   hashing. DuckDB consumes every produced BLOB with `octet_length`, Daft
+   collects a materialized DataFrame, and LeRobot returns uint8 Torch tensors.
+   Daft creates a fresh lazy DataFrame for every repeat because `collect()`
+   materializes the object in place; reusing it would benchmark a cached no-op.
+   Each result's `timing_boundary` records the engine-specific boundary.
+3. One additional untimed-for-comparison pass computes per-image SHA-256 over
+   the exact RGB bytes. DuckDB hashes its BLOBs in SQL; Daft and LeRobot
+   normalize collected images to contiguous uint8 HWC bytes in Python. The
+   result's `validation_boundary` states which path was used.
+   `validation_seconds` reports the cost, while `compare` treats any key, shape,
+   or pixel-hash difference as a correctness failure.
+
+`decode_durations_seconds`, `decode_median_seconds`, and
+`decode_min_seconds` are the primary performance fields. The old
+`durations_seconds`, `median_seconds`, and `min_seconds` names remain aliases so
+existing result readers continue to work. Do not add `validation_seconds` to
+the decode median: it deliberately replays the workload for correctness.
 
 The timed DuckDB query exercises `lerobot_video_targets`. Its profiler pass
 replays the same selection through `lerobot_video_frames`, because DuckDB's
@@ -121,10 +149,13 @@ decoder worker even when `decode_threads` is larger.
 
 Daft's published benchmark used one Apple M4 Max with 36 GB RAM, not a
 multi-machine cluster. Its remote `pepijn223/egodex-test` sweep covered 1–10
-rows, plus 100-frame and full 632-frame runs. The batched implementation reduced
-10 rows from 34.4 s to 3.9 s, 100 frames from 311.8 s to 25.6 s, and 632 frames
-from 1750.7 s to 115.8 s. It also checked the first 16 frames/all cameras on six
-public datasets. See Daft's [benchmark description](https://github.com/Eventual-Inc/Daft/tree/main/benchmarking/lerobot)
+rows, plus 100-frame and full 632-frame runs. The reported "up to 15x" compares
+Daft's old per-row video reader with its new batched video reader; it is not a
+Daft-versus-native-LeRobot result. The batched implementation reduced 10 rows
+from 34.4 s to 3.9 s, 100 frames from 311.8 s to 25.6 s, and 632 frames from
+1750.7 s to 115.8 s. It also checked the first 16 frames/all cameras on six
+public datasets. See Daft's [implementation article](https://www.eventual.ai/blog/how-we-made-our-lerobot-video-reader-up-to-15x-faster),
+[benchmark description](https://github.com/Eventual-Inc/Daft/tree/main/benchmarking/lerobot),
 and [real-dataset results](https://github.com/Eventual-Inc/Daft/blob/main/benchmarking/lerobot/real_datasets.md).
 
 ## Decisions after measurement
