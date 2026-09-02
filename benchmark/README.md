@@ -12,42 +12,110 @@ The common cross-engine comparison intentionally uses `delta_timestamps =
 expansion. SQL tests cover non-zero deltas, padding, duplicates, and order
 restoration separately.
 
-Run one engine per environment:
+## Local snapshot (recommended)
+
+The complete `pepijn223/egodex-test` snapshot is small: revision
+`9ab66a91daf0d0e73f022adadb59f5c9ad7a6b16` contains 632 frames in three
+episodes and one 1920x1080 AV1 video shard. Its regular files total about 7.4
+MiB. Download it once, then force offline mode for every measured process:
+
+```bash
+export BENCH_DATA="$PWD/build/benchmark-data/egodex-test"
+hf download pepijn223/egodex-test \
+  --repo-type dataset \
+  --revision 9ab66a91daf0d0e73f022adadb59f5c9ad7a6b16 \
+  --local-dir "$BENCH_DATA"
+export HF_HUB_OFFLINE=1
+```
+
+`hf download` resumes partial downloads. The benchmark itself does not contact
+the Hub when given these local paths. Run one engine per environment:
 
 ```bash
 python benchmark/lerobot_ab.py run \
   --engine duckdb \
-  --dataset hf://datasets/pepijn223/egodex-test \
-  --camera observation.images.front \
+  --dataset "$BENCH_DATA" \
+  --camera observation.image \
   --rows 100 \
-  --extension build/release/extension/lerobot/lerobot.duckdb_extension \
-  --output benchmark/results/duckdb.json
+  --duckdb-cli build/benchmark/duckdb \
+  --output build/benchmark-results/duckdb.json
 
 python benchmark/lerobot_ab.py run \
   --engine daft \
-  --dataset pepijn223/egodex-test \
-  --camera observation.images.front \
+  --dataset "$BENCH_DATA" \
+  --camera observation.image \
   --rows 100 \
-  --output benchmark/results/daft.json
+  --output build/benchmark-results/daft.json
 
 python benchmark/lerobot_ab.py run \
   --engine lerobot \
   --dataset pepijn223/egodex-test \
-  --camera observation.images.front \
+  --lerobot-root "$BENCH_DATA" \
+  --revision 9ab66a91daf0d0e73f022adadb59f5c9ad7a6b16 \
+  --camera observation.image \
   --rows 100 \
   --video-backend pyav \
-  --output benchmark/results/lerobot.json
+  --output build/benchmark-results/lerobot.json
 
 python benchmark/lerobot_ab.py compare \
-  benchmark/results/duckdb.json \
-  benchmark/results/daft.json \
-  benchmark/results/lerobot.json
+  build/benchmark-results/duckdb.json \
+  build/benchmark-results/daft.json \
+  build/benchmark-results/lerobot.json
 ```
+
+The official DuckDB shell is useful when the Python environment contains a
+different DuckDB ABI. Build a benchmark-only shell with both `httpfs` and this
+extension statically linked:
+
+```bash
+cmake -S duckdb -B build/benchmark -DCMAKE_BUILD_TYPE=Release \
+  '-DDUCKDB_EXTENSION_CONFIGS=/absolute/path/to/duckdb/.github/config/extensions/httpfs.cmake;/absolute/path/to/extension_config.cmake'
+cmake --build build/benchmark --target shell -j8
+```
+
+Use `--all-episodes --rows 632` for the complete `egodex-test` dataset. Without
+`--all-episodes`, `--episode 0` is selected by default. Label fresh-process and
+warmed-process measurements with `--cache-state cold-process --warmups 0` and
+`--cache-state warm-process --warmups 1`, respectively. The label is metadata;
+the caller remains responsible for OS and remote-object cache control.
 
 Use the same immutable dataset revision and machine for all runs. A local
 snapshot is preferred when measuring decoder CPU; an `hf://` URI is useful when
 measuring remote open/seek/read amplification. The setup phase is reported
 separately; timed repeats cover materialization and decode after engine setup.
+
+The timed DuckDB query exercises `lerobot_video_targets`. Its profiler pass
+replays the same selection through `lerobot_video_frames`, because DuckDB's
+source-table profiler hook exposes per-worker decoder metrics there. The result
+records this distinction in `profile_scope`; profiler timing is not the timed
+relation result.
+
+## Local multi-shard stress fixture
+
+The small public snapshot has only one physical video shard, so it cannot test
+decoder scheduling or LRU pressure. Create 20 logical shards and 10,000 targets
+without duplicating the MP4 blocks on filesystems that support hard links:
+
+```bash
+python benchmark/make_multishard_fixture.py \
+  --duckdb-cli build/benchmark/duckdb \
+  --source-video "$BENCH_DATA/videos/observation.image/chunk-000/file-000.mp4" \
+  --output build/benchmark-data/egodex-20x500 \
+  --shards 20 \
+  --frames-per-shard 500 \
+  --fps 30 \
+  --width 1920 \
+  --height 1080 \
+  --codec av1
+```
+
+The generated Parquet metadata and directory entries use roughly 100 KiB of
+additional space when hard linking succeeds. Use the source APIs for dense,
+known frame scans that should partition work across shards. The
+`lerobot_video_targets` table-in/out form preserves arbitrary upstream request
+relations, but its effective parallelism is also bounded by the upstream
+DuckDB pipeline; a single ordered input partition may therefore feed only one
+decoder worker even when `decode_threads` is larger.
 
 ## Daft reference scale
 

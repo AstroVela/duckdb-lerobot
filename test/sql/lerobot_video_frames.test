@@ -253,11 +253,13 @@ SELECT count(image)
 FROM lerobot_video_frames(
     '{TEST_DIR}/lerobot_video_frames',
     [0],
-    video_keys := ['observation.images.front'],
-    frame_indices := [0, 1]
+    video_keys := ['observation.images.front', 'observation.images.wrist'],
+    frame_indices := [0, 1],
+    target_buffer_size := 1,
+    decode_threads := 2
 );
 ----
-2
+4
 
 statement ok
 PRAGMA disable_profiling;
@@ -268,7 +270,8 @@ SELECT CAST(
     contains(content, 'LeRobot Decoder Seeks') AND
     contains(content, 'LeRobot Video Bytes Read') AND
     contains(content, 'LeRobot Frames Decoded') AND
-    contains(content, 'LeRobot RGB Conversions')
+    contains(content, 'LeRobot RGB Conversions') AND
+    contains(content, '"rows_scanned": 4')
 AS INTEGER)
 FROM read_text('{TEST_DIR}/lerobot_video_frames/profile.json');
 ----

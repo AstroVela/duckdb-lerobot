@@ -15,6 +15,7 @@ import json
 import os
 import platform
 import statistics
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -27,7 +28,7 @@ def sql_string(value: str) -> str:
 
 
 def machine_info() -> dict[str, Any]:
-    return {
+    result = {
         "hostname": platform.node(),
         "platform": platform.platform(),
         "machine": platform.machine(),
@@ -35,6 +36,39 @@ def machine_info() -> dict[str, Any]:
         "python": platform.python_version(),
         "cpu_count": os.cpu_count(),
     }
+    try:
+        cpuinfo = Path("/proc/cpuinfo").read_text()
+        model = next(
+            line.split(":", 1)[1].strip()
+            for line in cpuinfo.splitlines()
+            if line.startswith("model name")
+        )
+        physical_cores = {
+            (block_physical, block_core)
+            for block in cpuinfo.split("\n\n")
+            if (block_physical := _cpuinfo_field(block, "physical id")) is not None
+            if (block_core := _cpuinfo_field(block, "core id")) is not None
+        }
+        result["cpu_model"] = model
+        if physical_cores:
+            result["physical_cpu_count"] = len(physical_cores)
+    except (OSError, StopIteration):
+        pass
+    try:
+        result["memory_total_bytes"] = os.sysconf("SC_PAGE_SIZE") * os.sysconf(
+            "SC_PHYS_PAGES"
+        )
+    except (OSError, ValueError):
+        pass
+    return result
+
+
+def _cpuinfo_field(block: str, name: str) -> str | None:
+    prefix = name + "\t"
+    for line in block.splitlines():
+        if line.startswith(prefix):
+            return line.split(":", 1)[1].strip()
+    return None
 
 
 def image_bytes_and_shape(value: Any) -> tuple[bytes, list[int]]:
@@ -111,19 +145,19 @@ def find_profile_metrics(value: Any, output: dict[str, int]) -> None:
             find_profile_metrics(child, output)
 
 
-def run_duckdb(
-    args: argparse.Namespace,
-) -> tuple[float, Callable[[], list[dict[str, Any]]], dict[str, Any]]:
-    import duckdb
+def selection_query(args: argparse.Namespace, root: str) -> str:
+    episode_filter = (
+        "" if args.all_episodes else f"WHERE episode_index = {args.episode}"
+    )
+    return (
+        "SELECT episode_index, frame_index "
+        f"FROM lerobot_frames({root}) {episode_filter} "
+        "ORDER BY episode_index, frame_index "
+        f"LIMIT {args.rows}"
+    )
 
-    started = time.perf_counter()
-    connection = duckdb.connect()
-    if args.extension:
-        connection.execute(f"LOAD {sql_string(str(Path(args.extension).resolve()))}")
-    else:
-        connection.execute("LOAD lerobot")
-    setup_seconds = time.perf_counter() - started
 
+def duckdb_decode_query(args: argparse.Namespace, hash_images: bool) -> str:
     cameras_sql = ", ".join(
         f"({sql_string(camera)}, {index})" for index, camera in enumerate(args.camera)
     )
@@ -133,34 +167,193 @@ def run_duckdb(
             raise ValueError("--width and --height must be specified together")
         resize_sql = f", width := {args.width}, height := {args.height}"
     root = sql_string(args.dataset)
-    query = f"""
+    image_sql = "sha256(image) AS sha256" if hash_images else "image"
+    return f"""
         WITH selected_frames AS (
-            SELECT episode_index, frame_index
-            FROM lerobot_frames({root})
-            WHERE episode_index = {args.episode}
-            ORDER BY frame_index
-            LIMIT {args.rows}
+            {selection_query(args, root)}
         ), targets AS (
-            SELECT row_number() OVER (ORDER BY frame_index, camera_ordinal) - 1 AS request_id,
+            SELECT row_number() OVER (
+                       ORDER BY episode_index, frame_index, camera_ordinal
+                   ) - 1 AS request_id,
                    episode_index, frame_index, video_key, 0::BIGINT AS delta_index
             FROM selected_frames
             CROSS JOIN (VALUES {cameras_sql}) cameras(video_key, camera_ordinal)
         )
-        SELECT episode_index, frame_index, video_key, width, height, image
+        SELECT episode_index, frame_index, video_key, width, height, {image_sql}
         FROM lerobot_video_targets(
             {root},
             (SELECT request_id, episode_index, frame_index, video_key, delta_index FROM targets),
             delta_timestamps := [0.0],
             tolerance := {args.tolerance},
             cluster_gap := {args.cluster_gap},
+            batch_size := {args.batch_size},
+            target_buffer_size := {args.target_buffer_size},
             decode_threads := {args.decode_threads},
             max_cached_decoders := {args.max_cached_decoders},
             max_pending_targets := {args.max_pending_targets},
-            max_output_bytes := {args.max_output_bytes}
+            max_output_bytes := {args.max_output_bytes},
+            codec_threads := {args.codec_threads}
             {resize_sql}
         )
         ORDER BY episode_index, frame_index, video_key
     """
+
+
+def source_profile_queries(
+    args: argparse.Namespace, selected_rows: list[dict[str, Any]]
+) -> list[tuple[str, str]]:
+    by_episode: dict[int, list[int]] = {}
+    for row in selected_rows:
+        by_episode.setdefault(int(row["episode_index"]), []).append(
+            int(row["frame_index"])
+        )
+    cameras = ", ".join(sql_string(camera) for camera in args.camera)
+    resize_sql = ""
+    if args.width and args.height:
+        resize_sql = f", width := {args.width}, height := {args.height}"
+    root = sql_string(args.dataset)
+    groups: list[tuple[list[int], list[int]]]
+    frame_sets = {tuple(frame_indices) for frame_indices in by_episode.values()}
+    if len(frame_sets) == 1 and by_episode:
+        groups = [(list(by_episode), next(iter(by_episode.values())))]
+    else:
+        groups = [([episode], frames) for episode, frames in by_episode.items()]
+    queries = []
+    for episodes, frame_indices in groups:
+        frames = ", ".join(str(frame_index) for frame_index in frame_indices)
+        episode_sql = ", ".join(str(episode) for episode in episodes)
+        query = (
+            f"SELECT count(image) FROM lerobot_video_frames({root}, [{episode_sql}], "
+            f"video_keys := [{cameras}], frame_indices := [{frames}], "
+            f"tolerance := {args.tolerance}, cluster_gap := {args.cluster_gap}, "
+            f"batch_size := {args.batch_size}, "
+            f"target_buffer_size := {args.target_buffer_size}, "
+            f"decode_threads := {args.decode_threads}, "
+            f"max_cached_decoders := {args.max_cached_decoders}, "
+            f"max_pending_targets := {args.max_pending_targets}, "
+            f"max_output_bytes := {args.max_output_bytes}, "
+            f"codec_threads := {args.codec_threads}{resize_sql})"
+        )
+        label = "episodes-" + "-".join(str(episode) for episode in episodes)
+        queries.append((label, query))
+    return queries
+
+
+class DuckDBCLIConnection:
+    """Small persistent JSON protocol for benchmarking a DuckDB shell build."""
+
+    def __init__(self, executable: str, allow_unsigned: bool = False):
+        self.executable = str(Path(executable).resolve())
+        self.counter = 0
+        command = [self.executable, "-batch"]
+        if allow_unsigned:
+            command.insert(1, "-unsigned")
+        self.process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        if self.process.stdin is None or self.process.stdout is None:
+            raise RuntimeError("failed to open DuckDB CLI pipes")
+        self.process.stdin.write(".mode json\n.bail off\n")
+        self.process.stdin.flush()
+        self.execute("SELECT 1 AS ready")
+
+    def execute(self, sql: str) -> list[dict[str, Any]]:
+        if self.process.poll() is not None:
+            raise RuntimeError(
+                f"DuckDB CLI exited with status {self.process.returncode}"
+            )
+        self.counter += 1
+        marker = f"__LEROBOT_BENCHMARK_DONE_{self.counter}__"
+        statement = sql.rstrip().rstrip(";") + ";"
+        marker_query = f"SELECT {sql_string(marker)} AS __lerobot_benchmark_marker;\n"
+        assert self.process.stdin is not None
+        assert self.process.stdout is not None
+        self.process.stdin.write(statement + "\n" + marker_query)
+        self.process.stdin.flush()
+
+        result_sets: list[list[dict[str, Any]]] = []
+        diagnostics: list[str] = []
+        json_buffer = ""
+        while True:
+            line = self.process.stdout.readline()
+            if line == "":
+                raise RuntimeError(
+                    "DuckDB CLI closed its output before the benchmark marker; "
+                    + "\n".join(diagnostics)
+                )
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if not json_buffer and not (stripped.startswith("[{") or stripped == "[]"):
+                diagnostics.append(stripped)
+                continue
+            json_buffer += stripped
+            try:
+                parsed = json.loads(json_buffer)
+            except json.JSONDecodeError:
+                continue
+            json_buffer = ""
+            if (
+                isinstance(parsed, list)
+                and len(parsed) == 1
+                and parsed[0].get("__lerobot_benchmark_marker") == marker
+            ):
+                break
+            if isinstance(parsed, list):
+                result_sets.append(parsed)
+            else:
+                diagnostics.append(stripped)
+
+        errors = [line for line in diagnostics if "error" in line.lower()]
+        if errors:
+            raise RuntimeError("DuckDB CLI query failed:\n" + "\n".join(diagnostics))
+        return result_sets[-1] if result_sets else []
+
+    def close(self) -> None:
+        if self.process.poll() is not None:
+            return
+        assert self.process.stdin is not None
+        self.process.stdin.write(".quit\n")
+        self.process.stdin.flush()
+        try:
+            self.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.process.terminate()
+            self.process.wait(timeout=5)
+
+
+def configure_duckdb_connection(
+    args: argparse.Namespace, execute: Callable[[str], Any]
+) -> None:
+    extensions = list(args.duckdb_load)
+    if args.dataset.startswith(("hf://", "http://", "https://", "s3://")):
+        if "httpfs" not in extensions:
+            extensions.insert(0, "httpfs")
+    for extension in extensions:
+        execute(f"LOAD {sql_string(extension)}")
+    if args.extension:
+        execute(f"LOAD {sql_string(str(Path(args.extension).resolve()))}")
+    else:
+        execute("LOAD lerobot")
+
+
+def run_duckdb_python(
+    args: argparse.Namespace,
+) -> tuple[float, Callable[[], list[dict[str, Any]]], dict[str, Any]]:
+    import duckdb
+
+    started = time.perf_counter()
+    connection = duckdb.connect()
+    configure_duckdb_connection(args, connection.execute)
+    version_row = connection.execute("PRAGMA version").fetchone()
+    setup_seconds = time.perf_counter() - started
+    root = sql_string(args.dataset)
+    query = duckdb_decode_query(args, hash_images=False)
 
     def execute() -> list[dict[str, Any]]:
         result = connection.execute(query).fetchall()
@@ -184,37 +377,114 @@ def run_duckdb(
         return rows
 
     extra: dict[str, Any] = {
-        "duckdb_version": duckdb.__version__,
+        "duckdb_version": str(version_row[0]),
+        "duckdb_source_id": str(version_row[1]),
+        "duckdb_python_version": duckdb.__version__,
         "query": query.strip(),
     }
 
     def collect_profile() -> None:
-        frame_rows = connection.execute(
-            f"SELECT frame_index FROM lerobot_frames({root}) "
-            f"WHERE episode_index = {args.episode} ORDER BY frame_index LIMIT {args.rows}"
-        ).fetchall()
-        frame_indices = ", ".join(str(int(row[0])) for row in frame_rows)
-        cameras = ", ".join(sql_string(camera) for camera in args.camera)
-        profile_path = Path(args.output).with_suffix(".profile.json").resolve()
-        connection.execute("PRAGMA enable_profiling='json'")
-        connection.execute(f"SET profiling_output = {sql_string(str(profile_path))}")
-        connection.execute(
-            f"SELECT count(image) FROM lerobot_video_frames({root}, [{args.episode}], "
-            f"video_keys := [{cameras}], frame_indices := [{frame_indices}], "
-            f"tolerance := {args.tolerance}, cluster_gap := {args.cluster_gap}, "
-            f"decode_threads := {args.decode_threads}, max_cached_decoders := {args.max_cached_decoders}, "
-            f"max_pending_targets := {args.max_pending_targets}, max_output_bytes := {args.max_output_bytes}"
-            f"{resize_sql})"
-        ).fetchall()
-        connection.execute("PRAGMA disable_profiling")
-        profile = json.loads(profile_path.read_text())
         metrics: dict[str, int] = {}
-        find_profile_metrics(profile, metrics)
-        extra["profile_path"] = str(profile_path)
+        paths = []
+        selected = connection.execute(selection_query(args, root)).fetchall()
+        selected_rows = [
+            {"episode_index": row[0], "frame_index": row[1]} for row in selected
+        ]
+        for label, profile_query in source_profile_queries(args, selected_rows):
+            profile_path = (
+                Path(args.output).with_suffix(f".{label}.profile.json").resolve()
+            )
+            connection.execute("PRAGMA enable_profiling='json'")
+            connection.execute(
+                f"SET profiling_output = {sql_string(str(profile_path))}"
+            )
+            connection.execute(profile_query).fetchall()
+            connection.execute("PRAGMA disable_profiling")
+            episode_metrics: dict[str, int] = {}
+            find_profile_metrics(json.loads(profile_path.read_text()), episode_metrics)
+            for key, value in episode_metrics.items():
+                metrics[key] = metrics.get(key, 0) + value
+            paths.append(str(profile_path))
+        extra["profile_paths"] = paths
+        extra["profile_scope"] = (
+            "one source-function query per compatible selected-episode group"
+        )
+        extra["profile_metrics"] = metrics
+
+    extra["collect_profile"] = collect_profile
+    extra["close"] = connection.close
+    return setup_seconds, execute, extra
+
+
+def run_duckdb_cli(
+    args: argparse.Namespace,
+) -> tuple[float, Callable[[], list[dict[str, Any]]], dict[str, Any]]:
+    started = time.perf_counter()
+    connection = DuckDBCLIConnection(
+        args.duckdb_cli, allow_unsigned=bool(args.extension)
+    )
+    configure_duckdb_connection(args, connection.execute)
+    version_rows = connection.execute("PRAGMA version")
+    setup_seconds = time.perf_counter() - started
+    query = duckdb_decode_query(args, hash_images=True)
+    root = sql_string(args.dataset)
+
+    def execute() -> list[dict[str, Any]]:
+        result = connection.execute(query)
+        return [
+            {
+                "episode_index": int(row["episode_index"]),
+                "frame_index": int(row["frame_index"]),
+                "video_key": row["video_key"],
+                "shape": [int(row["height"]), int(row["width"]), 3],
+                "sha256": row["sha256"],
+            }
+            for row in result
+        ]
+
+    extra: dict[str, Any] = {
+        "duckdb_version": version_rows[0]["library_version"],
+        "duckdb_source_id": version_rows[0]["source_id"],
+        "duckdb_cli": connection.executable,
+        "query": query.strip(),
+        "close": connection.close,
+    }
+
+    def collect_profile() -> None:
+        selected = connection.execute(selection_query(args, root))
+        metrics: dict[str, int] = {}
+        paths = []
+        for label, profile_query in source_profile_queries(args, selected):
+            profile_path = (
+                Path(args.output).with_suffix(f".{label}.profile.json").resolve()
+            )
+            profile_sql = (
+                "PRAGMA enable_profiling='json'; "
+                f"SET profiling_output = {sql_string(str(profile_path))}; "
+                f"{profile_query}; PRAGMA disable_profiling"
+            )
+            connection.execute(profile_sql)
+            episode_metrics: dict[str, int] = {}
+            find_profile_metrics(json.loads(profile_path.read_text()), episode_metrics)
+            for key, value in episode_metrics.items():
+                metrics[key] = metrics.get(key, 0) + value
+            paths.append(str(profile_path))
+        extra["profile_paths"] = paths
+        extra["profile_scope"] = (
+            "one source-function query per compatible selected-episode group"
+        )
         extra["profile_metrics"] = metrics
 
     extra["collect_profile"] = collect_profile
     return setup_seconds, execute, extra
+
+
+def run_duckdb(
+    args: argparse.Namespace,
+) -> tuple[float, Callable[[], list[dict[str, Any]]], dict[str, Any]]:
+    if args.duckdb_cli:
+        return run_duckdb_cli(args)
+    return run_duckdb_python(args)
 
 
 def run_daft(
@@ -227,11 +497,9 @@ def run_daft(
 
     def execute() -> list[dict[str, Any]]:
         frame = lerobot.read(args.dataset, load_video_frames=args.camera)
-        frame = (
-            frame.where(daft.col("episode_index") == args.episode)
-            .sort("frame_index")
-            .limit(args.rows)
-        )
+        if not args.all_episodes:
+            frame = frame.where(daft.col("episode_index") == args.episode)
+        frame = frame.sort(["episode_index", "frame_index"]).limit(args.rows)
         data = frame.collect().to_pydict()
         rows: list[dict[str, Any]] = []
         for row_index in range(len(data["frame_index"])):
@@ -260,13 +528,16 @@ def run_lerobot(
 
     started = time.perf_counter()
     dataset_kwargs: dict[str, Any] = {
-        "episodes": [args.episode],
         "tolerance_s": args.tolerance,
         "video_backend": args.video_backend,
         "return_uint8": True,
     }
+    if not args.all_episodes:
+        dataset_kwargs["episodes"] = [args.episode]
     if args.lerobot_root:
         dataset_kwargs["root"] = args.lerobot_root
+    if args.revision:
+        dataset_kwargs["revision"] = args.revision
     dataset = LeRobotDataset(args.dataset, **dataset_kwargs)
     setup_seconds = time.perf_counter() - started
 
@@ -292,32 +563,58 @@ def run_lerobot(
                 )
         return rows
 
-    return setup_seconds, execute, {"video_backend": args.video_backend}
+    try:
+        from importlib.metadata import version
+
+        lerobot_version = version("lerobot")
+    except Exception:
+        lerobot_version = "unknown"
+    return (
+        setup_seconds,
+        execute,
+        {
+            "video_backend": args.video_backend,
+            "lerobot_version": lerobot_version,
+            "lerobot_root": (
+                str(Path(args.lerobot_root).resolve()) if args.lerobot_root else None
+            ),
+        },
+    )
 
 
 def run_command(args: argparse.Namespace) -> int:
     adapters = {"duckdb": run_duckdb, "daft": run_daft, "lerobot": run_lerobot}
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
     setup_seconds, execute, extra = adapters[args.engine](args)
     collect_profile = extra.pop("collect_profile", None)
-    durations, rows = time_callable(execute, args.warmups, args.repeats)
-    if collect_profile is not None and not args.no_profile:
-        collect_profile()
+    close = extra.pop("close", None)
+    try:
+        durations, rows = time_callable(execute, args.warmups, args.repeats)
+        if collect_profile is not None and not args.no_profile:
+            collect_profile()
+    finally:
+        if close is not None:
+            close()
     expected_rows = args.rows * len(args.camera)
     if len(rows) != expected_rows:
         raise RuntimeError(
             f"expected {expected_rows} decoded rows, received {len(rows)}"
         )
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "engine": args.engine,
         "dataset": args.dataset,
-        "episode": args.episode,
+        "revision": args.revision,
+        "episode": None if args.all_episodes else args.episode,
+        "all_episodes": args.all_episodes,
         "requested_frame_rows": args.rows,
         "cameras": args.camera,
         "decoded_images": len(rows),
         "warmups": args.warmups,
         "repeats": args.repeats,
+        "cache_state": args.cache_state,
         "setup_seconds": setup_seconds,
         "durations_seconds": durations,
         "median_seconds": statistics.median(durations),
@@ -325,10 +622,13 @@ def run_command(args: argparse.Namespace) -> int:
         "configuration": {
             "tolerance": args.tolerance,
             "cluster_gap": args.cluster_gap,
+            "batch_size": args.batch_size,
+            "target_buffer_size": args.target_buffer_size,
             "decode_threads": args.decode_threads,
             "max_cached_decoders": args.max_cached_decoders,
             "max_pending_targets": args.max_pending_targets,
             "max_output_bytes": args.max_output_bytes,
+            "codec_threads": args.codec_threads,
             "width": args.width,
             "height": args.height,
         },
@@ -336,8 +636,6 @@ def run_command(args: argparse.Namespace) -> int:
         "rows": rows,
         **extra,
     }
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     print(
         f"{args.engine}: {len(rows)} images, median {result['median_seconds']:.3f}s "
@@ -394,26 +692,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="local root passed to LeRobotDataset while --dataset remains its repo ID",
     )
     run.add_argument(
+        "--revision", help="immutable Hugging Face revision passed to native LeRobot"
+    )
+    run.add_argument(
         "--camera",
         action="append",
         required=True,
         help="repeat for every camera to decode",
     )
     run.add_argument("--episode", type=int, default=0)
+    run.add_argument(
+        "--all-episodes",
+        action="store_true",
+        help="select the first --rows frames globally instead of one episode",
+    )
     run.add_argument("--rows", type=int, default=16)
     run.add_argument("--warmups", type=int, default=1)
     run.add_argument("--repeats", type=int, default=3)
     run.add_argument("--output", required=True)
+    run.add_argument(
+        "--cache-state",
+        choices=("cold-process", "warm-process", "unspecified"),
+        default="unspecified",
+        help="label the intended cache state in the result",
+    )
+    run.add_argument(
+        "--duckdb-cli",
+        help="official DuckDB shell to use instead of importing Python duckdb",
+    )
+    run.add_argument(
+        "--duckdb-load",
+        action="append",
+        default=[],
+        help="extra DuckDB extension to LOAD before lerobot (repeatable)",
+    )
     run.add_argument(
         "--extension", help="path to lerobot.duckdb_extension for the DuckDB engine"
     )
     run.add_argument("--video-backend", choices=("pyav", "torchcodec"), default="pyav")
     run.add_argument("--tolerance", type=float, default=1e-4)
     run.add_argument("--cluster-gap", type=float, default=10.0)
+    run.add_argument("--batch-size", type=int, default=16)
+    run.add_argument("--target-buffer-size", type=int, default=256)
     run.add_argument("--decode-threads", type=int, default=8)
     run.add_argument("--max-cached-decoders", type=int, default=8)
     run.add_argument("--max-pending-targets", type=int, default=4096)
     run.add_argument("--max-output-bytes", type=int, default=64 * 1024 * 1024)
+    run.add_argument("--codec-threads", type=int, default=1)
     run.add_argument("--width", type=int, default=0)
     run.add_argument("--height", type=int, default=0)
     run.add_argument(

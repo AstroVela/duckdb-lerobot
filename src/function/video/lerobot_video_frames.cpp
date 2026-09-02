@@ -451,7 +451,7 @@ struct LerobotVideoDecodeMetrics {
 	LerobotVideoDecodeMetrics()
 	    : targets(0), decoder_acquires(0), decoder_cache_hits(0), decoder_opens(0), decoder_evictions(0),
 	      decoder_seeks(0), avio_seeks(0), video_bytes_read(0), frames_decoded(0), rgb_conversions(0),
-	      rgb_fanout_hits(0), reported(false) {
+	      rgb_fanout_hits(0) {
 	}
 
 	std::atomic<uint64_t> targets;
@@ -465,7 +465,6 @@ struct LerobotVideoDecodeMetrics {
 	std::atomic<uint64_t> frames_decoded;
 	std::atomic<uint64_t> rgb_conversions;
 	std::atomic<uint64_t> rgb_fanout_hits;
-	std::atomic<bool> reported;
 };
 
 struct LerobotDecodeBuffer {
@@ -2438,7 +2437,7 @@ unique_ptr<Expression> BuildVideoFilterExpression(const LerobotVideoFramesBindDa
 struct LerobotVideoFramesLocalState final : public LocalTableFunctionState {
 	LerobotVideoFramesLocalState(ExecutionContext &context, const LerobotVideoFramesBindData &bind_data,
 	                             TableFunctionInitInput &input)
-	    : target_position(0), have_decoded(false), filter_selection(STANDARD_VECTOR_SIZE) {
+	    : target_position(0), rows_scanned(0), have_decoded(false), filter_selection(STANDARD_VECTOR_SIZE) {
 		filter_expression = BuildVideoFilterExpression(bind_data, input);
 		if (filter_expression) {
 			filter_executor = make_uniq<ExpressionExecutor>(context.client, *filter_expression);
@@ -2457,6 +2456,7 @@ struct LerobotVideoFramesLocalState final : public LocalTableFunctionState {
 
 	unique_ptr<LerobotDecodeBuffer> buffer;
 	idx_t target_position;
+	idx_t rows_scanned;
 #ifdef LEROBOT_HAVE_FFMPEG
 	unique_ptr<LerobotShardDecoder> decoder;
 #endif
@@ -2813,6 +2813,7 @@ bool ProduceLerobotVideoFrames(ClientContext &context, TableFunctionInput &input
 		count++;
 #endif
 	}
+	local_state.rows_scanned += count;
 	SetOutputCardinality(output, count, 0);
 	return count == 0;
 }
@@ -2935,10 +2936,12 @@ void LerobotVideoFramesGetMetrics(TableFunctionGetMetricsInput &input) {
 		return;
 	}
 	auto &metrics = input.global_state->Cast<LerobotVideoFramesGlobalState>().GetMetrics();
-	if (metrics.reported.exchange(true, std::memory_order_relaxed)) {
-		return;
+	// DuckDB gathers source metrics once per local worker. Publish the shared
+	// snapshot from every worker so a later profiler flush cannot replace the
+	// only enriched extra-info map with the table scan's base parameters.
+	if (input.local_state) {
+		input.operator_metrics.rows_scanned = input.local_state->Cast<LerobotVideoFramesLocalState>().rows_scanned;
 	}
-	input.operator_metrics.rows_scanned = static_cast<idx_t>(metrics.targets.load(std::memory_order_relaxed));
 	input.operator_metrics.AddExtraInfo("LeRobot Targets", std::to_string(metrics.targets.load()));
 	input.operator_metrics.AddExtraInfo("LeRobot Decoder Acquires", std::to_string(metrics.decoder_acquires.load()));
 	input.operator_metrics.AddExtraInfo("LeRobot Decoder Cache Hits",
