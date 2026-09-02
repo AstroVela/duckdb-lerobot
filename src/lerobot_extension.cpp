@@ -5,6 +5,7 @@
 #include "duckdb/main/extension_helper.hpp"
 
 #include "function/lerobot_functions.hpp"
+#include "function/lerobot_copy.hpp"
 
 namespace duckdb {
 
@@ -23,6 +24,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	for (auto &function : LerobotFunctions::GetTableFunctions(loader)) {
 		loader.RegisterFunction(std::move(function));
 	}
+	loader.RegisterFunction(LerobotCopyFunction::Create());
 }
 
 void LerobotExtension::Load(ExtensionLoader &loader) {

@@ -253,6 +253,49 @@ and video-route `ObjectCache` entries remain the small reusable control plane,
 DuckDB owns remote byte/block and Parquet caches, and Vane/model actors decide
 whether decoded tensors are worth retaining.
 
+## Native write and commit model
+
+`COPY ... (FORMAT lerobot)` is a registered DuckDB `CopyFunction`. Its input
+contract mirrors `LeRobotDataset.add_frame`: every row carries
+`episode_index`, `task`, and all user-defined features, while the writer owns
+`timestamp`, per-episode `frame_index`, global `index`, and `task_index`.
+Episodes must arrive contiguously in ascending order from zero. This makes an
+episode boundary explicit in the streaming DuckDB input without adding a
+Python-side object protocol.
+
+The implementation follows the useful part of the Iceberg COPY architecture:
+data files are produced first and the authoritative metadata is committed
+last. All output initially goes to a UUID-named sibling staging directory.
+Episode data and metadata are delegated to DuckDB's registered native Parquet
+COPY implementation with Snappy compression; every episode collection is one
+row group. File-size projection rotates only between episodes, so an episode
+is never split across data or video shards. `meta/info.json` is written last in
+the staging tree, then a single directory rename publishes the destination.
+Any bind, encode, Parquet, or metadata error recursively removes the staging
+tree and leaves no readable partial dataset.
+
+LeRobot's control-plane rules remain extension-owned: canonical path
+templates, task indexing, episode routes, metadata chunk/file indices, and
+per-episode plus aggregate statistics. The 5000-bin quantile estimator follows
+the native NumPy float32 edge and float64 interpolation semantics, including
+the 128-element pairwise reduction tree, rounded-linspace visual sampling, and
+the conservative cross-episode quantile envelope. DuckDB still owns Parquet
+encoding and footer metadata; the extension does not build a second footer or
+row-group index.
+
+Image and video input columns contain raw HWC frames as BLOBs. RGB is uint8
+RGB24. A depth feature is marked by `info.is_depth_map` and is either
+little-endian uint16 millimetres or float32 metres, inferred once and enforced
+for the whole dataset. RGB video uses LeRobot's AV1/yuv420p/GOP-2/CRF-30/
+preset-12 defaults. Depth uses the native 12-bit logarithmic quantizer followed
+by lossless HEVC gray12le. Per-episode MP4s are stream-copy concatenated, and
+their cumulative durations become the episode route boundaries.
+
+The writer is deliberately strict and create-only. It does not infer legacy
+schemas, append to an existing root, overwrite output, change codecs when an
+encoder is missing, or publish remote object-store paths without a catalog
+commit protocol.
+
 ## Compatibility
 
 The first native scanner targets v3. v2.0/v2.1 support is a separate adapter:

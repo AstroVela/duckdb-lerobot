@@ -39,6 +39,15 @@ pool closes least-recently-used idle decoders when more shards are encountered
 than can remain open. Results are small Arrow-compatible batches of interleaved
 RGB24 bytes, not Python image objects.
 
+Native dataset creation is available through DuckDB's COPY surface. `FORMAT
+lerobot` delegates data, episode metadata, and task tables to DuckDB's native
+Parquet writer, while the extension owns LeRobot's episode boundaries, shard
+rotation, statistics, visual encoding, and final metadata commit. The writer
+uses a sibling staging directory and publishes the dataset root only after all
+Parquet, image/video, `stats.json`, and `info.json` work succeeds. Like the
+current LeRobot recorder, it is create-only and requires contiguous episodes
+ordered from zero.
+
 `lerobot_video_windows` is the training-oriented entry point. It accepts an
 ordered list of `(request_id, episode_index, frame_index)` structs plus LeRobot
 `delta_timestamps`. Delta values are validated against the dataset FPS, target
@@ -209,6 +218,58 @@ FROM lerobot_video_metadata_cache('hf://datasets/lerobot/droid_1.0.1');
 | --- | --- | --- | --- | --- | --- |
 | `hf://datasets/lerobot/droid_1.0.1` | `…/meta/info.json` | `…/meta/episodes` | `…/meta/tasks.parquet` | `…/data` | `…/videos` |
 
+## Native LeRobot v3 write
+
+The COPY query supplies `episode_index`, `task`, and exactly the user features
+declared by the `FEATURES` JSON object. The extension generates `timestamp`,
+`frame_index`, global `index`, and `task_index`, writes one Parquet row group
+per episode, and produces the canonical v3 control plane.
+
+```sql
+COPY (
+  SELECT episode_index::BIGINT,
+         task::VARCHAR,
+         state::FLOAT[6] AS "observation.state",
+         action::FLOAT[3] AS action,
+         camera_rgb::BLOB AS "observation.images.front"
+  FROM recorded_frames
+  ORDER BY episode_index, source_frame_index
+) TO '/datasets/my_robot_run' (
+  FORMAT lerobot,
+  FPS 30,
+  FEATURES '{
+    "observation.state": {
+      "dtype": "float32", "shape": [6], "names": null
+    },
+    "action": {
+      "dtype": "float32", "shape": [3], "names": null
+    },
+    "observation.images.front": {
+      "dtype": "video", "shape": [480, 640, 3],
+      "names": ["height", "width", "channels"]
+    }
+  }',
+  ROBOT_TYPE 'my_robot',
+  CHUNKS_SIZE 1000,
+  DATA_FILES_SIZE_IN_MB 100,
+  VIDEO_FILES_SIZE_IN_MB 200,
+  METADATA_BUFFER_SIZE 10,
+  ENCODER_THREADS 4
+);
+```
+
+Visual input is an unboxed HWC frame in a DuckDB `BLOB`: RGB features require
+exactly `height * width * 3` uint8 bytes. Depth features set
+`info.is_depth_map` to true and require either little-endian uint16 millimetres
+or float32 metres. Image features are embedded as PNG/TIFF structs in Parquet.
+Video features use LeRobot's current defaults: AV1/yuv420p for RGB and
+lossless HEVC/gray12le after 12-bit logarithmic quantization for depth.
+Multiple episodes are stream-copy concatenated into a shard, and the episode
+metadata records the resulting `[from_timestamp, to_timestamp)` routes.
+
+The destination must be a new local path. There is intentionally no append,
+overwrite, legacy-layout inference, or codec fallback in this strict writer.
+
 ## Roadmap
 
 1. Vane-side tensor layout and image-transform materialization.
@@ -262,10 +323,10 @@ git submodule update --init --recursive
 make
 ```
 
-The metadata and Parquet functions build without FFmpeg. Native video decode is
-enabled automatically when `pkg-config` can find `libavformat`, `libavcodec`,
-`libavutil`, and `libswscale`; on Debian/Ubuntu the corresponding development
-packages can be installed with:
+The metadata and Parquet functions build without FFmpeg. Native visual writing
+and video decoding are enabled automatically when `pkg-config` can find
+`libavformat`, `libavcodec`, `libavutil`, and `libswscale`; on Debian/Ubuntu the
+corresponding development packages can be installed with:
 
 ```bash
 sudo apt-get install pkg-config libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
@@ -318,10 +379,10 @@ into this portable extension.
 
 Extension-owned code uses DuckDB's native `string`, `vector`, `unique_ptr`,
 `make_uniq`, and related helpers. It intentionally stays within the C++11
-language subset so the same source remains compatible with Vane's DuckDB fork.
+language subset rather than introducing another STL or runtime abstraction.
 
 The build does not force `-std=c++11`; it inherits the standard selected by the
 host DuckDB tree. Current official DuckDB builds as C++17 and the current Vane
-tree builds as C++20. Extension-owned translation units are additionally
-syntax-checked with `-std=c++11` against the Vane headers, keeping this layer
-portable even though either host can require a newer standard internally.
+tree builds as C++20. The writer targets the pinned official DuckDB
+`CopyFunction` API; a Vane-fork API adapter belongs in Vane's explicit version
+integration rather than in this strict extension path.

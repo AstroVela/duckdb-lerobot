@@ -1,0 +1,181 @@
+# name: test/sql/lerobot_copy_visual.test
+# description: Native COPY embeds images and writes concatenated RGB and depth video shards
+# group: [lerobot]
+
+require-env LEROBOT_FFMPEG_TESTS
+
+require parquet
+
+require json
+
+require lerobot
+
+statement ok
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'image task'::VARCHAR AS task,
+           CASE frame_index
+               WHEN 0 THEN from_hex(repeat('14283c', 24))
+               ELSE from_hex(repeat('1e2d3f', 24))
+           END AS "observation.images.front",
+           (frame_index / 10.0)::FLOAT AS action
+    FROM range(2) frames(frame_index)
+    ORDER BY frame_index
+) TO '{TEST_DIR}/lerobot_copy_image' (
+    FORMAT lerobot,
+    FPS 10,
+    FEATURES '{"observation.images.front":{"dtype":"image","shape":[4,6,3],"names":["height","width","channels"]},"action":{"dtype":"float32","shape":[1],"names":null}}'
+);
+
+query ITI
+SELECT frame_index, ("observation.images.front").path,
+	       octet_length(("observation.images.front").bytes) > 0
+FROM lerobot_frames('{TEST_DIR}/lerobot_copy_image')
+ORDER BY frame_index;
+----
+0	frame-000000.png	true
+1	frame-000001.png	true
+
+query IT
+SELECT frame_index, left(hex(("observation.images.front").bytes), 16)
+FROM lerobot_frames('{TEST_DIR}/lerobot_copy_image')
+ORDER BY frame_index;
+----
+0	89504E470D0A1A0A
+1	89504E470D0A1A0A
+
+query RRR
+SELECT round("stats/observation.images.front/mean"[1][1][1], 9),
+       round("stats/observation.images.front/q01"[1][1][1], 9),
+       round("stats/observation.images.front/q90"[1][1][1], 9)
+FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_image');
+----
+0.098039217	0.078431375	0.117645491
+
+# At 474 frames NumPy's rounded-linspace sampler selects frame 237 at its
+# midpoint, not frame 236. A white frame only at the latter catches a changed
+# operation order in the sampling implementation.
+statement ok
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'sample task'::VARCHAR AS task,
+           from_hex(CASE WHEN frame_index = 236 THEN 'ffffff' ELSE '000000' END)
+               AS "observation.images.sample"
+    FROM range(474) frames(frame_index)
+    ORDER BY frame_index
+) TO '{TEST_DIR}/lerobot_copy_image_sampling' (
+    FORMAT lerobot,
+    FPS 10,
+    FEATURES '{"observation.images.sample":{"dtype":"image","shape":[1,1,3],"names":["height","width","channels"]}}'
+);
+
+query I
+SELECT "stats/observation.images.sample/mean"[1][1][1] = 0
+FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_image_sampling');
+----
+true
+
+# Two episodes share one MP4. Finalize performs an FFmpeg stream-copy concat,
+# while episode routes retain the local half-open time ranges.
+statement ok
+COPY (
+    SELECT episode_index, task, from_hex(repeat(pixel, 4096)) AS "observation.images.front", action
+    FROM (VALUES
+        (0::BIGINT, 'pick'::VARCHAR, '14283c', 0.0::FLOAT),
+        (0::BIGINT, 'pick'::VARCHAR, '1e323f', 0.1::FLOAT),
+        (1::BIGINT, 'place'::VARCHAR, '645a64', 1.0::FLOAT),
+        (1::BIGINT, 'place'::VARCHAR, '6e6467', 1.1::FLOAT)
+    ) frames(episode_index, task, pixel, action)
+	ORDER BY episode_index, action
+) TO '{TEST_DIR}/lerobot_copy_video' (
+    FORMAT lerobot,
+    FPS 10,
+    FEATURES '{"observation.images.front":{"dtype":"video","shape":[64,64,3],"names":["height","width","channels"]},"action":{"dtype":"float32","shape":[1],"names":null}}',
+    ENCODER_THREADS 1
+);
+
+query I
+SELECT count(*)
+FROM glob('{TEST_DIR}/lerobot_copy_video/videos/**/*.mp4');
+----
+1
+
+query IRR
+SELECT episode_index,
+       round("videos/observation.images.front/from_timestamp", 3),
+       round("videos/observation.images.front/to_timestamp", 3)
+FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_video')
+ORDER BY episode_index;
+----
+0	0.0	0.2
+1	0.2	0.4
+
+query IIIIII
+SELECT count(*), min(width), max(width), min(height), min(channels), min(octet_length(image))
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_copy_video',
+    [0, 1],
+    video_keys := ['observation.images.front'],
+    frame_indices := [0, 1]
+);
+----
+4	64	64	64	3	12288
+
+query III
+SELECT contains(content, '"video.codec":"av1"'),
+       contains(content, '"video.pix_fmt":"yuv420p"'),
+       contains(content, '"video.g":2')
+FROM read_text('{TEST_DIR}/lerobot_copy_video/meta/info.json');
+----
+true	true	true
+
+# Integer depth input is HWC uint16 little-endian in millimetres. It is
+# quantized with LeRobot's 12-bit logarithmic mapping and encoded losslessly.
+statement ok
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'depth task'::VARCHAR AS task,
+           CASE frame_index
+               WHEN 0 THEN from_hex(repeat('d007', 4096))
+               ELSE from_hex(repeat('b80b', 4096))
+           END AS "observation.images.depth",
+           (frame_index / 10.0)::FLOAT AS action
+    FROM range(2) frames(frame_index)
+    ORDER BY frame_index
+) TO '{TEST_DIR}/lerobot_copy_depth' (
+    FORMAT lerobot,
+    FPS 10,
+    FEATURES '{"observation.images.depth":{"dtype":"video","shape":[64,64,1],"names":["height","width","channels"],"info":{"is_depth_map":true}},"action":{"dtype":"float32","shape":[1],"names":null}}',
+    ENCODER_THREADS 1
+);
+
+query II
+SELECT count(*), min(size) > 0
+FROM read_blob('{TEST_DIR}/lerobot_copy_depth/videos/**/*.mp4');
+----
+1	true
+
+query IRR
+SELECT count(*), round(min(decoded_timestamp), 3), round(max(decoded_timestamp), 3)
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_copy_depth',
+    [0],
+    video_keys := ['observation.images.depth'],
+    frame_indices := [0, 1]
+);
+----
+2	0.0	0.1
+
+query RII
+SELECT "stats/observation.images.depth/mean"[1][1][1],
+	       abs("stats/observation.images.depth/q90"[1][1][1] - 2999.960009765625) < 1e-9,
+	       abs("stats/observation.images.depth/q99"[1][1][1] - 2999.9960009765623) < 1e-9
+FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_depth');
+----
+2500.0	true	true
+
+query IIII
+SELECT contains(content, '"video.codec":"hevc"'),
+       contains(content, '"video.pix_fmt":"gray12le"'),
+       contains(content, '"x265-params":"lossless=1"'),
+       contains(content, '"depth_unit":"mm"')
+FROM read_text('{TEST_DIR}/lerobot_copy_depth/meta/info.json');
+----
+true	true	true	true

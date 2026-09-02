@@ -1,0 +1,278 @@
+# name: test/sql/lerobot_copy.test
+# description: Native COPY writes a strict LeRobot v3 dataset and publishes metadata last
+# group: [lerobot]
+
+require parquet
+
+require json
+
+require lerobot
+
+# A tiny data-file limit forces the second episode into the next chunk. One
+# metadata row per flush exercises the same rotation path for meta/episodes.
+statement ok
+COPY (
+    SELECT episode_index, task,
+           array_value(value::FLOAT, (value + 10)::FLOAT) AS "observation.state",
+           (value / 10.0)::FLOAT AS action
+    FROM (VALUES
+        (0::BIGINT, 'pick'::VARCHAR, 0),
+        (0::BIGINT, 'pick'::VARCHAR, 1),
+        (1::BIGINT, 'place'::VARCHAR, 10),
+        (1::BIGINT, 'place'::VARCHAR, 11)
+    ) rows(episode_index, task, value)
+    ORDER BY episode_index, value
+) TO '{TEST_DIR}/lerobot_copy' (
+    FORMAT lerobot,
+    FPS 10,
+    FEATURES '{"observation.state":{"dtype":"float32","shape":[2],"names":["x","y"]},"action":{"dtype":"float32","shape":[1],"names":null}}',
+    ROBOT_TYPE 'testbot',
+    CHUNKS_SIZE 1,
+    DATA_FILES_SIZE_IN_MB 0.000001,
+    METADATA_BUFFER_SIZE 1
+);
+
+query TTI
+SELECT codebase_version, data_path, fps
+FROM lerobot_info('{TEST_DIR}/lerobot_copy');
+----
+v3.0	data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet	10
+
+query IIIIIRRI
+SELECT episode_index, frame_index, "index", task_index,
+	       CAST("observation.state"[1] AS INTEGER), round(action, 1), round(timestamp, 1),
+	       length(CAST("observation.state" AS VARCHAR)) > 0
+FROM lerobot_frames('{TEST_DIR}/lerobot_copy')
+ORDER BY "index";
+----
+0	0	0	0	0	0.0	0.0	true
+0	1	1	0	1	0.1	0.1	true
+1	0	2	1	10	1.0	0.0	true
+1	1	3	1	11	1.1	0.1	true
+
+query IT
+SELECT task_index, task
+FROM lerobot_tasks('{TEST_DIR}/lerobot_copy')
+ORDER BY task_index;
+----
+0	pick
+1	place
+
+query IIIIIII
+SELECT episode_index, length, "data/chunk_index", "data/file_index",
+       dataset_from_index, dataset_to_index, "meta/episodes/chunk_index"
+FROM lerobot_episodes('{TEST_DIR}/lerobot_copy')
+ORDER BY episode_index;
+----
+0	2	0	0	0	2	0
+1	2	1	0	2	4	1
+
+# The generated timestamp is stored as float32 but, like LeRobot, its stats
+# are calculated from frame_index / fps before the Arrow cast.
+query RRRR
+SELECT round("stats/action/mean"[1], 6),
+       round("stats/action/q90"[1], 6),
+       round("stats/timestamp/mean"[1], 6),
+       round("stats/timestamp/q90"[1], 6)
+FROM lerobot_episodes('{TEST_DIR}/lerobot_copy')
+WHERE episode_index = 0;
+----
+0.05	0.099996	0.05	0.099996
+
+# Keep NumPy's float32 intermediate rounding exact. This protects both the
+# per-episode RunningQuantileStats calculation and cross-episode aggregation
+# from compiler FMA contraction.
+query III
+SELECT "stats/action/std"[1] = 0.05000000074505806,
+       "stats/action/q90"[1] = 0.09999600052833557,
+       "stats/timestamp/q90"[1] = 0.099996000099992
+FROM lerobot_episodes('{TEST_DIR}/lerobot_copy')
+WHERE episode_index = 0;
+----
+true	true	true
+
+query I
+SELECT CAST(json_extract(content, '$.action.std[0]') AS DOUBLE) = 0.5024938447111051
+FROM read_text('{TEST_DIR}/lerobot_copy/meta/stats.json');
+----
+true
+
+# NumPy reduces float32 batches sequentially below eight values and switches to
+# an eight-lane, 128-value pairwise reduction for larger inputs. Cover the
+# sub-eight case and its subsequent incremental episode aggregation exactly.
+statement ok
+COPY (
+    SELECT *
+    FROM (VALUES
+        (0::BIGINT, 'task-0'::VARCHAR, 0.1::FLOAT),
+        (0::BIGINT, 'task-0'::VARCHAR, -2.3::FLOAT),
+        (0::BIGINT, 'task-0'::VARCHAR, 4.5::FLOAT),
+        (1::BIGINT, 'task-1'::VARCHAR, 100.25::FLOAT),
+        (1::BIGINT, 'task-1'::VARCHAR, -0.75::FLOAT),
+        (2::BIGINT, 'task-2'::VARCHAR, 0.001::FLOAT),
+        (2::BIGINT, 'task-2'::VARCHAR, 0.002::FLOAT),
+        (2::BIGINT, 'task-2'::VARCHAR, 0.003::FLOAT),
+        (2::BIGINT, 'task-2'::VARCHAR, 0.004::FLOAT)
+    ) rows(episode_index, task, action)
+) TO '{TEST_DIR}/lerobot_copy_pairwise_stats' (
+    FORMAT lerobot,
+    FPS 30,
+    FEATURES '{"action":{"dtype":"float32","shape":[1],"names":null}}'
+);
+
+query II
+SELECT "stats/action/mean"[1] = 0.0024999999441206455,
+       "stats/action/std"[1] = 0.0011180343572050333
+FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_pairwise_stats')
+WHERE episode_index = 2;
+----
+true	true
+
+query II
+SELECT CAST(json_extract(content, '$.action.mean[0]') AS DOUBLE) = 11.312222216899196,
+       CAST(json_extract(content, '$.action.std[0]') AS DOUBLE) = 31.489817909433381
+FROM read_text('{TEST_DIR}/lerobot_copy_pairwise_stats/meta/stats.json');
+----
+true	true
+
+statement ok
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'block'::VARCHAR AS task,
+           CASE i % 3
+               WHEN 0 THEN 100000000::FLOAT
+               WHEN 1 THEN -100000000::FLOAT
+               ELSE 1::FLOAT
+           END AS action
+    FROM range(129) rows(i)
+    ORDER BY i
+) TO '{TEST_DIR}/lerobot_copy_pairwise_block' (
+    FORMAT lerobot,
+    FPS 30,
+    FEATURES '{"action":{"dtype":"float32","shape":[1],"names":null}}'
+);
+
+# Sequential float32 summation produces one here; NumPy's recursive 128-value
+# block split produces zero and is the contract used by RunningQuantileStats.
+query II
+SELECT "stats/action/mean"[1] = 0,
+       "stats/action/std"[1] = 81649656
+FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_pairwise_block');
+----
+true	true
+
+statement ok
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'singleton'::VARCHAR AS task,
+           1e30::FLOAT AS action
+) TO '{TEST_DIR}/lerobot_copy_singleton_stats' (
+    FORMAT lerobot,
+    FPS 30,
+    FEATURES '{"action":{"dtype":"float32","shape":[1],"names":null}}'
+);
+
+query II
+SELECT "stats/action/std"[1] = 0,
+       "stats/action/q50"[1] = "stats/action/mean"[1]
+FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_singleton_stats');
+----
+true	true
+
+query II
+SELECT count(DISTINCT file_name), count(DISTINCT file_name || ':' || row_group_id)
+FROM parquet_metadata('{TEST_DIR}/lerobot_copy/data/**/*.parquet');
+----
+2	2
+
+query T
+SELECT DISTINCT compression
+FROM parquet_metadata('{TEST_DIR}/lerobot_copy/data/**/*.parquet');
+----
+SNAPPY
+
+query I
+SELECT count(*)
+FROM parquet_kv_metadata('{TEST_DIR}/lerobot_copy/data/**/*.parquet')
+WHERE decode(key) = 'huggingface'
+  AND contains(decode(value), '"observation.state"');
+----
+2
+
+# Create-only publication prevents an accidental overwrite.
+statement error
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'pick'::VARCHAR AS task,
+           array_value(0::FLOAT, 1::FLOAT) AS "observation.state",
+           0::FLOAT AS action
+) TO '{TEST_DIR}/lerobot_copy' (
+    FORMAT lerobot,
+    FPS 10,
+    FEATURES '{"observation.state":{"dtype":"float32","shape":[2]},"action":{"dtype":"float32","shape":[1]}}'
+);
+----
+dataset root already exists
+
+# An execution-time episode-order failure must remove both the destination and
+# its UUID staging directory.
+statement error
+COPY (
+    SELECT episode_index, 'bad'::VARCHAR AS task, 0::FLOAT AS action
+    FROM (VALUES (0::BIGINT), (2::BIGINT)) rows(episode_index)
+	ORDER BY episode_index
+) TO '{TEST_DIR}/lerobot_copy_failed' (
+    FORMAT lerobot,
+    FPS 10,
+    FEATURES '{"action":{"dtype":"float32","shape":[1]}}'
+);
+----
+episodes must be contiguous and ordered from zero
+
+query I
+SELECT count(*)
+FROM glob('{TEST_DIR}/lerobot_copy_failed*');
+----
+0
+
+statement error
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'pick'::VARCHAR AS task, 0::FLOAT AS action
+) TO '{TEST_DIR}/lerobot_copy_missing_fps' (
+    FORMAT lerobot,
+    FEATURES '{"action":{"dtype":"float32","shape":[1]}}'
+);
+----
+requires the FPS option
+
+statement error
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'pick'::VARCHAR AS task, NULL::FLOAT AS action
+) TO '{TEST_DIR}/lerobot_copy_null' (
+    FORMAT lerobot,
+    FPS 10,
+    FEATURES '{"action":{"dtype":"float32","shape":[1]}}'
+);
+----
+feature 'action' must not contain NULL
+
+statement error
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'pick'::VARCHAR AS task,
+           0::FLOAT AS action, 42::INTEGER AS undeclared
+) TO '{TEST_DIR}/lerobot_copy_extra_column' (
+    FORMAT lerobot,
+    FPS 10,
+    FEATURES '{"action":{"dtype":"float32","shape":[1]}}'
+);
+----
+expected exactly episode_index, task, and 1 user feature columns
+
+statement error
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'pick'::VARCHAR AS task,
+           0::FLOAT AS "invalid/name"
+) TO '{TEST_DIR}/lerobot_copy_invalid_feature_name' (
+    FORMAT lerobot,
+    FPS 10,
+    FEATURES '{"invalid/name":{"dtype":"float32","shape":[1]}}'
+);
+----
+feature names must not contain '/'
