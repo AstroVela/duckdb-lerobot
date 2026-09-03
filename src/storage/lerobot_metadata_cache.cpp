@@ -33,6 +33,7 @@ struct ParsedLerobotInfo {
 	string video_path_template;
 	int64_t fps;
 	vector<string> video_keys;
+	vector<LerobotVideoFeatureMetadata> video_feature_metadata;
 };
 
 string FormatDecimal(int64_t value, const string &format_spec, const string &field_name) {
@@ -164,13 +165,55 @@ bool IsV3Version(const string &version) {
 	       StringUtil::StartsWith(version, "3.");
 }
 
+bool ValidFloat32DepthParameters(double depth_min, double depth_max, double shift, bool use_log) {
+	const auto depth_min_float = static_cast<float>(depth_min);
+	const auto depth_max_float = static_cast<float>(depth_max);
+	const auto shift_float = static_cast<float>(shift);
+	if (!std::isfinite(depth_min_float) || !std::isfinite(depth_max_float) || !std::isfinite(shift_float) ||
+	    depth_min_float >= depth_max_float) {
+		return false;
+	}
+
+	double scale;
+	double offset;
+	if (use_log) {
+		const auto shifted_min = depth_min + shift;
+		const auto shifted_max = depth_max + shift;
+		if (!std::isfinite(shifted_min) || !std::isfinite(shifted_max) || shifted_min <= 0 ||
+		    shifted_max <= shifted_min) {
+			return false;
+		}
+		const auto log_min = std::log(shifted_min);
+		const auto log_max = std::log(shifted_max);
+		scale = (log_max - log_min) / 4095.0;
+		offset = log_min;
+	} else {
+		scale = (depth_max - depth_min) / 4095.0;
+		offset = depth_min;
+	}
+	const auto scale_float = static_cast<float>(scale);
+	const auto offset_float = static_cast<float>(offset);
+	return std::isfinite(scale) && std::isfinite(offset) && std::isfinite(scale_float) && scale_float > 0 &&
+	       std::isfinite(offset_float);
+}
+
 ParsedLerobotInfo ReadLerobotInfo(Connection &connection, const string &info_path) {
 	auto info_result = connection.Query(
 	    "WITH info AS (SELECT row_number() OVER () AS record_index, json FROM read_json_objects(" +
 	    MetadataQueryPath(info_path) +
 	    ")) SELECT CAST(record_index AS BIGINT), json_extract_string(info.json, '$.codebase_version'), "
 	    "json_extract_string(info.json, '$.data_path'), json_extract_string(info.json, '$.video_path'), "
-	    "CAST(json_extract_string(info.json, '$.fps') AS BIGINT), features.key FROM info LEFT JOIN LATERAL "
+	    "CAST(json_extract_string(info.json, '$.fps') AS BIGINT), features.key, "
+	    "CAST(json_extract(features.value, '$.info.is_depth_map') AS BOOLEAN), "
+	    "CAST(json_extract(features.value, '$.info.\"video.depth_min\"') AS DOUBLE), "
+	    "CAST(json_extract(features.value, '$.info.\"video.depth_max\"') AS DOUBLE), "
+	    "CAST(json_extract(features.value, '$.info.\"video.shift\"') AS DOUBLE), "
+	    "CAST(json_extract(features.value, '$.info.\"video.use_log\"') AS BOOLEAN), "
+	    "json_extract_string(features.value, '$.info.\"video.pix_fmt\"'), "
+	    "CAST(json_extract(features.value, '$.shape[2]') AS BIGINT), "
+	    "json_extract_string(features.value, '$.info.\"video.is_depth_map\"'), "
+	    "json_extract_string(features.value, '$.video_info.\"video.is_depth_map\"') "
+	    "FROM info LEFT JOIN LATERAL "
 	    "json_each(json_extract(info.json, '$.features')) features ON "
 	    "json_extract_string(features.value, '$.dtype') = 'video' ORDER BY record_index, features.key");
 	if (info_result->HasError()) {
@@ -211,7 +254,64 @@ ParsedLerobotInfo ReadLerobotInfo(Connection &connection, const string &info_pat
 				if (video_key.empty()) {
 					throw BinderException("LeRobot video feature keys must not be empty");
 				}
+				if (!chunk->GetValue(13, row).IsNull() || !chunk->GetValue(14, row).IsNull()) {
+					throw BinderException(
+					    "LeRobot video feature '%s' uses a legacy depth marker; use info.is_depth_map instead",
+					    video_key);
+				}
+				LerobotVideoFeatureMetadata feature_metadata;
+				const auto is_depth_map =
+				    !chunk->GetValue(6, row).IsNull() && BooleanValue::Get(chunk->GetValue(6, row));
+				if (is_depth_map) {
+					for (idx_t column = 7; column <= 12; column++) {
+						if (chunk->GetValue(column, row).IsNull()) {
+							throw BinderException(
+							    "LeRobot depth video feature '%s' requires video.depth_min, video.depth_max, "
+							    "video.shift, video.use_log, video.pix_fmt, and a channel dimension",
+							    video_key);
+						}
+					}
+					const auto depth_min = chunk->GetValue(7, row).GetValue<double>();
+					const auto depth_max = chunk->GetValue(8, row).GetValue<double>();
+					const auto shift = chunk->GetValue(9, row).GetValue<double>();
+					const auto use_log = BooleanValue::Get(chunk->GetValue(10, row));
+					const auto pixel_format = StringValue::Get(chunk->GetValue(11, row));
+					const auto channels = chunk->GetValue(12, row).GetValue<int64_t>();
+					if (!std::isfinite(depth_min) || !std::isfinite(depth_max) || !std::isfinite(shift) ||
+					    depth_min >= depth_max || !ValidFloat32DepthParameters(depth_min, depth_max, shift, use_log)) {
+						throw BinderException("LeRobot depth video feature '%s' has invalid quantization parameters",
+						                      video_key);
+					}
+					if (pixel_format != "gray12le") {
+						throw BinderException("LeRobot depth video feature '%s' requires video.pix_fmt 'gray12le'",
+						                      video_key);
+					}
+					if (channels != 1) {
+						throw BinderException("LeRobot depth video feature '%s' requires exactly one channel",
+						                      video_key);
+					}
+					feature_metadata = LerobotVideoFeatureMetadata(depth_min, depth_max, shift, use_log);
+				} else {
+					bool has_depth_only_metadata = false;
+					for (idx_t column = 7; column <= 10; column++) {
+						has_depth_only_metadata = has_depth_only_metadata || !chunk->GetValue(column, row).IsNull();
+					}
+					if (!chunk->GetValue(11, row).IsNull()) {
+						has_depth_only_metadata =
+						    has_depth_only_metadata || StringValue::Get(chunk->GetValue(11, row)) == "gray12le";
+					}
+					if (!chunk->GetValue(12, row).IsNull()) {
+						has_depth_only_metadata =
+						    has_depth_only_metadata || chunk->GetValue(12, row).GetValue<int64_t>() == 1;
+					}
+					if (has_depth_only_metadata) {
+						throw BinderException(
+						    "LeRobot video feature '%s' uses depth-only metadata but info.is_depth_map is not true",
+						    video_key);
+					}
+				}
 				info.video_keys.push_back(std::move(video_key));
+				info.video_feature_metadata.push_back(feature_metadata);
 			}
 		}
 	}
@@ -228,7 +328,6 @@ ParsedLerobotInfo ReadLerobotInfo(Connection &connection, const string &info_pat
 	if (info.fps <= 0) {
 		throw BinderException("LeRobot info.json fps must be positive");
 	}
-	std::sort(info.video_keys.begin(), info.video_keys.end());
 	for (idx_t index = 1; index < info.video_keys.size(); index++) {
 		if (info.video_keys[index - 1] == info.video_keys[index]) {
 			throw BinderException("Duplicate LeRobot video feature key '%s' in info.json", info.video_keys[index]);
@@ -244,12 +343,15 @@ ParsedLerobotInfo ReadLerobotInfo(Connection &connection, const string &info_pat
 
 LerobotDatasetMetadata::LerobotDatasetMetadata(string root_p, string codebase_version_p, string data_path_template_p,
                                                string video_path_template_p, int64_t fps_p, vector<string> video_keys_p,
+                                               vector<LerobotVideoFeatureMetadata> video_feature_metadata_p,
                                                vector<LerobotEpisodeRoute> routes_p, vector<string> data_files_p,
                                                FileFingerprint info_fingerprint_p)
     : root(std::move(root_p)), codebase_version(std::move(codebase_version_p)),
       data_path_template(std::move(data_path_template_p)), video_path_template(std::move(video_path_template_p)),
-      fps(fps_p), video_keys(std::move(video_keys_p)), routes(std::move(routes_p)), data_files(std::move(data_files_p)),
+      fps(fps_p), video_keys(std::move(video_keys_p)), video_feature_metadata(std::move(video_feature_metadata_p)),
+      routes(std::move(routes_p)), data_files(std::move(data_files_p)),
       info_fingerprint(std::move(info_fingerprint_p)) {
+	D_ASSERT(video_keys.size() == video_feature_metadata.size());
 }
 
 string LerobotDatasetMetadata::ObjectType() {
@@ -268,6 +370,7 @@ optional_idx LerobotDatasetMetadata::GetEstimatedCacheMemory() const {
 	for (const auto &video_key : video_keys) {
 		memory += video_key.capacity();
 	}
+	memory += video_feature_metadata.capacity() * sizeof(LerobotVideoFeatureMetadata);
 	memory += routes.capacity() * sizeof(LerobotEpisodeRoute);
 	memory += data_files.capacity() * sizeof(string);
 	for (const auto &path : data_files) {
@@ -359,7 +462,8 @@ shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Load(ClientContext &c
 
 	return make_shared_ptr<LerobotDatasetMetadata>(
 	    root, std::move(info.codebase_version), std::move(info.data_path_template), std::move(info.video_path_template),
-	    info.fps, std::move(info.video_keys), std::move(routes), std::move(data_files), info_fingerprint);
+	    info.fps, std::move(info.video_keys), std::move(info.video_feature_metadata), std::move(routes),
+	    std::move(data_files), info_fingerprint);
 }
 
 shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Get(ClientContext &context, const string &root, bool refresh,
@@ -423,12 +527,15 @@ const string &LerobotDatasetMetadata::GetSchemaDataFile() const {
 }
 
 LerobotVideoMetadata::LerobotVideoMetadata(string root_p, string video_path_template_p, int64_t fps_p,
-                                           vector<string> video_keys_p, vector<LerobotVideoRoute> routes_p,
-                                           vector<string> video_files_p,
+                                           vector<string> video_keys_p,
+                                           vector<LerobotVideoFeatureMetadata> video_feature_metadata_p,
+                                           vector<LerobotVideoRoute> routes_p, vector<string> video_files_p,
                                            LerobotDatasetMetadata::FileFingerprint info_fingerprint_p)
     : root(std::move(root_p)), video_path_template(std::move(video_path_template_p)), fps(fps_p),
-      video_keys(std::move(video_keys_p)), routes(std::move(routes_p)), video_files(std::move(video_files_p)),
+      video_keys(std::move(video_keys_p)), video_feature_metadata(std::move(video_feature_metadata_p)),
+      routes(std::move(routes_p)), video_files(std::move(video_files_p)),
       info_fingerprint(std::move(info_fingerprint_p)) {
+	D_ASSERT(video_keys.size() == video_feature_metadata.size());
 }
 
 string LerobotVideoMetadata::ObjectType() {
@@ -445,6 +552,7 @@ optional_idx LerobotVideoMetadata::GetEstimatedCacheMemory() const {
 	for (const auto &video_key : video_keys) {
 		memory += video_key.capacity();
 	}
+	memory += video_feature_metadata.capacity() * sizeof(LerobotVideoFeatureMetadata);
 	memory += routes.capacity() * sizeof(LerobotVideoRoute);
 	memory += video_files.capacity() * sizeof(string);
 	for (const auto &video_file : video_files) {
@@ -467,10 +575,11 @@ shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Load(ClientContext &conte
 	vector<LerobotVideoRoute> routes;
 	vector<string> video_files;
 	const auto &video_keys = dataset.GetVideoKeys();
+	const auto &video_feature_metadata = dataset.GetVideoFeatureMetadata();
 	if (video_keys.empty()) {
-		return make_shared_ptr<LerobotVideoMetadata>(dataset.GetRoot(), dataset.GetVideoPathTemplate(),
-		                                             dataset.GetFPS(), video_keys, std::move(routes),
-		                                             std::move(video_files), dataset.GetInfoFingerprint());
+		return make_shared_ptr<LerobotVideoMetadata>(
+		    dataset.GetRoot(), dataset.GetVideoPathTemplate(), dataset.GetFPS(), video_keys, video_feature_metadata,
+		    std::move(routes), std::move(video_files), dataset.GetInfoFingerprint());
 	}
 
 	string query = "SELECT CAST(episode_index AS BIGINT), CAST(length AS BIGINT)";
@@ -490,6 +599,7 @@ shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Load(ClientContext &conte
 	}
 
 	unordered_map<string, idx_t> video_file_indexes;
+	vector<idx_t> video_file_key_indices;
 	while (true) {
 		auto chunk = episode_result->Fetch();
 		if (!chunk) {
@@ -545,8 +655,16 @@ shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Load(ClientContext &conte
 					video_file_index = video_files.size();
 					video_file_indexes.emplace(video_file, video_file_index);
 					video_files.push_back(std::move(video_file));
+					video_file_key_indices.push_back(video_key_index);
 				} else {
 					video_file_index = entry->second;
+					D_ASSERT(video_file_index < video_file_key_indices.size());
+					const auto previous_video_key_index = video_file_key_indices[video_file_index];
+					if (previous_video_key_index != video_key_index) {
+						throw BinderException("LeRobot video path '%s' is shared by feature keys '%s' and '%s'",
+						                      video_file, video_keys[previous_video_key_index],
+						                      video_keys[video_key_index]);
+					}
 				}
 				routes.emplace_back(episode_index, episode_length, video_key_index, video_file_index, chunk_index,
 				                    file_index, from_timestamp, to_timestamp);
@@ -569,8 +687,8 @@ shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Load(ClientContext &conte
 	}
 
 	return make_shared_ptr<LerobotVideoMetadata>(dataset.GetRoot(), dataset.GetVideoPathTemplate(), dataset.GetFPS(),
-	                                             video_keys, std::move(routes), std::move(video_files),
-	                                             dataset.GetInfoFingerprint());
+	                                             video_keys, video_feature_metadata, std::move(routes),
+	                                             std::move(video_files), dataset.GetInfoFingerprint());
 }
 
 shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Get(ClientContext &context, const string &root, bool refresh,

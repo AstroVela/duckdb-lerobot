@@ -302,3 +302,90 @@ SELECT count(*)
 FROM lerobot_video_routes('{TEST_DIR}/lerobot_no_video', [0]);
 ----
 0
+
+# Current depth videos must carry the complete canonical quantizer metadata.
+# The reader does not infer defaults or inspect legacy depth markers.
+statement ok
+COPY (
+    SELECT 0 AS bootstrap, 1 AS payload
+) TO '{TEST_DIR}/lerobot_incomplete_depth' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (
+    SELECT 0 AS bootstrap, 1 AS payload
+) TO '{TEST_DIR}/lerobot_incomplete_depth/meta' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version,
+           'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet' AS data_path,
+           'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
+           30 AS fps,
+           struct_pack(
+               "observation.images.depth" := struct_pack(
+                   dtype := 'video',
+                   shape := [64, 64, 1],
+                   info := struct_pack(is_depth_map := true)
+               )
+           ) AS features
+) TO '{TEST_DIR}/lerobot_incomplete_depth/meta/info.json' (FORMAT JSON, ARRAY false);
+
+statement error
+SELECT *
+FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_incomplete_depth');
+----
+requires video.depth_min, video.depth_max, video.shift, video.use_log, video.pix_fmt, and a channel dimension
+
+# A current one-channel/gray12le stream must opt in through the canonical marker;
+# it is never inferred and must not silently enter the RGB24 path.
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version,
+           'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet' AS data_path,
+           'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
+           30 AS fps,
+           struct_pack(
+               "observation.images.depth" := struct_pack(
+                   dtype := 'video',
+                   shape := [64, 64, 1],
+                   info := struct_pack(
+                       "video.pix_fmt" := 'gray12le',
+                       "video.depth_min" := 0.01,
+                       "video.depth_max" := 10.0,
+                       "video.shift" := 3.5,
+                       "video.use_log" := true,
+                       is_depth_map := false
+                   )
+               )
+           ) AS features
+) TO '{TEST_DIR}/lerobot_incomplete_depth/meta/info.json'
+  (FORMAT JSON, ARRAY false, OVERWRITE_OR_IGNORE);
+
+statement error
+SELECT *
+FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_incomplete_depth', refresh := true);
+----
+uses depth-only metadata but info.is_depth_map is not true
+
+# Legacy marker presence is rejected even when no shape or codec field is
+# available to infer that the feature is depth.
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version,
+           'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet' AS data_path,
+           'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
+           30 AS fps,
+           struct_pack(
+               "observation.images.depth" := struct_pack(
+                   dtype := 'video',
+                   info := struct_pack("video.is_depth_map" := true)
+               )
+           ) AS features
+) TO '{TEST_DIR}/lerobot_incomplete_depth/meta/info.json'
+  (FORMAT JSON, ARRAY false, OVERWRITE_OR_IGNORE);
+
+statement error
+SELECT *
+FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_incomplete_depth', refresh := true);
+----
+uses a legacy depth marker; use info.is_depth_map instead
