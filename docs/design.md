@@ -209,13 +209,22 @@ decoder count, queued target count, per-call image bytes, and FFmpeg codec
 threads are independent controls. Encountering an additional shard closes the
 least-recently-used idle decoder before opening the replacement. Each row
 includes the episode-local timestamp, absolute requested timestamp, actual
-decoded timestamp, dimensions, three channels, and an interleaved HWC RGB24
-`BLOB`.
+decoded timestamp, dimensions, channels, and an HWC `BLOB`. RGB rows contain
+three interleaved uint8 channels. Depth rows contain one little-endian float32
+channel dequantized to millimetres by default or metres when
+`depth_output_unit := 'm'` is requested.
 Optional width and height use the same two-stage pixel contract as Daft: PyAV
 RGB24 conversion at native dimensions followed by Pillow-compatible
 nearest-neighbour resize. A `frame_indices` named argument filters the native
 Parquet timestamp query before decode; callers should prefer it over an outer
 SQL filter for sparse sampling.
+
+Depth routes are identified only by the canonical `info.is_depth_map` marker.
+Their one-channel `gray12le` codes are inverted with the exact
+`video.depth_min`, `video.depth_max`, `video.shift`, and `video.use_log` values
+stored in `info.json`. Missing parameters, legacy markers, other pixel formats,
+and out-of-range 12-bit codes are rejected instead of receiving inferred
+defaults or a color conversion.
 
 FFmpeg reads through a seekable custom `AVIOContext` backed by DuckDB's
 `FileSystem`. This preserves `hf://` and other filesystem extensions, secrets,

@@ -152,8 +152,9 @@ FROM read_blob('{TEST_DIR}/lerobot_copy_depth/videos/**/*.mp4');
 ----
 1	true
 
-query IRR
-SELECT count(*), round(min(decoded_timestamp), 3), round(max(decoded_timestamp), 3)
+query IRRIII
+SELECT count(*), round(min(decoded_timestamp), 3), round(max(decoded_timestamp), 3),
+       min(channels), min(octet_length(image)), count(DISTINCT md5(image))
 FROM lerobot_video_frames(
     '{TEST_DIR}/lerobot_copy_depth',
     [0],
@@ -161,7 +162,88 @@ FROM lerobot_video_frames(
     frame_indices := [0, 1]
 );
 ----
-2	0.0	0.1
+2	0.0	0.1	1	16384	2
+
+# Depth output is an HWC, one-channel, little-endian float32 BLOB. The default
+# output unit is millimetres, matching native LeRobot's tensor contract. The
+# encoded 2000 mm and 3000 mm inputs dequantize to 1999 mm and 3000 mm.
+query IT
+SELECT frame_index, md5(image)
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_copy_depth',
+    [0],
+    video_keys := ['observation.images.depth'],
+    frame_indices := [0, 1]
+)
+ORDER BY frame_index;
+----
+0	ef7151749ffa8528e7d397c641b58bbc
+1	2f6ddf3c05fb452214774f7241227112
+
+query I
+WITH millimetres AS (
+    SELECT frame_index, image
+    FROM lerobot_video_frames(
+        '{TEST_DIR}/lerobot_copy_depth', [0],
+        video_keys := ['observation.images.depth'], frame_indices := [0, 1]
+    )
+), metres AS (
+    SELECT frame_index, image
+    FROM lerobot_video_frames(
+        '{TEST_DIR}/lerobot_copy_depth', [0],
+        video_keys := ['observation.images.depth'], frame_indices := [0, 1],
+        depth_output_unit := 'm'
+    )
+)
+SELECT count(*)
+FROM millimetres JOIN metres USING (frame_index)
+WHERE millimetres.image != metres.image;
+----
+2
+
+query IIII
+SELECT min(width), min(height), min(channels), min(octet_length(image))
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_copy_depth', [0],
+    video_keys := ['observation.images.depth'], frame_indices := [0, 1],
+    width := 32, height := 16
+);
+----
+32	16	1	2048
+
+query III
+SELECT min(channels), min(octet_length(image)), count(DISTINCT md5(image))
+FROM lerobot_video_windows(
+    '{TEST_DIR}/lerobot_copy_depth',
+    [struct_pack(request_id := 7::BIGINT, episode_index := 0::BIGINT, frame_index := 0::BIGINT)],
+    video_keys := ['observation.images.depth'],
+    delta_timestamps := [0.0, 0.1]
+);
+----
+1	16384	2
+
+query III
+SELECT min(channels), min(octet_length(image)), count(DISTINCT md5(image))
+FROM lerobot_video_targets(
+    '{TEST_DIR}/lerobot_copy_depth',
+    (SELECT * FROM (VALUES
+        (7, 0, 0, 'observation.images.depth', 0),
+        (7, 0, 0, 'observation.images.depth', 1)
+    ) targets(request_id, episode_index, frame_index, video_key, delta_index)),
+    delta_timestamps := [0.0, 0.1]
+);
+----
+1	16384	2
+
+statement error
+SELECT *
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_copy_depth', [0],
+    video_keys := ['observation.images.depth'],
+    depth_output_unit := 'cm'
+);
+----
+depth_output_unit must be 'm' or 'mm'
 
 query RII
 SELECT "stats/observation.images.depth/mean"[1][1][1],
@@ -179,3 +261,142 @@ SELECT contains(content, '"video.codec":"hevc"'),
 FROM read_text('{TEST_DIR}/lerobot_copy_depth/meta/info.json');
 ----
 true	true	true	true
+
+# The decoder consumes the quantizer configuration from info.json instead of
+# assuming the writer defaults. Reinterpret the same lossless codes with a
+# linear [0.5 m, 6.5 m] mapping, then force metadata-cache refresh.
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version,
+           10 AS fps,
+           1 AS total_episodes,
+           2 AS total_frames,
+           1 AS total_tasks,
+           1000 AS chunks_size,
+           100 AS data_files_size_in_mb,
+           200 AS video_files_size_in_mb,
+           'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet' AS data_path,
+           'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
+           struct_pack(
+               "observation.images.depth" := struct_pack(
+                   dtype := 'video',
+                   shape := [64, 64, 1],
+                   names := ['height', 'width', 'channels'],
+                   info := struct_pack(
+                       "video.pix_fmt" := 'gray12le',
+                       "video.depth_min" := 0.5,
+                       "video.depth_max" := 6.5,
+                       "video.shift" := 2.0,
+                       "video.use_log" := false,
+                       is_depth_map := true,
+                       depth_unit := 'mm'
+                   )
+               )
+           ) AS features
+) TO '{TEST_DIR}/lerobot_copy_depth/meta/info.json'
+  (FORMAT JSON, ARRAY false, OVERWRITE_OR_IGNORE);
+
+query IT
+SELECT frame_index, md5(image)
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_copy_depth',
+    [0],
+    video_keys := ['observation.images.depth'],
+    frame_indices := [0, 1],
+    refresh := true
+)
+ORDER BY frame_index;
+----
+0	fe2d98d6954082cd58fae41556ffe863
+1	8ab5e0de62c66c63cb75d6557620796c
+
+# The same linear mapping has exact, libm-independent float32 metre values.
+query IT
+SELECT frame_index, md5(image)
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_copy_depth',
+    [0],
+    video_keys := ['observation.images.depth'],
+    frame_indices := [0, 1],
+    depth_output_unit := 'm'
+)
+ORDER BY frame_index;
+----
+0	4a1da32fd15a860f8e2c62de9bea0e53
+1	53ab1bf11cc87bf1503c7b49a498ae5f
+
+# Exercise non-default logarithmic bounds and shift independently of the
+# writer defaults, so every persisted dequantizer parameter affects the result.
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version,
+           10 AS fps,
+           'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet' AS data_path,
+           'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
+           struct_pack(
+               "observation.images.depth" := struct_pack(
+                   dtype := 'video',
+                   shape := [64, 64, 1],
+                   names := ['height', 'width', 'channels'],
+                   info := struct_pack(
+                       "video.pix_fmt" := 'gray12le',
+                       "video.depth_min" := 0.5,
+                       "video.depth_max" := 6.5,
+                       "video.shift" := 0.25,
+                       "video.use_log" := true,
+                       is_depth_map := true
+                   )
+               )
+           ) AS features
+) TO '{TEST_DIR}/lerobot_copy_depth/meta/info.json'
+  (FORMAT JSON, ARRAY false, OVERWRITE_OR_IGNORE);
+
+query IT
+SELECT frame_index, md5(image)
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_copy_depth',
+    [0],
+    video_keys := ['observation.images.depth'],
+    frame_indices := [0, 1],
+    refresh := true
+)
+ORDER BY frame_index;
+----
+0	f2de9917cad819203a02c0203b70517a
+1	409d325a23268841009e29170c4dc725
+
+# Actual stream format is checked whenever decoding occurs, even when image is
+# projected away. Re-label the RGB fixture as depth without changing its MP4.
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version,
+           10 AS fps,
+           'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet' AS data_path,
+           'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
+           struct_pack(
+               "observation.images.front" := struct_pack(
+                   dtype := 'video',
+                   shape := [64, 64, 1],
+                   names := ['height', 'width', 'channels'],
+                   info := struct_pack(
+                       "video.pix_fmt" := 'gray12le',
+                       "video.depth_min" := 0.01,
+                       "video.depth_max" := 10.0,
+                       "video.shift" := 3.5,
+                       "video.use_log" := true,
+                       is_depth_map := true
+                   )
+               )
+           ) AS features
+) TO '{TEST_DIR}/lerobot_copy_video/meta/info.json'
+  (FORMAT JSON, ARRAY false, OVERWRITE_OR_IGNORE);
+
+statement error
+SELECT decoded_timestamp
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_copy_video', [0],
+    video_keys := ['observation.images.front'], frame_indices := [0],
+    refresh := true
+);
+----
+instead of gray12le

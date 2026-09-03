@@ -45,7 +45,7 @@ Decoder sessions stay open across buffers, continue forward when timestamps are
 nearby, and otherwise seek backward to the preceding keyframe. A bounded LRU
 pool closes least-recently-used idle decoders when more shards are encountered
 than can remain open. Results are small Arrow-compatible batches of interleaved
-RGB24 bytes, not Python image objects.
+RGB24 or single-channel float32 depth bytes, not Python image objects.
 
 Native dataset creation is available through DuckDB's COPY surface. `FORMAT
 lerobot` delegates data, episode metadata, and task tables to DuckDB's native
@@ -136,8 +136,9 @@ FROM lerobot_video_routes(
   video_keys := ['observation.images.wrist']
 );
 
--- Decode selected frame rows. The image column is raw HWC RGB24; dimensions
--- and the timestamp actually selected by FFmpeg are returned alongside it.
+-- Decode selected frame rows. RGB image values are raw HWC RGB24. Depth image
+-- values are HWC, single-channel, little-endian float32 physical depths.
+-- Dimensions and the timestamp actually selected by FFmpeg are returned too.
 SELECT episode_index, frame_index, video_key,
        video_timestamp, decoded_timestamp,
        width, height, channels, image
@@ -275,16 +276,23 @@ lossless HEVC/gray12le after 12-bit logarithmic quantization for depth.
 Multiple episodes are stream-copy concatenated into a shard, and the episode
 metadata records the resulting `[from_timestamp, to_timestamp)` routes.
 
+On read, depth video codes are dequantized from the canonical
+`video.depth_min`, `video.depth_max`, `video.shift`, and `video.use_log`
+metadata. The `image` BLOB is HWC with one little-endian float32 value per pixel.
+`depth_output_unit` defaults to `mm`, matching native LeRobot, and accepts `m`
+for metres. Depth metadata must contain the canonical marker, quantizer fields,
+one-channel shape, and `gray12le` pixel format; no defaults or legacy markers are
+inferred.
+
 The destination must be a new local path. There is intentionally no append,
 overwrite, legacy-layout inference, or codec fallback in this strict writer.
 
 ## Roadmap
 
 1. Vane-side tensor layout and image-transform materialization.
-2. Optional depth-video decoding and dequantization when a target dataset requires it.
-3. Optional adaptive seek clustering if cross-storage benchmarks beat the
+2. Optional adaptive seek clustering if cross-storage benchmarks beat the
    fixed 10-second policy materially.
-4. Optional hardware-accelerated FFmpeg backends after the CPU contract is
+3. Optional hardware-accelerated FFmpeg backends after the CPU contract is
    stable.
 
 ## Metadata and Parquet caching
@@ -364,17 +372,19 @@ the least-recently-used partial shard buffer before crossing that bound.
 worker or decoder-session limit, but changing one no longer silently rewrites
 the other.
 `codec_threads` defaults to one FFmpeg thread per decoder to avoid nested
-oversubscription. Projection pushdown avoids opening video entirely unless the
+oversubscription. `depth_output_unit` defaults to `mm` and can be set to `m`;
+both forms use little-endian float32 values in the returned BLOB. Projection
+pushdown avoids opening video entirely unless the
 query needs `image`, `decoded_timestamp`, or unknown native dimensions, so
 metadata-only queries also work in an FFmpeg-disabled build. The relation input
 uses DuckDB typed vectors and native child-plan projection/filter pushdown; the
-source APIs also evaluate pushed output filters themselves. RGB data is written
-directly into DuckDB `BLOB` vectors.
+source APIs also evaluate pushed output filters themselves. RGB and dequantized
+depth data are written directly into DuckDB `BLOB` vectors.
 
 With JSON profiling enabled, `lerobot_video_frames` and
 `lerobot_video_windows` publish targets, decoder acquires/cache hits/opens/
 evictions, decoder seeks, AVIO seeks, video bytes read, frames decoded, RGB
-conversions, and same-frame fan-out hits. See the
+and depth conversions, and same-frame fan-out hits. See the
 [A/B benchmark harness](benchmark/README.md) for matching DuckDB, Daft, and
 native LeRobot runs and the current adaptive-threshold/hardware-decode decision
 gates.

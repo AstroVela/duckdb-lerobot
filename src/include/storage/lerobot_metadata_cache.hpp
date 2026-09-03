@@ -44,6 +44,21 @@ struct LerobotVideoRoute {
 	double to_timestamp;
 };
 
+struct LerobotVideoFeatureMetadata {
+	LerobotVideoFeatureMetadata() : is_depth_map(false), depth_min(0), depth_max(0), shift(0), use_log(false) {
+	}
+
+	LerobotVideoFeatureMetadata(double depth_min_p, double depth_max_p, double shift_p, bool use_log_p)
+	    : is_depth_map(true), depth_min(depth_min_p), depth_max(depth_max_p), shift(shift_p), use_log(use_log_p) {
+	}
+
+	bool is_depth_map;
+	double depth_min;
+	double depth_max;
+	double shift;
+	bool use_log;
+};
+
 //! Immutable, dataset-level metadata used to route an episode to a small set
 //! of Parquet shards. Parquet footers and row-group statistics remain owned by
 //! DuckDB's native Parquet caches.
@@ -65,6 +80,7 @@ public:
 
 	LerobotDatasetMetadata(string root_p, string codebase_version_p, string data_path_template_p,
 	                       string video_path_template_p, int64_t fps_p, vector<string> video_keys_p,
+	                       vector<LerobotVideoFeatureMetadata> video_feature_metadata_p,
 	                       vector<LerobotEpisodeRoute> routes_p, vector<string> data_files_p,
 	                       FileFingerprint info_fingerprint_p);
 
@@ -97,6 +113,9 @@ public:
 	const vector<string> &GetVideoKeys() const {
 		return video_keys;
 	}
+	const vector<LerobotVideoFeatureMetadata> &GetVideoFeatureMetadata() const {
+		return video_feature_metadata;
+	}
 	const FileFingerprint &GetInfoFingerprint() const {
 		return info_fingerprint;
 	}
@@ -124,6 +143,7 @@ private:
 	string video_path_template;
 	int64_t fps;
 	vector<string> video_keys;
+	vector<LerobotVideoFeatureMetadata> video_feature_metadata;
 	vector<LerobotEpisodeRoute> routes;
 	vector<string> data_files;
 	FileFingerprint info_fingerprint;
@@ -134,6 +154,7 @@ private:
 class LerobotVideoMetadata final : public ObjectCacheEntry {
 public:
 	LerobotVideoMetadata(string root_p, string video_path_template_p, int64_t fps_p, vector<string> video_keys_p,
+	                     vector<LerobotVideoFeatureMetadata> video_feature_metadata_p,
 	                     vector<LerobotVideoRoute> routes_p, vector<string> video_files_p,
 	                     LerobotDatasetMetadata::FileFingerprint info_fingerprint_p);
 
@@ -154,6 +175,9 @@ public:
 	}
 	const string &GetVideoFile(const LerobotVideoRoute &route) const {
 		return video_files[route.video_file_index];
+	}
+	const LerobotVideoFeatureMetadata &GetVideoFeatureMetadata(const LerobotVideoRoute &route) const {
+		return video_feature_metadata[route.video_key_index];
 	}
 
 	const string &GetRoot() const {
@@ -185,6 +209,7 @@ private:
 	string video_path_template;
 	int64_t fps;
 	vector<string> video_keys;
+	vector<LerobotVideoFeatureMetadata> video_feature_metadata;
 	vector<LerobotVideoRoute> routes;
 	vector<string> video_files;
 	LerobotDatasetMetadata::FileFingerprint info_fingerprint;

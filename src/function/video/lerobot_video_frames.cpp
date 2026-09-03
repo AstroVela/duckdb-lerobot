@@ -3,6 +3,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/deque.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/helper.hpp"
 #include "duckdb/common/list.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -60,6 +61,11 @@ static const idx_t LEROBOT_MAX_PENDING_TARGETS = 10 * 1024 * 1024;
 static const idx_t LEROBOT_MAX_WINDOW_TARGETS = 100000;
 static const idx_t LEROBOT_DECODE_FRAME_BUDGET = 20000;
 static const double LEROBOT_DEFAULT_CLUSTER_GAP_SECONDS = 10.0;
+#ifdef LEROBOT_HAVE_FFMPEG
+static const uint16_t LEROBOT_DEPTH_QMAX = 4095;
+#endif
+
+enum class LerobotDepthOutputUnit : uint8_t { METERS, MILLIMETERS };
 
 template <typename T>
 T *GetMutableFlatData(Vector &vector) {
@@ -157,6 +163,18 @@ double GetNamedDouble(TableFunctionBindInput &input, const char *name, double de
 	return entry->second.DefaultCastAs(LogicalType::DOUBLE).GetValue<double>();
 }
 
+string GetNamedString(TableFunctionBindInput &input, const char *function_name, const char *name,
+                      const char *default_value) {
+	auto entry = input.named_parameters.find(name);
+	if (entry == input.named_parameters.end()) {
+		return default_value;
+	}
+	if (entry->second.IsNull()) {
+		throw BinderException("%s %s must not be NULL", function_name, name);
+	}
+	return StringValue::Get(entry->second);
+}
+
 string ValueListSQL(const vector<string> &values) {
 	string result = "[";
 	for (idx_t index = 0; index < values.size(); index++) {
@@ -252,6 +270,7 @@ struct LerobotVideoOptions {
 	idx_t max_pending_targets;
 	idx_t max_output_bytes;
 	int32_t codec_threads;
+	LerobotDepthOutputUnit depth_output_unit;
 };
 
 LerobotVideoOptions GetVideoOptions(TableFunctionBindInput &input, const char *function_name) {
@@ -331,6 +350,15 @@ LerobotVideoOptions GetVideoOptions(TableFunctionBindInput &input, const char *f
 	if (codec_threads_value < 0 || codec_threads_value > 64) {
 		throw BinderException("%s codec_threads must be between 0 and 64", function_name);
 	}
+	const auto depth_output_unit_value = GetNamedString(input, function_name, "depth_output_unit", "mm");
+	LerobotDepthOutputUnit depth_output_unit;
+	if (depth_output_unit_value == "m") {
+		depth_output_unit = LerobotDepthOutputUnit::METERS;
+	} else if (depth_output_unit_value == "mm") {
+		depth_output_unit = LerobotDepthOutputUnit::MILLIMETERS;
+	} else {
+		throw BinderException("%s depth_output_unit must be 'm' or 'mm'", function_name);
+	}
 
 	LerobotVideoOptions result;
 	result.tolerance = tolerance;
@@ -344,6 +372,7 @@ LerobotVideoOptions GetVideoOptions(TableFunctionBindInput &input, const char *f
 	result.max_pending_targets = max_pending_targets;
 	result.max_output_bytes = static_cast<idx_t>(max_output_bytes_value);
 	result.codec_threads = static_cast<int32_t>(codec_threads_value);
+	result.depth_output_unit = depth_output_unit;
 	return result;
 }
 
@@ -386,7 +415,7 @@ struct LerobotVideoDecodeMetrics {
 	LerobotVideoDecodeMetrics()
 	    : targets(0), decoder_acquires(0), decoder_cache_hits(0), decoder_opens(0), decoder_evictions(0),
 	      decoder_seeks(0), avio_seeks(0), video_bytes_read(0), frames_decoded(0), rgb_conversions(0),
-	      rgb_fanout_hits(0) {
+	      rgb_fanout_hits(0), depth_conversions(0), depth_fanout_hits(0) {
 	}
 
 	std::atomic<uint64_t> targets;
@@ -400,6 +429,8 @@ struct LerobotVideoDecodeMetrics {
 	std::atomic<uint64_t> frames_decoded;
 	std::atomic<uint64_t> rgb_conversions;
 	std::atomic<uint64_t> rgb_fanout_hits;
+	std::atomic<uint64_t> depth_conversions;
+	std::atomic<uint64_t> depth_fanout_hits;
 };
 
 struct LerobotDecodeBuffer {
@@ -416,7 +447,8 @@ struct LerobotVideoFramesBindData final : public TableFunctionData {
 	      width(options.width), height(options.height), output_batch_size(options.output_batch_size),
 	      target_buffer_size(options.target_buffer_size), max_cached_decoders(options.max_cached_decoders),
 	      decode_threads(options.decode_threads), max_pending_targets(options.max_pending_targets),
-	      max_output_bytes(options.max_output_bytes), codec_threads(options.codec_threads) {
+	      max_output_bytes(options.max_output_bytes), codec_threads(options.codec_threads),
+	      depth_output_unit(options.depth_output_unit) {
 	}
 
 	unique_ptr<FunctionData> Copy() const override {
@@ -436,6 +468,7 @@ struct LerobotVideoFramesBindData final : public TableFunctionData {
 		options.max_pending_targets = max_pending_targets;
 		options.max_output_bytes = max_output_bytes;
 		options.codec_threads = codec_threads;
+		options.depth_output_unit = depth_output_unit;
 		return options;
 	}
 
@@ -454,6 +487,7 @@ struct LerobotVideoFramesBindData final : public TableFunctionData {
 	idx_t max_pending_targets;
 	idx_t max_output_bytes;
 	int32_t codec_threads;
+	LerobotDepthOutputUnit depth_output_unit;
 };
 
 void FinalizeDecodeBuffer(LerobotDecodeBuffer &buffer, double cluster_gap) {
@@ -898,17 +932,31 @@ struct DuckDBAVIOState {
 class LerobotShardDecoder {
 public:
 	LerobotShardDecoder(ClientContext &context_p, const LerobotVideoOptions &options_p, idx_t shard_index_p,
-	                    string video_path_p, bool needs_pixels_p, LerobotVideoDecodeMetrics &metrics_p)
+	                    string video_path_p, const LerobotVideoFeatureMetadata &video_feature_metadata_p,
+	                    bool needs_pixels_p, LerobotVideoDecodeMetrics &metrics_p)
 	    : context(context_p), options(options_p), shard_index(shard_index_p), video_path(std::move(video_path_p)),
-	      needs_pixels(needs_pixels_p), buffer(nullptr), io_state(context_p, video_path, metrics_p), metrics(metrics_p),
-	      format_context(nullptr), avio_context(nullptr), codec_context(nullptr), packet(nullptr),
-	      previous_frame(nullptr), current_frame(nullptr), video_stream(nullptr), sws_context(nullptr),
-	      cluster_position(0), target_position(0), decoded_frames_in_buffer(0), demux_eof(false), flush_sent(false),
-	      decoder_eof(false), have_previous(false), have_current(false), previous_timestamp(0), current_timestamp(0),
-	      have_last_target(false), last_target_timestamp(0), have_converted_frame(false), converted_timestamp(0),
-	      converted_source_width(0), converted_source_height(0), converted_source_format(AV_PIX_FMT_NONE),
+	      video_feature_metadata(video_feature_metadata_p), needs_pixels(needs_pixels_p), buffer(nullptr),
+	      io_state(context_p, video_path, metrics_p), metrics(metrics_p), format_context(nullptr),
+	      avio_context(nullptr), codec_context(nullptr), packet(nullptr), previous_frame(nullptr),
+	      current_frame(nullptr), video_stream(nullptr), sws_context(nullptr), cluster_position(0), target_position(0),
+	      decoded_frames_in_buffer(0), demux_eof(false), flush_sent(false), decoder_eof(false), have_previous(false),
+	      have_current(false), previous_timestamp(0), current_timestamp(0), have_last_target(false),
+	      last_target_timestamp(0), have_converted_frame(false), converted_timestamp(0), converted_source_width(0),
+	      converted_source_height(0), converted_source_format(AV_PIX_FMT_NONE), depth_scale(0), depth_offset(0),
 	      sws_source_width(0), sws_source_height(0), sws_source_format(AV_PIX_FMT_NONE), resize_source_width(0),
 	      resize_source_height(0), resize_target_width(0), resize_target_height(0) {
+		if (video_feature_metadata.is_depth_map) {
+			if (video_feature_metadata.use_log) {
+				const auto log_min = std::log(video_feature_metadata.depth_min + video_feature_metadata.shift);
+				const auto log_max = std::log(video_feature_metadata.depth_max + video_feature_metadata.shift);
+				depth_scale = (log_max - log_min) / static_cast<double>(LEROBOT_DEPTH_QMAX);
+				depth_offset = log_min;
+			} else {
+				depth_scale = (video_feature_metadata.depth_max - video_feature_metadata.depth_min) /
+				              static_cast<double>(LEROBOT_DEPTH_QMAX);
+				depth_offset = video_feature_metadata.depth_min;
+			}
+		}
 		try {
 			Open();
 		} catch (...) {
@@ -1212,39 +1260,112 @@ private:
 		}
 	}
 
-	void ConvertFrame(const AVFrame &source, double decoded_timestamp, idx_t target_index, DecodedVideoFrame &result) {
-		const auto target_width = options.width > 0 ? options.width : source.width;
-		const auto target_height = options.height > 0 ? options.height : source.height;
-		if (source.width <= 0 || source.height <= 0 || target_width <= 0 || target_height <= 0) {
-			throw InvalidInputException("FFmpeg returned invalid dimensions for LeRobot video '%s'", video_path);
-		}
-		result.target_index = target_index;
-		result.decoded_timestamp = decoded_timestamp;
-		result.width = target_width;
-		result.height = target_height;
-		result.pixels = nullptr;
-		if (!needs_pixels) {
+	void PrepareResizeIndices(int32_t source_width, int32_t source_height, int32_t target_width,
+	                          int32_t target_height) {
+		if (resize_source_width == source_width && resize_source_height == source_height &&
+		    resize_target_width == target_width && resize_target_height == target_height) {
 			return;
 		}
+		resize_x_indices.resize(target_width);
+		resize_y_indices.resize(target_height);
+		const auto horizontal_scale =
+		    static_cast<double>(static_cast<float>(source_width)) / static_cast<double>(target_width);
+		const auto vertical_scale =
+		    static_cast<double>(static_cast<float>(source_height)) / static_cast<double>(target_height);
+		double source_x = horizontal_scale * 0.5;
+		for (int32_t target_x = 0; target_x < target_width; target_x++) {
+			resize_x_indices[target_x] = std::min<int32_t>(source_width - 1, static_cast<int32_t>(source_x));
+			source_x += horizontal_scale;
+		}
+		double source_y = vertical_scale * 0.5;
+		for (int32_t target_y = 0; target_y < target_height; target_y++) {
+			resize_y_indices[target_y] = std::min<int32_t>(source_height - 1, static_cast<int32_t>(source_y));
+			source_y += vertical_scale;
+		}
+		resize_source_width = source_width;
+		resize_source_height = source_height;
+		resize_target_width = target_width;
+		resize_target_height = target_height;
+	}
 
+	float DequantizeDepth(uint16_t quantized) const {
+		float depth = static_cast<float>(quantized) * depth_scale;
+		depth += depth_offset;
+		if (video_feature_metadata.use_log) {
+			depth = std::exp(depth);
+			depth -= static_cast<float>(video_feature_metadata.shift);
+		}
+		depth = MaxValue(static_cast<float>(video_feature_metadata.depth_min),
+		                 MinValue(static_cast<float>(video_feature_metadata.depth_max), depth));
+		if (options.depth_output_unit == LerobotDepthOutputUnit::MILLIMETERS) {
+			depth *= 1000.0f;
+			if (depth <= 0.0f) {
+				return 0.0f;
+			}
+			if (depth >= 65535.0f) {
+				return 65535.0f;
+			}
+			const auto lower = std::floor(depth);
+			const auto fraction = depth - lower;
+			const auto lower_is_odd = (static_cast<uint32_t>(lower) & 1U) != 0;
+			if (fraction > 0.5f || (fraction == 0.5f && lower_is_odd)) {
+				return lower + 1.0f;
+			}
+			return lower;
+		}
+		return depth;
+	}
+
+	void ConvertDepthPixels(const AVFrame &source, int32_t target_width, int32_t target_height) {
+		const auto source_format = static_cast<AVPixelFormat>(source.format);
+		if (source_format != AV_PIX_FMT_GRAY12LE) {
+			throw InvalidInputException("LeRobot depth video '%s' decoded as pixel format %d instead of gray12le",
+			                            video_path, static_cast<int>(source_format));
+		}
+		if (!source.data[0] || static_cast<int64_t>(source.linesize[0]) <
+		                           static_cast<int64_t>(source.width) * static_cast<int64_t>(sizeof(uint16_t))) {
+			throw InvalidInputException("FFmpeg returned an invalid gray12le plane for LeRobot depth video '%s'",
+			                            video_path);
+		}
+		const uint64_t target_byte_count =
+		    static_cast<uint64_t>(target_width) * static_cast<uint64_t>(target_height) * sizeof(float);
+		if (target_byte_count > static_cast<uint64_t>(std::numeric_limits<idx_t>::max())) {
+			throw OutOfMemoryException("Decoded LeRobot depth frame is too large");
+		}
+		const bool resize = target_width != source.width || target_height != source.height;
+		if (resize) {
+			PrepareResizeIndices(source.width, source.height, target_width, target_height);
+		}
+		converted_pixels.resize(static_cast<idx_t>(target_byte_count));
+		for (int32_t target_y = 0; target_y < target_height; target_y++) {
+			const auto source_y = resize ? resize_y_indices[target_y] : target_y;
+			const auto source_row = source.data[0] + static_cast<idx_t>(source_y) * source.linesize[0];
+			for (int32_t target_x = 0; target_x < target_width; target_x++) {
+				const auto source_x = resize ? resize_x_indices[target_x] : target_x;
+				const auto quantized = LoadLE<uint16_t>(source_row + static_cast<idx_t>(source_x) * sizeof(uint16_t));
+				if (quantized > LEROBOT_DEPTH_QMAX) {
+					throw InvalidInputException("LeRobot depth video '%s' contains code %u above the 12-bit range",
+					                            video_path, static_cast<unsigned>(quantized));
+				}
+				const auto depth = BSwapIfBE(DequantizeDepth(quantized));
+				const auto target_offset =
+				    (static_cast<idx_t>(target_y) * static_cast<idx_t>(target_width) + target_x) * sizeof(float);
+				Store<float>(depth, reinterpret_cast<data_ptr_t>(&converted_pixels[target_offset]));
+			}
+		}
+	}
+
+	void ConvertRGBPixels(const AVFrame &source, int32_t target_width, int32_t target_height) {
 		const uint64_t source_byte_count =
 		    static_cast<uint64_t>(source.width) * static_cast<uint64_t>(source.height) * 3;
 		const uint64_t target_byte_count =
 		    static_cast<uint64_t>(target_width) * static_cast<uint64_t>(target_height) * 3;
 		if (source_byte_count > static_cast<uint64_t>(std::numeric_limits<idx_t>::max()) ||
 		    target_byte_count > static_cast<uint64_t>(std::numeric_limits<idx_t>::max())) {
-			throw OutOfMemoryException("Decoded LeRobot video frame is too large");
+			throw OutOfMemoryException("Decoded LeRobot RGB frame is too large");
 		}
 
 		const auto source_format = static_cast<AVPixelFormat>(source.format);
-		if (have_converted_frame && decoded_timestamp == converted_timestamp &&
-		    source.width == converted_source_width && source.height == converted_source_height &&
-		    source_format == converted_source_format) {
-			metrics.rgb_fanout_hits.fetch_add(1, std::memory_order_relaxed);
-			result.pixels = &converted_pixels;
-			return;
-		}
-		metrics.rgb_conversions.fetch_add(1, std::memory_order_relaxed);
 		if (!sws_context || sws_source_width != source.width || sws_source_height != source.height ||
 		    sws_source_format != source_format) {
 			if (sws_context) {
@@ -1276,29 +1397,7 @@ private:
 		}
 
 		if (resize) {
-			if (resize_source_width != source.width || resize_source_height != source.height ||
-			    resize_target_width != target_width || resize_target_height != target_height) {
-				resize_x_indices.resize(target_width);
-				resize_y_indices.resize(target_height);
-				const auto horizontal_scale =
-				    static_cast<double>(static_cast<float>(source.width)) / static_cast<double>(target_width);
-				const auto vertical_scale =
-				    static_cast<double>(static_cast<float>(source.height)) / static_cast<double>(target_height);
-				double source_x = horizontal_scale * 0.5;
-				for (int32_t target_x = 0; target_x < target_width; target_x++) {
-					resize_x_indices[target_x] = std::min<int32_t>(source.width - 1, static_cast<int32_t>(source_x));
-					source_x += horizontal_scale;
-				}
-				double source_y = vertical_scale * 0.5;
-				for (int32_t target_y = 0; target_y < target_height; target_y++) {
-					resize_y_indices[target_y] = std::min<int32_t>(source.height - 1, static_cast<int32_t>(source_y));
-					source_y += vertical_scale;
-				}
-				resize_source_width = source.width;
-				resize_source_height = source.height;
-				resize_target_width = target_width;
-				resize_target_height = target_height;
-			}
+			PrepareResizeIndices(source.width, source.height, target_width, target_height);
 			converted_pixels.resize(static_cast<idx_t>(target_byte_count));
 			for (int32_t target_y = 0; target_y < target_height; target_y++) {
 				const auto source_y = resize_y_indices[target_y];
@@ -1312,6 +1411,46 @@ private:
 				}
 			}
 		}
+	}
+
+	void ConvertFrame(const AVFrame &source, double decoded_timestamp, idx_t target_index, DecodedVideoFrame &result) {
+		const auto target_width = options.width > 0 ? options.width : source.width;
+		const auto target_height = options.height > 0 ? options.height : source.height;
+		if (source.width <= 0 || source.height <= 0 || target_width <= 0 || target_height <= 0) {
+			throw InvalidInputException("FFmpeg returned invalid dimensions for LeRobot video '%s'", video_path);
+		}
+		result.target_index = target_index;
+		result.decoded_timestamp = decoded_timestamp;
+		result.width = target_width;
+		result.height = target_height;
+		result.pixels = nullptr;
+		const auto source_format = static_cast<AVPixelFormat>(source.format);
+		if (video_feature_metadata.is_depth_map && source_format != AV_PIX_FMT_GRAY12LE) {
+			throw InvalidInputException("LeRobot depth video '%s' decoded as pixel format %d instead of gray12le",
+			                            video_path, static_cast<int>(source_format));
+		}
+		if (!needs_pixels) {
+			return;
+		}
+
+		if (have_converted_frame && decoded_timestamp == converted_timestamp &&
+		    source.width == converted_source_width && source.height == converted_source_height &&
+		    source_format == converted_source_format) {
+			if (video_feature_metadata.is_depth_map) {
+				metrics.depth_fanout_hits.fetch_add(1, std::memory_order_relaxed);
+			} else {
+				metrics.rgb_fanout_hits.fetch_add(1, std::memory_order_relaxed);
+			}
+			result.pixels = &converted_pixels;
+			return;
+		}
+		if (video_feature_metadata.is_depth_map) {
+			metrics.depth_conversions.fetch_add(1, std::memory_order_relaxed);
+			ConvertDepthPixels(source, target_width, target_height);
+		} else {
+			metrics.rgb_conversions.fetch_add(1, std::memory_order_relaxed);
+			ConvertRGBPixels(source, target_width, target_height);
+		}
 		have_converted_frame = true;
 		converted_timestamp = decoded_timestamp;
 		converted_source_width = source.width;
@@ -1324,6 +1463,7 @@ private:
 	LerobotVideoOptions options;
 	idx_t shard_index;
 	string video_path;
+	LerobotVideoFeatureMetadata video_feature_metadata;
 	bool needs_pixels;
 	const LerobotDecodeBuffer *buffer;
 	DuckDBAVIOState io_state;
@@ -1353,6 +1493,8 @@ private:
 	int converted_source_width;
 	int converted_source_height;
 	AVPixelFormat converted_source_format;
+	float depth_scale;
+	float depth_offset;
 	string source_rgb_pixels;
 	string converted_pixels;
 	int sws_source_width;
@@ -1373,7 +1515,9 @@ public:
 	}
 
 	unique_ptr<LerobotShardDecoder> Acquire(ClientContext &context, const LerobotVideoOptions &options,
-	                                        idx_t shard_index, const string &video_path, bool needs_pixels) {
+	                                        idx_t shard_index, const string &video_path,
+	                                        const LerobotVideoFeatureMetadata &video_feature_metadata,
+	                                        bool needs_pixels) {
 		metrics.decoder_acquires.fetch_add(1, std::memory_order_relaxed);
 		unique_ptr<LerobotShardDecoder> stale_decoder;
 		{
@@ -1419,7 +1563,8 @@ public:
 		// filesystem work, so neither operation holds the cache mutex.
 		stale_decoder.reset();
 		try {
-			return make_uniq<LerobotShardDecoder>(context, options, shard_index, video_path, needs_pixels, metrics);
+			return make_uniq<LerobotShardDecoder>(context, options, shard_index, video_path, video_feature_metadata,
+			                                      needs_pixels, metrics);
 		} catch (...) {
 			lock_guard<mutex> guard(lock);
 			open_count--;
@@ -1562,7 +1707,8 @@ struct LerobotVideoTargetsGlobalState final : public GlobalTableFunctionState {
 #ifdef LEROBOT_HAVE_FFMPEG
 	unique_ptr<LerobotShardDecoder> AcquireDecoder(ClientContext &context, const LerobotVideoRoute &route) {
 		return decoder_cache->Acquire(context, bind_data.options, route.video_file_index,
-		                              bind_data.metadata->GetVideoFile(route), needs_pixels);
+		                              bind_data.metadata->GetVideoFile(route),
+		                              bind_data.metadata->GetVideoFeatureMetadata(route), needs_pixels);
 	}
 
 	void ReleaseDecoder(idx_t shard_index, unique_ptr<LerobotShardDecoder> decoder) {
@@ -1965,7 +2111,8 @@ struct LerobotVideoFramesGlobalState final : public GlobalTableFunctionState {
 		const auto &route = bind_data.routes[target.route_index];
 		D_ASSERT(route.video_file_index == buffer.shard_index);
 		return decoder_cache->Acquire(context, bind_data.GetOptions(), buffer.shard_index,
-		                              bind_data.metadata->GetVideoFile(route), needs_pixels);
+		                              bind_data.metadata->GetVideoFile(route),
+		                              bind_data.metadata->GetVideoFeatureMetadata(route), needs_pixels);
 	}
 
 	void ReleaseDecoder(idx_t shard_index, unique_ptr<LerobotShardDecoder> decoder) {
@@ -2401,7 +2548,7 @@ void WriteLegacyColumn(const LerobotVideoFramesBindData &bind_data, const Lerobo
 		WriteInt32(output, row, GetOutputHeight(bind_data, decoded));
 		break;
 	case LEROBOT_FRAME_CHANNELS:
-		WriteInt32(output, row, 3);
+		WriteInt32(output, row, bind_data.metadata->GetVideoFeatureMetadata(route).is_depth_map ? 1 : 3);
 		break;
 	case LEROBOT_FRAME_IMAGE:
 		D_ASSERT(decoded && decoded->pixels);
@@ -2466,7 +2613,7 @@ void WriteWindowColumn(const LerobotVideoFramesBindData &bind_data, const Lerobo
 		WriteInt32(output, row, GetOutputHeight(bind_data, decoded));
 		break;
 	case LEROBOT_WINDOW_CHANNELS:
-		WriteInt32(output, row, 3);
+		WriteInt32(output, row, bind_data.metadata->GetVideoFeatureMetadata(route).is_depth_map ? 1 : 3);
 		break;
 	case LEROBOT_WINDOW_IMAGE:
 		D_ASSERT(decoded && decoded->pixels);
@@ -2547,7 +2694,7 @@ void WriteTargetRelationColumn(const LerobotVideoTargetsBindData &bind_data, con
 		WriteInt32(output, row, GetTargetOutputHeight(bind_data, decoded));
 		break;
 	case LEROBOT_TARGET_CHANNELS:
-		WriteInt32(output, row, 3);
+		WriteInt32(output, row, bind_data.metadata->GetVideoFeatureMetadata(route).is_depth_map ? 1 : 3);
 		break;
 	case LEROBOT_TARGET_IMAGE:
 		D_ASSERT(decoded && decoded->pixels);
@@ -2801,6 +2948,8 @@ void AddLerobotVideoMetrics(InsertionOrderPreservingMap<string> &result, const L
 	result["LeRobot Frames Decoded"] = std::to_string(metrics.frames_decoded.load());
 	result["LeRobot RGB Conversions"] = std::to_string(metrics.rgb_conversions.load());
 	result["LeRobot RGB Fan-out Hits"] = std::to_string(metrics.rgb_fanout_hits.load());
+	result["LeRobot Depth Conversions"] = std::to_string(metrics.depth_conversions.load());
+	result["LeRobot Depth Fan-out Hits"] = std::to_string(metrics.depth_fanout_hits.load());
 }
 
 InsertionOrderPreservingMap<string> LerobotVideoFramesDynamicToString(TableFunctionDynamicToStringInput &input) {
@@ -2840,6 +2989,7 @@ void AddVideoDecodeNamedParameters(TableFunction &function, bool include_video_k
 	function.named_parameters["max_pending_targets"] = LogicalType::BIGINT;
 	function.named_parameters["max_output_bytes"] = LogicalType::BIGINT;
 	function.named_parameters["codec_threads"] = LogicalType::BIGINT;
+	function.named_parameters["depth_output_unit"] = LogicalType::VARCHAR;
 	function.named_parameters["refresh"] = LogicalType::BOOLEAN;
 	function.projection_pushdown = true;
 	if (source_function) {
