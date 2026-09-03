@@ -40,6 +40,7 @@ private:
 	bool has_explicit_schema = false;
 	bool file_row_number = false;
 	bool binary_as_string = false;
+	bool has_explicit_binary_as_string = false;
 };
 
 string NormalizeLerobotRoot(string root);

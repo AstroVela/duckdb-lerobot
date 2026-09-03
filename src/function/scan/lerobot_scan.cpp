@@ -592,9 +592,11 @@ shared_ptr<MultiFileList> LerobotMultiFileReader::CreateFileList(ClientContext &
 	if (root.empty()) {
 		throw InternalException("LeRobot dataset root was not parsed before file-list creation");
 	}
-	Value binary_setting;
-	if (context.TryGetCurrentSetting("binary_as_string", binary_setting)) {
-		binary_as_string = BooleanValue::Get(binary_setting);
+	if (!has_explicit_binary_as_string) {
+		Value binary_setting;
+		if (context.TryGetCurrentSetting("binary_as_string", binary_setting)) {
+			binary_as_string = BooleanValue::Get(binary_setting);
+		}
 	}
 
 	auto info = ReadLerobotDatasetInfo(context, root);
@@ -656,6 +658,7 @@ bool LerobotMultiFileReader::ParseOption(const string &key, const Value &val, Mu
 			throw BinderException("binary_as_string must not be NULL");
 		}
 		binary_as_string = BooleanValue::Get(val);
+		has_explicit_binary_as_string = true;
 	}
 	if (normalized_key == "schema") {
 		has_explicit_schema =
@@ -710,6 +713,7 @@ unique_ptr<MultiFileReader> LerobotMultiFileReader::Copy() const {
 	result->has_explicit_schema = has_explicit_schema;
 	result->file_row_number = file_row_number;
 	result->binary_as_string = binary_as_string;
+	result->has_explicit_binary_as_string = has_explicit_binary_as_string;
 	return std::move(result);
 }
 

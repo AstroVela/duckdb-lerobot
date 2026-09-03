@@ -407,6 +407,29 @@ FROM (DESCRIBE SELECT * FROM lerobot_frames(
 ----
 true
 
+# A per-scan Parquet option takes precedence over the session default even
+# when empty binding cannot inspect a Parquet footer.
+statement ok
+SET binary_as_string = true;
+
+query II
+SELECT count_if(column_name = 'observation.images.image' AND contains(column_type, 'bytes BLOB')) = 1,
+       count_if(column_name = 'observation.images.image' AND contains(column_type, 'bytes VARCHAR')) = 0
+FROM (DESCRIBE SELECT * FROM lerobot_frames(
+    '{TEST_DIR}/lerobot_copy_empty', binary_as_string := false
+));
+----
+true	true
+
+query I
+SELECT count_if(column_name = 'observation.images.image' AND contains(column_type, 'bytes VARCHAR')) = 1
+FROM (DESCRIBE SELECT * FROM lerobot_frames('{TEST_DIR}/lerobot_copy_empty'));
+----
+true
+
+statement ok
+SET binary_as_string = false;
+
 query IIIIII
 SELECT count(*) = 117,
        count_if(column_name = 'videos/observation.images.video/from_timestamp' AND column_type = 'DOUBLE') = 1,
