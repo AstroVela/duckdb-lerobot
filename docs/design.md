@@ -124,7 +124,13 @@ The function does not open the MP4.
 functions. Following DuckDB Iceberg's implementation pattern, each clones a
 registered DuckDB scan function set and replaces only its `MultiFileReader`.
 The LeRobot reader normalizes the dataset root and expands it to the fixed v3
-metadata path.
+metadata path. It reads the authoritative totals before expanding Parquet
+files. When the relevant total is zero, its custom bind publishes the strict
+v3 schema without opening a file; a positive total with no matching file is an
+error. As with DuckDB Iceberg's custom root reader, scans that remain on this
+reader explicitly do not support plan serialization rather than delegating to
+the native serializer, which would persist expanded files and lose
+dataset-root metadata semantics.
 
 `lerobot_frames` is a bind-replacement table function. It loads the immutable
 base route cache, takes its deduplicated file list resolved from the
@@ -135,6 +141,9 @@ logical get, preserving schema inference, parallel reads, projection and filter
 pushdown, join dynamic filters, footer caching, and row-group pruning. Its
 function set retains the native Parquet overloads and named parameters; the
 bind replacement forwards those parameters after consuming only `refresh`.
+For a zero-frame dataset, the replacement falls through to the same LeRobot
+`MultiFileReader` empty bind and derives the frame schema from
+`info.json.features`.
 
 `lerobot_episode_frames` is a bind-replacement table function. It constructs a
 relational `episode_index IN (...)` predicate over a native `parquet_scan`.
@@ -146,7 +155,8 @@ one known shard only to bind the output schema, then produces no rows; negative
 or NULL indices are rejected during binding.
 
 The base route cache stores the authoritative `codebase_version`, `data_path`,
-`video_path`, `fps`, and sorted video feature keys from `meta/info.json`, a
+`video_path`, `fps`, total counts, empty-dataset schemas, and sorted video
+feature keys from `meta/info.json`, a
 sorted compact episode-to-length/data-file index, and one copy of each resolved
 data path. A second lazy cache stores compact episode/key/video-file indices,
 timestamps, and one copy of each resolved MP4 path. Keeping the caches separate
@@ -165,6 +175,11 @@ video cache is
 not populated until `lerobot_video_routes` or
 `lerobot_video_metadata_cache` is bound; that query projects only four columns
 per video key plus `episode_index` and episode `length`.
+
+Native LeRobot does not create episode, task, data, statistics, or media files
+until its first episode is saved. `FORMAT lerobot` preserves that layout: a
+zero-row COPY publishes `meta/info.json` with zero totals, and the readers use
+that commit marker rather than manufacturing placeholder Parquet footers.
 
 ## Metadata required for a v3 episode
 

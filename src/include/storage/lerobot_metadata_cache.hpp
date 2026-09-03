@@ -8,6 +8,7 @@
 #pragma once
 
 #include "duckdb/common/shared_ptr.hpp"
+#include "duckdb/common/types.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/storage/object_cache.hpp"
 
@@ -59,6 +60,30 @@ struct LerobotVideoFeatureMetadata {
 	bool use_log;
 };
 
+struct LerobotScanSchema {
+	vector<string> names;
+	vector<LogicalType> types;
+};
+
+struct LerobotDatasetInfo {
+	LerobotDatasetInfo() : fps(0), total_episodes(0), total_frames(0), total_tasks(0) {
+	}
+
+	string codebase_version;
+	string data_path_template;
+	string video_path_template;
+	int64_t fps;
+	int64_t total_episodes;
+	int64_t total_frames;
+	int64_t total_tasks;
+	vector<string> video_keys;
+	vector<LerobotVideoFeatureMetadata> video_feature_metadata;
+	LerobotScanSchema frame_schema;
+	LerobotScanSchema episode_schema;
+};
+
+LerobotDatasetInfo ReadLerobotDatasetInfo(ClientContext &context, const string &root);
+
 //! Immutable, dataset-level metadata used to route an episode to a small set
 //! of Parquet shards. Parquet footers and row-group statistics remain owned by
 //! DuckDB's native Parquet caches.
@@ -78,11 +103,8 @@ public:
 		string version_tag;
 	};
 
-	LerobotDatasetMetadata(string root_p, string codebase_version_p, string data_path_template_p,
-	                       string video_path_template_p, int64_t fps_p, vector<string> video_keys_p,
-	                       vector<LerobotVideoFeatureMetadata> video_feature_metadata_p,
-	                       vector<LerobotEpisodeRoute> routes_p, vector<string> data_files_p,
-	                       FileFingerprint info_fingerprint_p);
+	LerobotDatasetMetadata(string root_p, LerobotDatasetInfo info_p, vector<LerobotEpisodeRoute> routes_p,
+	                       vector<string> data_files_p, FileFingerprint info_fingerprint_p);
 
 	static shared_ptr<LerobotDatasetMetadata> Get(ClientContext &context, const string &root, bool refresh,
 	                                              bool &cache_hit);
@@ -102,34 +124,46 @@ public:
 		return root;
 	}
 	const string &GetCodebaseVersion() const {
-		return codebase_version;
+		return info.codebase_version;
 	}
 	const string &GetDataPathTemplate() const {
-		return data_path_template;
+		return info.data_path_template;
 	}
 	const string &GetVideoPathTemplate() const {
-		return video_path_template;
+		return info.video_path_template;
 	}
 	int64_t GetFPS() const {
-		return fps;
+		return info.fps;
 	}
 	const vector<string> &GetVideoKeys() const {
-		return video_keys;
+		return info.video_keys;
 	}
 	const vector<LerobotVideoFeatureMetadata> &GetVideoFeatureMetadata() const {
-		return video_feature_metadata;
+		return info.video_feature_metadata;
+	}
+	const LerobotScanSchema &GetFrameSchema() const {
+		return info.frame_schema;
+	}
+	const LerobotScanSchema &GetEpisodeSchema() const {
+		return info.episode_schema;
+	}
+	int64_t GetTotalFrames() const {
+		return info.total_frames;
+	}
+	int64_t GetTotalTasks() const {
+		return info.total_tasks;
 	}
 	const FileFingerprint &GetInfoFingerprint() const {
 		return info_fingerprint;
 	}
 	idx_t GetEpisodeCount() const {
-		return routes.size();
+		return static_cast<idx_t>(info.total_episodes);
 	}
 	idx_t GetDataFileCount() const {
 		return data_files.size();
 	}
 	idx_t GetVideoKeyCount() const {
-		return video_keys.size();
+		return info.video_keys.size();
 	}
 
 private:
@@ -141,12 +175,7 @@ private:
 
 private:
 	string root;
-	string codebase_version;
-	string data_path_template;
-	string video_path_template;
-	int64_t fps;
-	vector<string> video_keys;
-	vector<LerobotVideoFeatureMetadata> video_feature_metadata;
+	LerobotDatasetInfo info;
 	vector<LerobotEpisodeRoute> routes;
 	vector<string> data_files;
 	FileFingerprint info_fingerprint;

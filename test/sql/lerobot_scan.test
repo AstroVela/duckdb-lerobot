@@ -25,6 +25,9 @@ COPY (
            'frames/chunk-{chunk_index:02d}/part-{file_index:04d}.parquet' AS data_path,
            'media/{video_key}/chunk-{chunk_index:02d}/clip-{file_index:04d}.mp4' AS video_path,
            30 AS fps,
+           3 AS total_episodes,
+           6 AS total_frames,
+           2 AS total_tasks,
            struct_pack(
                "observation.images.front" := struct_pack(dtype := 'video'),
                action := struct_pack(dtype := 'float32'),
@@ -246,6 +249,8 @@ COPY (
            'media/{video_key}/chunk-{chunk_index:02d}/clip-{file_index:04d}.mp4' AS video_path,
            30 AS fps,
            3 AS total_episodes,
+           6 AS total_frames,
+           2 AS total_tasks,
            struct_pack(
                "observation.images.front" := struct_pack(dtype := 'video'),
                action := struct_pack(dtype := 'float32'),
@@ -306,6 +311,9 @@ COPY (
     SELECT 'v3.0' AS codebase_version,
            'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet' AS data_path,
            30 AS fps,
+           1 AS total_episodes,
+           1 AS total_frames,
+           0 AS total_tasks,
            struct_pack(action := struct_pack(dtype := 'float32')) AS features
 ) TO '{TEST_DIR}/lerobot_no_video/meta/info.json' (FORMAT JSON, ARRAY false);
 
@@ -354,6 +362,9 @@ COPY (
            'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet' AS data_path,
            'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
            30 AS fps,
+           0 AS total_episodes,
+           0 AS total_frames,
+           0 AS total_tasks,
            struct_pack(
                "observation.images.depth" := struct_pack(
                    dtype := 'video',
@@ -377,6 +388,9 @@ COPY (
            'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet' AS data_path,
            'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
            30 AS fps,
+           0 AS total_episodes,
+           0 AS total_frames,
+           0 AS total_tasks,
            struct_pack(
                "observation.images.depth" := struct_pack(
                    dtype := 'video',
@@ -408,6 +422,9 @@ COPY (
            'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet' AS data_path,
            'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
            30 AS fps,
+           0 AS total_episodes,
+           0 AS total_frames,
+           0 AS total_tasks,
            struct_pack(
                "observation.images.depth" := struct_pack(
                    dtype := 'video',
@@ -441,6 +458,9 @@ COPY (
            'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet' AS data_path,
            'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
            30 AS fps,
+           0 AS total_episodes,
+           0 AS total_frames,
+           0 AS total_tasks,
            json('{"observation.images.front":{"dtype":"video"},"observation.images.wrist":{"dtype":"video"},"observation.images.front":{"dtype":"video"}}') AS features
 ) TO '{TEST_DIR}/lerobot_duplicate_video_key/meta/info.json' (FORMAT JSON, ARRAY false);
 

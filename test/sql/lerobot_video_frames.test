@@ -25,6 +25,9 @@ COPY (
            'data.parquet' AS data_path,
            'video-{file_index:03d}.mp4' AS video_path,
            2 AS fps,
+           2 AS total_episodes,
+           9 AS total_frames,
+           0 AS total_tasks,
            struct_pack(
                "observation.images.front" := struct_pack(dtype := 'video'),
                "observation.images.wrist" := struct_pack(dtype := 'video')

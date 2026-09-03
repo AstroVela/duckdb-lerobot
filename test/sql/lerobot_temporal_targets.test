@@ -23,6 +23,9 @@ COPY (
     SELECT 'v3.0' AS codebase_version,
            'data/data_chunk={chunk_index}/data_0.parquet' AS data_path,
            10 AS fps,
+           2 AS total_episodes,
+           5 AS total_frames,
+           2 AS total_tasks,
            struct_pack(
                "observation.state" := struct_pack(dtype := 'float32'),
                action := struct_pack(dtype := 'float32')
@@ -78,6 +81,9 @@ COPY (
     SELECT 'v3.0' AS codebase_version,
            'data.parquet' AS data_path,
            4096 AS fps,
+           1 AS total_episodes,
+           7 AS total_frames,
+           0 AS total_tasks,
            struct_pack(
                "observation.state" := struct_pack(dtype := 'float32')
            ) AS features
