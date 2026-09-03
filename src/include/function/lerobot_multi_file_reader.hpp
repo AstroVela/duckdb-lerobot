@@ -11,7 +11,7 @@
 
 namespace duckdb {
 
-enum class LerobotScanKind : uint8_t { INFO, EPISODES, TASKS, FRAMES };
+enum class LerobotScanKind : uint8_t { INFO, EPISODES, TASKS };
 
 class LerobotMultiFileReader final : public MultiFileReader {
 public:
@@ -20,7 +20,6 @@ public:
 	static unique_ptr<MultiFileReader> CreateInfo(const TableFunction &function);
 	static unique_ptr<MultiFileReader> CreateEpisodes(const TableFunction &function);
 	static unique_ptr<MultiFileReader> CreateTasks(const TableFunction &function);
-	static unique_ptr<MultiFileReader> CreateFrames(const TableFunction &function);
 
 	vector<string> ParsePaths(const Value &input) override;
 	unique_ptr<MultiFileReader> Copy() const override;

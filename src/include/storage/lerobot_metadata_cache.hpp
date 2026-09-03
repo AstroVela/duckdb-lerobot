@@ -94,6 +94,9 @@ public:
 	vector<string> ResolveDataFiles(const vector<int64_t> &episode_indices) const;
 	const LerobotEpisodeRoute *FindEpisodeRoute(int64_t episode_index) const;
 	const string &GetSchemaDataFile() const;
+	const vector<string> &GetDataFiles() const {
+		return data_files;
+	}
 
 	const string &GetRoot() const {
 		return root;

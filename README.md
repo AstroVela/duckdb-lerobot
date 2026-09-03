@@ -20,15 +20,20 @@ belong on a separate extension branch rather than in compatibility shims here.
 ## Current status
 
 The extension now exposes native dataset-root scans for LeRobot v3 episode,
-task, and frame Parquet files. Like the Iceberg extension, it copies DuckDB's
-registered `read_json_auto` and `parquet_scan` function sets and injects only a
-format-specific `MultiFileReader`. DuckDB therefore retains its native
-projection, filter, parallel I/O, and row-group pruning paths.
+task, and frame Parquet files. Metadata and task scans copy DuckDB's registered
+`read_json_auto` or `parquet_scan` function sets and inject only a
+format-specific `MultiFileReader`. `lerobot_frames` resolves the authoritative
+`info.json.data_path` file list through the route cache and binds that list
+directly to native `parquet_scan`. DuckDB therefore retains its native
+projection, filter, dynamic-filter, parallel I/O, footer-cache, and row-group
+pruning paths without assuming a `data/` directory. Native Parquet overloads
+and named scan options are preserved and forwarded; `refresh` remains the one
+LeRobot-owned metadata option.
 
-Episode-scoped scans additionally cache the small LeRobot control plane:
-`meta/info.json` plus each episode's `length` and data-shard mapping from
-`meta/episodes`. The cache resolves custom `data_path` templates and hands an
-explicit, deduplicated file list to DuckDB before Parquet binding.
+Frame scans cache the small LeRobot control plane: `meta/info.json` plus each
+episode's `length` and data-shard mapping from `meta/episodes`. The cache
+resolves custom `data_path` templates and hands either the complete or selected
+deduplicated file list to DuckDB before Parquet binding.
 
 Video routing is available as a metadata-only second stage. It resolves each
 requested episode and video feature to its full MP4 path and timestamp range,
@@ -115,7 +120,7 @@ FROM lerobot_tasks('hf://datasets/lerobot/droid_1.0.1');
 -- Read the authoritative version and path-template metadata.
 SELECT * FROM lerobot_info('hf://datasets/lerobot/droid_1.0.1');
 
--- Read all frame rows while retaining native Parquet pushdown.
+-- Read all authoritative frame shards while retaining native Parquet pushdown.
 SELECT episode_index, frame_index, timestamp
 FROM lerobot_frames('hf://datasets/lerobot/droid_1.0.1');
 
