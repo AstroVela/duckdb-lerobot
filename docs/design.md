@@ -303,10 +303,15 @@ instead of being retained in an episode-sized vector. At an episode boundary,
 the writer closes the spools, computes visual statistics by positional reads of
 only the rounded-linspace sample, and encodes each camera sequentially with one
 raw frame buffer. Numeric statistics scan the episode's buffer-managed column
-collection twice per dimension batch: once for the exact NumPy reduction tree
-and extrema, and once for the 5000-bin histograms. Features wider than 64
-dimensions are processed in fixed batches, preserving the same value order and
-exact results while capping histogram and reduction scratch space.
+collection twice per dimension batch: once for the NumPy reduction tree and
+once for the 5000-bin histograms. During the first reduction scan, signed and
+unsigned integer extrema are also collected as original-typed DuckDB values.
+Episode Parquet `min`/`max` use PyArrow-compatible `BIGINT` leaves, except that
+`uint64` uses `UBIGINT` to cover its complete domain; aggregate JSON remains
+exact beyond `2^53`. Integer mean, standard deviation, and quantiles
+deliberately remain floating point. Features wider than 64 dimensions are
+processed in fixed batches, preserving the same value order while capping
+histogram and reduction scratch space.
 `MAX_VISUAL_FRAME_BYTES` (64 MiB by default) bounds each extension-owned raw
 frame allocation; raw-frame scratch memory is therefore independent of episode
 length and camera count, apart from DuckDB's input/output chunks and
