@@ -9,6 +9,14 @@ following the repository structure used by AstroVela's `duckdb-iceberg` fork.
 Vane consumes release-compatible extension builds through an explicit DuckDB
 version compatibility matrix.
 
+## DuckDB version target
+
+The `v1.5-variegata` branch exclusively targets the DuckDB 1.5 Variegata
+release line. It currently pins the official DuckDB `v1.5.5` tag
+(`d8cdaa33fda8df955cc76ef58a280f68f4cd43fa`), matching the pin used by the
+corresponding `duckdb-iceberg` release branch. API changes for DuckDB `main`
+belong on a separate extension branch rather than in compatibility shims here.
+
 ## Current status
 
 The extension now exposes native dataset-root scans for LeRobot v3 episode,
@@ -381,8 +389,8 @@ Extension-owned code uses DuckDB's native `string`, `vector`, `unique_ptr`,
 `make_uniq`, and related helpers. It intentionally stays within the C++11
 language subset rather than introducing another STL or runtime abstraction.
 
-The build does not force `-std=c++11`; it inherits the standard selected by the
-host DuckDB tree. Current official DuckDB builds as C++17 and the current Vane
-tree builds as C++20. The writer targets the pinned official DuckDB
-`CopyFunction` API; a Vane-fork API adapter belongs in Vane's explicit version
-integration rather than in this strict extension path.
+The build does not override the language standard selected by DuckDB. The
+pinned DuckDB 1.5.5 tree selects `-std=c++11`, so this branch compiles the
+extension as C++11 without a second toolchain policy. The writer directly uses
+the Variegata `CopyFunction` and Parquet rotation APIs; DuckDB `main` and
+Vane-fork API adapters belong on their matching version branches.

@@ -3,8 +3,8 @@ cmake_minimum_required(VERSION 3.16)
 project(DuckDBLerobotExtension)
 
 # Inherit the standard selected by the embedding DuckDB build. The extension
-# source stays within the C++11 language subset, but current official DuckDB
-# headers require C++17 and must not be downgraded here.
+# source stays within the C++11 language subset, and the pinned DuckDB 1.5.5
+# tree selects C++11 for the complete build.
 
 # This file is evaluated by DuckDB after extension_config.cmake points at this
 # repository. Configure from the pinned DuckDB source tree (or use `make`) so

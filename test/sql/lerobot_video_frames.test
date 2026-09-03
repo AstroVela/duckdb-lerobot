@@ -271,7 +271,7 @@ SELECT CAST(
     contains(content, 'LeRobot Video Bytes Read') AND
     contains(content, 'LeRobot Frames Decoded') AND
     contains(content, 'LeRobot RGB Conversions') AND
-    contains(content, '"rows_scanned": 4')
+    contains(content, '"operator_rows_scanned": 4')
 AS INTEGER)
 FROM read_text('{TEST_DIR}/lerobot_video_frames/profile.json');
 ----

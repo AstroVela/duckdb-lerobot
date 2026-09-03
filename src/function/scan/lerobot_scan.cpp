@@ -19,24 +19,10 @@
 #include "storage/lerobot_metadata_cache.hpp"
 
 #include <algorithm>
-#include <type_traits>
 
 namespace duckdb {
 
 namespace {
-
-template <typename CALLBACK>
-struct BindColumnNames;
-
-template <typename RESULT, typename CONTEXT, typename INPUT, typename RETURN_TYPES, typename COLUMN_NAMES>
-struct BindColumnNames<RESULT (*)(CONTEXT, INPUT, RETURN_TYPES, COLUMN_NAMES)> {
-	using type = typename std::remove_reference<COLUMN_NAMES>::type;
-};
-
-// DuckDB 2.0 uses vector<Identifier> here, while the Vane fork currently uses
-// vector<string>. Derive the type from DuckDB's callback ABI so both builds use
-// the same source without version checks.
-using LerobotColumnNames = typename BindColumnNames<table_function_bind_t>::type;
 
 bool IsHuggingFaceRepoId(const string &root) {
 	if (root.empty() || root[0] == '/' || StringUtil::Contains(root, "://") || StringUtil::StartsWith(root, "./") ||
@@ -76,36 +62,7 @@ unique_ptr<MultiFileReader> CreateLerobotReader(LerobotScanKind kind, const Tabl
 	return make_uniq<LerobotMultiFileReader>(kind);
 }
 
-template <typename FUNCTION_SET, typename CALLBACK>
-auto ModifyFunctions(FUNCTION_SET &functions, CALLBACK &callback, int)
-    -> decltype(functions.ApplyToFunctions(callback), void()) {
-	functions.ApplyToFunctions(callback);
-}
-
-template <typename FUNCTION_SET, typename CALLBACK>
-void ModifyFunctions(FUNCTION_SET &functions, CALLBACK &callback, long) {
-	for (auto &function : functions.functions) {
-		callback(function);
-	}
-}
-
-template <typename FUNCTION>
-auto SetFunctionName(FUNCTION &function, const char *name, int) -> decltype(function.SetName(name), void()) {
-	function.SetName(name);
-}
-
-template <typename FUNCTION>
-void SetFunctionName(FUNCTION &function, const char *name, long) {
-	function.name = name;
-}
-
-template <typename CHUNK>
-auto SetOutputCardinality(CHUNK &output, idx_t count, int) -> decltype(output.SetCardinalityUnsafe(count), void()) {
-	output.SetCardinalityUnsafe(count);
-}
-
-template <typename CHUNK>
-void SetOutputCardinality(CHUNK &output, idx_t count, long) {
+void SetOutputCardinality(DataChunk &output, idx_t count) {
 	output.SetCardinality(count);
 }
 
@@ -115,12 +72,11 @@ TableFunctionSet CreateNativeScan(ExtensionLoader &loader, const char *source_na
 	// from the catalog, then inject only LeRobot's dataset-root expansion.
 	auto &source = loader.GetTableFunction(source_name);
 	auto result = source.functions;
-	auto modify = [target_name, create_reader](TableFunction &function) {
+	for (auto &function : result.functions) {
 		function.get_multi_file_reader = create_reader;
-		SetFunctionName(function, target_name, 0);
-	};
-	ModifyFunctions(result, modify, 0);
-	SetFunctionName(result, target_name, 0);
+		function.name = target_name;
+	}
+	result.name = target_name;
 	return result;
 }
 
@@ -176,7 +132,7 @@ vector<int64_t> GetEpisodeIndices(const Value &value, const char *function_name)
 }
 
 unique_ptr<FunctionData> LerobotLayoutBind(ClientContext &, TableFunctionBindInput &input,
-                                           vector<LogicalType> &return_types, LerobotColumnNames &names) {
+                                           vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("lerobot_layout root must not be NULL");
 	}
@@ -202,7 +158,7 @@ void LerobotLayoutFunction(ClientContext &, TableFunctionInput &input, DataChunk
 	output.data[3].SetValue(0, Value(root + "/meta/tasks.parquet"));
 	output.data[4].SetValue(0, Value(root + "/data"));
 	output.data[5].SetValue(0, Value(root + "/videos"));
-	SetOutputCardinality(output, 1, 0);
+	SetOutputCardinality(output, 1);
 	state.emitted = true;
 }
 
@@ -234,7 +190,7 @@ struct LerobotV3ShardBindData final : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> LerobotV3ShardPathsBind(ClientContext &, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, LerobotColumnNames &names) {
+                                                 vector<LogicalType> &return_types, vector<string> &names) {
 	for (const auto &value : input.inputs) {
 		if (value.IsNull()) {
 			throw BinderException("lerobot_v3_shard_paths arguments must not be NULL");
@@ -270,7 +226,7 @@ void LerobotV3ShardPathsFunction(ClientContext &, TableFunctionInput &input, Dat
 	output.data[1].SetValue(0, Value(root + "/data/chunk-" + chunk + "/file-" + file + ".parquet"));
 	output.data[2].SetValue(
 	    0, Value(root + "/videos/" + bind_data.video_key + "/chunk-" + chunk + "/file-" + file + ".mp4"));
-	SetOutputCardinality(output, 1, 0);
+	SetOutputCardinality(output, 1);
 	state.emitted = true;
 }
 
@@ -305,7 +261,7 @@ struct LerobotMetadataCacheBindData final : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> LerobotMetadataCacheBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, LerobotColumnNames &names) {
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("lerobot_metadata_cache root must not be NULL");
 	}
@@ -338,7 +294,7 @@ void LerobotMetadataCacheFunction(ClientContext &, TableFunctionInput &input, Da
 	output.data[6].SetValue(0, Value::BIGINT(static_cast<int64_t>(metadata.GetDataFileCount())));
 	output.data[7].SetValue(0, Value::BIGINT(static_cast<int64_t>(metadata.GetVideoKeyCount())));
 	output.data[8].SetValue(0, Value::BOOLEAN(bind_data.cache_hit));
-	SetOutputCardinality(output, 1, 0);
+	SetOutputCardinality(output, 1);
 	state.emitted = true;
 }
 
@@ -356,7 +312,7 @@ struct LerobotVideoMetadataCacheBindData final : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> LerobotVideoMetadataCacheBind(ClientContext &context, TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types, LerobotColumnNames &names) {
+                                                       vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("lerobot_video_metadata_cache root must not be NULL");
 	}
@@ -385,7 +341,7 @@ void LerobotVideoMetadataCacheFunction(ClientContext &, TableFunctionInput &inpu
 	output.data[4].SetValue(0, Value::BIGINT(static_cast<int64_t>(metadata.GetRouteCount())));
 	output.data[5].SetValue(0, Value::BIGINT(static_cast<int64_t>(metadata.GetVideoFileCount())));
 	output.data[6].SetValue(0, Value::BOOLEAN(bind_data.cache_hit));
-	SetOutputCardinality(output, 1, 0);
+	SetOutputCardinality(output, 1);
 	state.emitted = true;
 }
 
@@ -411,7 +367,7 @@ unique_ptr<GlobalTableFunctionState> LerobotVideoRoutesInit(ClientContext &, Tab
 }
 
 unique_ptr<FunctionData> LerobotVideoRoutesBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, LerobotColumnNames &names) {
+                                                vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("lerobot_video_routes root must not be NULL");
 	}
@@ -466,7 +422,7 @@ void LerobotVideoRoutesFunction(ClientContext &, TableFunctionInput &input, Data
 		output.data[7].SetValue(count, Value::BIGINT(bind_data.metadata->GetFPS()));
 		count++;
 	}
-	SetOutputCardinality(output, count, 0);
+	SetOutputCardinality(output, count);
 }
 
 unique_ptr<TableRef> LerobotEpisodeFramesBindReplace(ClientContext &context, TableFunctionBindInput &input) {

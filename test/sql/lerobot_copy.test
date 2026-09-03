@@ -79,12 +79,12 @@ WHERE episode_index = 0;
 ----
 0.05	0.099996	0.05	0.099996
 
-# Keep NumPy's float32 intermediate rounding exact. This protects both the
-# per-episode RunningQuantileStats calculation and cross-episode aggregation
-# from compiler FMA contraction.
+# Keep NumPy's float32 intermediate rounding exact. Variegata binds the long
+# decimal literal as DECIMAL(18,17), so cast it explicitly before comparing the
+# binary DOUBLE emitted by the episode Parquet file.
 query III
 SELECT "stats/action/std"[1] = 0.05000000074505806,
-       "stats/action/q90"[1] = 0.09999600052833557,
+       "stats/action/q90"[1] = CAST('0.09999600052833557' AS DOUBLE),
        "stats/timestamp/q90"[1] = 0.099996000099992
 FROM lerobot_episodes('{TEST_DIR}/lerobot_copy')
 WHERE episode_index = 0;

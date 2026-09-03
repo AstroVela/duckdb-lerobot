@@ -437,8 +437,8 @@ string TasksPandasMetadataJSON() {
 }
 
 CopyFunction GetParquetCopyFunction(ClientContext &context) {
-	auto &entry = Catalog::GetEntry<CopyFunctionCatalogEntry>(
-	    context, QualifiedName(Identifier::SystemCatalog(), Identifier::DefaultSchema(), Identifier("parquet")));
+	auto &catalog = Catalog::GetSystemCatalog(context);
+	auto &entry = catalog.GetEntry<CopyFunctionCatalogEntry>(context, DEFAULT_SCHEMA, "parquet");
 	return entry.function;
 }
 
@@ -455,7 +455,7 @@ unique_ptr<FunctionData> BindParquet(ClientContext &context, const CopyFunction 
 		info.options["kv_metadata"] = {Value::STRUCT(std::move(entries))};
 	}
 	CopyFunctionBindInput input(info, function.function_info);
-	return function.copy_to_bind(context, input, StringsToIdentifiers(names), types);
+	return function.copy_to_bind(context, input, names, types);
 }
 
 const Value &GetSingleOption(const CopyFunctionBindInput &input, const char *name, bool required) {
@@ -483,7 +483,7 @@ T GetNumericOption(const CopyFunctionBindInput &input, const char *name, T defau
 }
 
 struct LerobotCopyBindData : public FunctionData {
-	LerobotCopyBindData() : parquet_function(Identifier("parquet")) {
+	LerobotCopyBindData() : parquet_function("parquet") {
 	}
 
 	vector<string> input_names;
@@ -558,13 +558,13 @@ void AppendStatColumns(LerobotCopyBindData &bind, const LerobotFeature &feature)
 }
 
 unique_ptr<FunctionData> LerobotCopyBind(ClientContext &context, CopyFunctionBindInput &input,
-                                         const vector<Identifier> &names, const vector<LogicalType> &types) {
+                                         const vector<string> &names, const vector<LogicalType> &types) {
 	if (names.size() != types.size()) {
 		throw InternalException("LeRobot COPY input names/types size mismatch");
 	}
 	auto result = make_uniq<LerobotCopyBindData>();
 	for (const auto &name : names) {
-		result->input_names.push_back(name.GetIdentifierName());
+		result->input_names.push_back(name);
 	}
 	result->input_types = types;
 
@@ -738,11 +738,22 @@ struct DelegatedParquetWriter {
 		function.flush_batch(context, *bind_data, *global_data, *prepared);
 	}
 
-	idx_t FileSize() const {
+	bool SizeAtLeast(double bytes) const {
 		if (!global_data) {
-			return 0;
+			return false;
 		}
-		return function.file_size_bytes(*global_data);
+		if (bytes <= 0) {
+			return true;
+		}
+		if (!std::isfinite(bytes) || bytes > static_cast<double>(NumericLimits<idx_t>::Maximum())) {
+			return false;
+		}
+		if (!function.rotate_next_file) {
+			throw InternalException("DuckDB 1.5 Parquet COPY is missing rotate_next_file");
+		}
+		const auto minimum_size = static_cast<idx_t>(std::ceil(bytes));
+		const auto maximum_smaller_size = minimum_size == 0 ? 0 : minimum_size - 1;
+		return function.rotate_next_file(*global_data, *bind_data, optional_idx(maximum_smaller_size));
 	}
 
 	void Close(ClientContext &context) {
@@ -1374,7 +1385,7 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 			episodes_writer.global_data.reset();
 			tasks_writer.global_data.reset();
 			if (fs.DirectoryExists(stage_root)) {
-				fs.RemoveDirectoryExtended(stage_root, {RemoveDirectoryMode::RECURSIVE});
+				fs.RemoveDirectory(stage_root);
 			}
 		} catch (...) { // NOLINT
 		}
@@ -1516,7 +1527,7 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 				}
 			}
 		}
-		output.SetChildCardinality(count);
+		output.SetCardinality(count);
 		for (idx_t row = 0; row < count; row++) {
 			AddStatsRow(output, row, current_episode_frames + row);
 		}
@@ -1526,7 +1537,7 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 
 	void Process(DataChunk &input) {
 		for (const auto &feature : bind.features) {
-			if (feature.user_defined && VectorOperations::HasNull(input.data[feature.input_index])) {
+			if (feature.user_defined && VectorOperations::HasNull(input.data[feature.input_index], input.size())) {
 				throw InvalidInputException("LeRobot feature '%s' must not contain NULL", feature.name);
 			}
 		}
@@ -1558,11 +1569,11 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 
 	void EnsureDataWriter(idx_t episode_length) {
 		if (data_writer.global_data) {
-			const auto current_size = data_writer.FileSize();
 			const auto frames_in_file = total_frames - data_file_start_frame;
-			const auto average_size = frames_in_file > 0 ? static_cast<double>(current_size) / frames_in_file : 0;
-			const auto projected = static_cast<double>(current_size) + average_size * episode_length;
-			if (projected >= bind.data_file_size_mb * 1024.0 * 1024.0) {
+			const auto size_limit = bind.data_file_size_mb * 1024.0 * 1024.0;
+			const auto projection_factor =
+			    frames_in_file > 0 ? 1.0 + static_cast<double>(episode_length) / frames_in_file : 1.0;
+			if (data_writer.SizeAtLeast(size_limit / projection_factor)) {
 				data_writer.Close(context);
 				AdvanceFileIndex(data_chunk_index, data_file_index, bind.chunks_size);
 				data_file_start_frame = total_frames;
@@ -1659,7 +1670,11 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 				fs.RemoveFile(concat_list);
 			}
 			shard.duration += encoded.duration;
-			current_video_routes[feature_index] = {shard.chunk_index, shard.file_index, from_timestamp, shard.duration};
+			auto &route = current_video_routes[feature_index];
+			route.chunk_index = shard.chunk_index;
+			route.file_index = shard.file_index;
+			route.from_timestamp = from_timestamp;
+			route.to_timestamp = shard.duration;
 		}
 	}
 
@@ -1684,13 +1699,13 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 		if (!episodes_writer.global_data) {
 			return;
 		}
-		const auto current_size = static_cast<double>(episodes_writer.FileSize());
 		// Match LeRobotDatasetMetadata._save_episode_metadata: the latest
 		// episode index is used as the divisor for its next-row size estimate.
 		const auto latest_episode_index = current_episode > 0 ? static_cast<double>(current_episode - 1) : 0.0;
-		const auto average_size = latest_episode_index > 0 ? current_size / latest_episode_index : 0.0;
-		const auto projected_size = current_size + average_size * static_cast<double>(episode_length);
-		if (projected_size < bind.data_file_size_mb * 1024.0 * 1024.0) {
+		const auto projection_factor =
+		    latest_episode_index > 0 ? 1.0 + static_cast<double>(episode_length) / latest_episode_index : 1.0;
+		const auto size_limit = bind.data_file_size_mb * 1024.0 * 1024.0;
+		if (!episodes_writer.SizeAtLeast(size_limit / projection_factor)) {
 			return;
 		}
 		FlushMetadataBuffer();
@@ -1739,7 +1754,7 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 		for (idx_t column = 0; column < row.size(); column++) {
 			chunk.data[column].SetValue(0, row[column]);
 		}
-		chunk.SetChildCardinality(1);
+		chunk.SetCardinality(1);
 		metadata_buffer->Append(metadata_append_state, chunk);
 		metadata_buffer_rows++;
 		if (metadata_buffer_rows >= bind.metadata_buffer_size) {
@@ -1819,7 +1834,7 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 				chunk.data[0].SetValue(row, Value::BIGINT(NumericCast<int64_t>(offset + row)));
 				chunk.data[1].SetValue(row, Value(tasks[offset + row]));
 			}
-			chunk.SetChildCardinality(count);
+			chunk.SetCardinality(count);
 			collection->Append(append_state, chunk);
 			offset += count;
 		}
@@ -1935,7 +1950,7 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 		WriteTasks();
 		auto temporary_root = fs.JoinPath(stage_root, ".tmp");
 		if (fs.DirectoryExists(temporary_root)) {
-			fs.RemoveDirectoryExtended(temporary_root, {RemoveDirectoryMode::RECURSIVE});
+			fs.RemoveDirectory(temporary_root);
 		}
 		if (total_episodes > 0) {
 			WriteStringFile(fs, fs.JoinPath(stage_root, "meta/stats.json"), StatsJSON());

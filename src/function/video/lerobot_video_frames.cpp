@@ -16,34 +16,11 @@
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "duckdb/planner/expression_iterator.hpp"
-#include "duckdb/planner/filter/expression_filter.hpp"
-#if defined(__has_include) && __has_include("duckdb/planner/table_filter_set.hpp")
-#define LEROBOT_HAVE_MODERN_TABLE_FILTER_SET 1
-#include "duckdb/planner/table_filter_set.hpp"
-#else
-#define LEROBOT_HAVE_MODERN_TABLE_FILTER_SET 0
 #include "duckdb/planner/table_filter.hpp"
-#endif
 
 #include "function/lerobot_multi_file_reader.hpp"
 #include "function/lerobot_temporal.hpp"
 #include "storage/lerobot_metadata_cache.hpp"
-
-#if defined(__has_include)
-#if __has_include("duckdb/main/profiler/profiling_node.hpp")
-#define LEROBOT_HAVE_TABLE_FUNCTION_GET_METRICS 1
-#include "duckdb/main/profiler/profiling_node.hpp"
-#else
-#define LEROBOT_HAVE_TABLE_FUNCTION_GET_METRICS 0
-#endif
-#if __has_include("duckdb/common/vector/flat_vector.hpp")
-#include "duckdb/common/vector/flat_vector.hpp"
-#include "duckdb/common/vector/string_vector.hpp"
-#endif
-#else
-#define LEROBOT_HAVE_TABLE_FUNCTION_GET_METRICS 0
-#endif
 
 #include <algorithm>
 #include <atomic>
@@ -54,7 +31,6 @@
 #include <cstring>
 #include <exception>
 #include <limits>
-#include <type_traits>
 #include <utility>
 
 #ifdef LEROBOT_HAVE_FFMPEG
@@ -85,64 +61,23 @@ static const idx_t LEROBOT_MAX_WINDOW_TARGETS = 100000;
 static const idx_t LEROBOT_DECODE_FRAME_BUDGET = 20000;
 static const double LEROBOT_DEFAULT_CLUSTER_GAP_SECONDS = 10.0;
 
-template <typename CALLBACK>
-struct BindColumnNames;
-
-template <typename RESULT, typename CONTEXT, typename INPUT, typename RETURN_TYPES, typename COLUMN_NAMES>
-struct BindColumnNames<RESULT (*)(CONTEXT, INPUT, RETURN_TYPES, COLUMN_NAMES)> {
-	using type = typename std::remove_reference<COLUMN_NAMES>::type;
-};
-
-using LerobotColumnNames = typename BindColumnNames<table_function_bind_t>::type;
-
-template <typename FLAT_VECTOR, typename T>
-auto GetMutableFlatDataInternal(Vector &vector, int) -> decltype(FLAT_VECTOR::template GetDataMutable<T>(vector)) {
-	return FLAT_VECTOR::template GetDataMutable<T>(vector);
-}
-
-template <typename FLAT_VECTOR, typename T>
-auto GetMutableFlatDataInternal(Vector &vector, long) -> decltype(FLAT_VECTOR::template GetData<T>(vector)) {
-	return FLAT_VECTOR::template GetData<T>(vector);
-}
-
 template <typename T>
 T *GetMutableFlatData(Vector &vector) {
-	return GetMutableFlatDataInternal<FlatVector, T>(vector, 0);
-}
-
-template <typename VECTOR>
-auto PrepareUnifiedFormatInternal(VECTOR &vector, idx_t, UnifiedVectorFormat &format, int)
-    -> decltype(vector.ToUnifiedFormat(format), void()) {
-	vector.ToUnifiedFormat(format);
-}
-
-template <typename VECTOR>
-auto PrepareUnifiedFormatInternal(VECTOR &vector, idx_t count, UnifiedVectorFormat &format, long)
-    -> decltype(vector.ToUnifiedFormat(count, format), void()) {
-	vector.ToUnifiedFormat(count, format);
+	return FlatVector::GetData<T>(vector);
 }
 
 void PrepareUnifiedFormat(Vector &vector, idx_t count, UnifiedVectorFormat &format) {
-	PrepareUnifiedFormatInternal(vector, count, format, 0);
+	vector.ToUnifiedFormat(count, format);
 }
 
-template <typename CHUNK>
-auto SetOutputCardinality(CHUNK &output, idx_t count, int) -> decltype(output.SetCardinalityUnsafe(count), void()) {
-	output.SetCardinalityUnsafe(count);
-}
-
-template <typename CHUNK>
-void SetOutputCardinality(CHUNK &output, idx_t count, long) {
+void SetOutputCardinality(DataChunk &output, idx_t count) {
 	output.SetCardinality(count);
 }
 
-template <typename CONTEXT>
-auto CheckForInterrupt(CONTEXT &context, int) -> decltype(context.InterruptCheck(), void()) {
-	context.InterruptCheck();
-}
-
-template <typename CONTEXT>
-void CheckForInterrupt(CONTEXT &, long) {
+void CheckForInterrupt(ClientContext &context) {
+	if (context.IsInterrupted()) {
+		throw InterruptException();
+	}
 }
 
 bool GetRefreshParameter(TableFunctionBindInput &input, const char *function_name) {
@@ -557,7 +492,7 @@ void FinalizeDecodeBuffer(LerobotDecodeBuffer &buffer, double cluster_gap) {
 }
 
 unique_ptr<FunctionData> LerobotVideoFramesBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, LerobotColumnNames &names) {
+                                                vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("lerobot_video_frames root must not be NULL");
 	}
@@ -704,7 +639,7 @@ string BuildVideoWindowQuery(const vector<LerobotVideoWindowRequest> &requests,
 }
 
 unique_ptr<FunctionData> LerobotVideoWindowsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, LerobotColumnNames &names) {
+                                                 vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("lerobot_video_windows root must not be NULL");
 	}
@@ -818,7 +753,7 @@ idx_t FindTargetInputColumn(TableFunctionBindInput &input, const char *name) {
 }
 
 unique_ptr<FunctionData> LerobotVideoTargetsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, LerobotColumnNames &names) {
+                                                 vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs.empty() || input.inputs[0].IsNull()) {
 		throw BinderException("lerobot_video_targets root must not be NULL");
 	}
@@ -1046,7 +981,7 @@ public:
 				StartCluster();
 				continue;
 			}
-			CheckForInterrupt(context, 0);
+			CheckForInterrupt(context);
 			const auto target_index = cluster[target_position];
 			const auto target_timestamp = buffer->targets[target_index].video_timestamp;
 			if (have_current && target_timestamp <= current_timestamp) {
@@ -1213,7 +1148,7 @@ private:
 				decoded_frames_in_buffer++;
 				metrics.frames_decoded.fetch_add(1, std::memory_order_relaxed);
 				if ((decoded_frames_in_buffer & 255) == 0) {
-					CheckForInterrupt(context, 0);
+					CheckForInterrupt(context);
 				}
 				if (decoded_frames_in_buffer > LEROBOT_DECODE_FRAME_BUDGET) {
 					throw InvalidInputException("Exceeded the %d-frame decode budget while aligning LeRobot video '%s'",
@@ -2335,36 +2270,6 @@ unique_ptr<Expression> BuildVideoFilterExpression(const LerobotVideoFramesBindDa
 		return nullptr;
 	}
 	auto conjunction = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
-#if LEROBOT_HAVE_MODERN_TABLE_FILTER_SET
-	for (const auto &entry : *input.filters) {
-		const auto output_index = entry.GetIndex().GetIndex();
-		if (output_index >= input.column_ids.size()) {
-			throw InternalException("Invalid LeRobot pushed-down filter column");
-		}
-		const auto logical_column = static_cast<idx_t>(input.column_ids[output_index]);
-		BoundReferenceExpression column(GetVideoOutputType(bind_data.window_mode, logical_column), output_index);
-		conjunction->GetChildrenMutable().push_back(entry.Filter().ToExpression(column));
-	}
-	for (const auto &filter : input.filters->GetMultiColumnFilters()) {
-		const auto &expression_filter = ExpressionFilter::GetExpressionFilter(*filter, "LeRobot video filter");
-		auto expression = expression_filter.expr->Copy();
-		ExpressionIterator::VisitExpressionMutable<BoundReferenceExpression>(
-		    expression, [&](BoundReferenceExpression &reference, unique_ptr<Expression> &) {
-			    if (reference.Index() >= expression_filter.column_indexes.size()) {
-				    throw InternalException("Invalid LeRobot multi-column filter reference");
-			    }
-			    reference.IndexMutable() = expression_filter.column_indexes[reference.Index()].GetIndex();
-		    });
-		conjunction->GetChildrenMutable().push_back(std::move(expression));
-	}
-	if (conjunction->GetChildren().empty()) {
-		return nullptr;
-	}
-	if (conjunction->GetChildren().size() == 1) {
-		auto result = std::move(conjunction->GetChildrenMutable().front());
-		return result;
-	}
-#else
 	for (const auto &entry : input.filters->filters) {
 		const auto output_index = entry.first;
 		if (output_index >= input.column_ids.size()) {
@@ -2381,7 +2286,6 @@ unique_ptr<Expression> BuildVideoFilterExpression(const LerobotVideoFramesBindDa
 		auto result = std::move(conjunction->children.front());
 		return result;
 	}
-#endif
 	return std::move(conjunction);
 }
 
@@ -2765,7 +2669,7 @@ bool ProduceLerobotVideoFrames(ClientContext &context, TableFunctionInput &input
 #endif
 	}
 	local_state.rows_scanned += count;
-	SetOutputCardinality(output, count, 0);
+	SetOutputCardinality(output, count);
 	return count == 0;
 }
 
@@ -2873,7 +2777,7 @@ OperatorResultType LerobotVideoTargetsFunction(ExecutionContext &context, TableF
 		count++;
 #endif
 	}
-	SetOutputCardinality(output, count, 0);
+	SetOutputCardinality(output, count);
 	if (local_state.InputFinished(target_input)) {
 		local_state.FinishInput();
 		return OperatorResultType::NEED_MORE_INPUT;
@@ -2881,32 +2785,10 @@ OperatorResultType LerobotVideoTargetsFunction(ExecutionContext &context, TableF
 	return OperatorResultType::HAVE_MORE_OUTPUT;
 }
 
-#if LEROBOT_HAVE_TABLE_FUNCTION_GET_METRICS
-void LerobotVideoFramesGetMetrics(TableFunctionGetMetricsInput &input) {
-	if (!input.global_state) {
-		return;
-	}
-	auto &metrics = input.global_state->Cast<LerobotVideoFramesGlobalState>().GetMetrics();
-	// DuckDB gathers source metrics once per local worker. Publish the shared
-	// snapshot from every worker so a later profiler flush cannot replace the
-	// only enriched extra-info map with the table scan's base parameters.
-	if (input.local_state) {
-		input.operator_metrics.rows_scanned = input.local_state->Cast<LerobotVideoFramesLocalState>().rows_scanned;
-	}
-	input.operator_metrics.AddExtraInfo("LeRobot Targets", std::to_string(metrics.targets.load()));
-	input.operator_metrics.AddExtraInfo("LeRobot Decoder Acquires", std::to_string(metrics.decoder_acquires.load()));
-	input.operator_metrics.AddExtraInfo("LeRobot Decoder Cache Hits",
-	                                    std::to_string(metrics.decoder_cache_hits.load()));
-	input.operator_metrics.AddExtraInfo("LeRobot Decoder Opens", std::to_string(metrics.decoder_opens.load()));
-	input.operator_metrics.AddExtraInfo("LeRobot Decoder Evictions", std::to_string(metrics.decoder_evictions.load()));
-	input.operator_metrics.AddExtraInfo("LeRobot Decoder Seeks", std::to_string(metrics.decoder_seeks.load()));
-	input.operator_metrics.AddExtraInfo("LeRobot AVIO Seeks", std::to_string(metrics.avio_seeks.load()));
-	input.operator_metrics.AddExtraInfo("LeRobot Video Bytes Read", std::to_string(metrics.video_bytes_read.load()));
-	input.operator_metrics.AddExtraInfo("LeRobot Frames Decoded", std::to_string(metrics.frames_decoded.load()));
-	input.operator_metrics.AddExtraInfo("LeRobot RGB Conversions", std::to_string(metrics.rgb_conversions.load()));
-	input.operator_metrics.AddExtraInfo("LeRobot RGB Fan-out Hits", std::to_string(metrics.rgb_fanout_hits.load()));
+idx_t LerobotVideoFramesRowsScanned(GlobalTableFunctionState &, LocalTableFunctionState &local_state) {
+	return local_state.Cast<LerobotVideoFramesLocalState>().rows_scanned;
 }
-#else
+
 void AddLerobotVideoMetrics(InsertionOrderPreservingMap<string> &result, const LerobotVideoDecodeMetrics &metrics) {
 	result["LeRobot Targets"] = std::to_string(metrics.targets.load());
 	result["LeRobot Decoder Acquires"] = std::to_string(metrics.decoder_acquires.load());
@@ -2938,7 +2820,6 @@ InsertionOrderPreservingMap<string> LerobotVideoTargetsDynamicToString(TableFunc
 	}
 	return result;
 }
-#endif
 
 void AddVideoDecodeNamedParameters(TableFunction &function, bool include_video_keys = true,
                                    bool source_function = true) {
@@ -2963,11 +2844,8 @@ void AddVideoDecodeNamedParameters(TableFunction &function, bool include_video_k
 	function.projection_pushdown = true;
 	if (source_function) {
 		function.filter_pushdown = true;
-#if LEROBOT_HAVE_TABLE_FUNCTION_GET_METRICS
-		function.get_metrics = LerobotVideoFramesGetMetrics;
-#else
+		function.rows_scanned = LerobotVideoFramesRowsScanned;
 		function.dynamic_to_string = LerobotVideoFramesDynamicToString;
-#endif
 	}
 }
 
@@ -3000,9 +2878,7 @@ TableFunctionSet LerobotFunctions::GetVideoTargetsFunction() {
 	function.in_out_function = LerobotVideoTargetsFunction;
 	function.named_parameters["delta_timestamps"] = LogicalType::LIST(LogicalType::DOUBLE);
 	AddVideoDecodeNamedParameters(function, false, false);
-#if !LEROBOT_HAVE_TABLE_FUNCTION_GET_METRICS
 	function.dynamic_to_string = LerobotVideoTargetsDynamicToString;
-#endif
 	return TableFunctionSet(std::move(function));
 }
 

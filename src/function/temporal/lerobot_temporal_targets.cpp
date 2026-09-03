@@ -10,14 +10,9 @@
 #include "function/lerobot_temporal.hpp"
 #include "storage/lerobot_metadata_cache.hpp"
 
-#if defined(__has_include) && __has_include("duckdb/common/vector/flat_vector.hpp")
-#include "duckdb/common/vector/flat_vector.hpp"
-#endif
-
 #include <atomic>
 #include <cmath>
 #include <limits>
-#include <type_traits>
 #include <utility>
 
 namespace duckdb {
@@ -67,54 +62,16 @@ vector<LerobotTemporalDelta> GetLerobotTemporalDeltas(TableFunctionBindInput &in
 
 namespace {
 
-template <typename CALLBACK>
-struct BindColumnNames;
-
-template <typename RESULT, typename CONTEXT, typename INPUT, typename RETURN_TYPES, typename COLUMN_NAMES>
-struct BindColumnNames<RESULT (*)(CONTEXT, INPUT, RETURN_TYPES, COLUMN_NAMES)> {
-	using type = typename std::remove_reference<COLUMN_NAMES>::type;
-};
-
-using LerobotColumnNames = typename BindColumnNames<table_function_bind_t>::type;
-
-template <typename FLAT_VECTOR, typename T>
-auto GetMutableFlatDataInternal(Vector &vector, int) -> decltype(FLAT_VECTOR::template GetDataMutable<T>(vector)) {
-	return FLAT_VECTOR::template GetDataMutable<T>(vector);
-}
-
-template <typename FLAT_VECTOR, typename T>
-auto GetMutableFlatDataInternal(Vector &vector, long) -> decltype(FLAT_VECTOR::template GetData<T>(vector)) {
-	return FLAT_VECTOR::template GetData<T>(vector);
-}
-
 template <typename T>
 T *GetMutableFlatData(Vector &vector) {
-	return GetMutableFlatDataInternal<FlatVector, T>(vector, 0);
-}
-
-template <typename VECTOR>
-auto PrepareUnifiedFormatInternal(VECTOR &vector, idx_t, UnifiedVectorFormat &format, int)
-    -> decltype(vector.ToUnifiedFormat(format), void()) {
-	vector.ToUnifiedFormat(format);
-}
-
-template <typename VECTOR>
-auto PrepareUnifiedFormatInternal(VECTOR &vector, idx_t count, UnifiedVectorFormat &format, long)
-    -> decltype(vector.ToUnifiedFormat(count, format), void()) {
-	vector.ToUnifiedFormat(count, format);
+	return FlatVector::GetData<T>(vector);
 }
 
 void PrepareUnifiedFormat(Vector &vector, idx_t count, UnifiedVectorFormat &format) {
-	PrepareUnifiedFormatInternal(vector, count, format, 0);
+	vector.ToUnifiedFormat(count, format);
 }
 
-template <typename CHUNK>
-auto SetOutputCardinality(CHUNK &output, idx_t count, int) -> decltype(output.SetCardinalityUnsafe(count), void()) {
-	output.SetCardinalityUnsafe(count);
-}
-
-template <typename CHUNK>
-void SetOutputCardinality(CHUNK &output, idx_t count, long) {
+void SetOutputCardinality(DataChunk &output, idx_t count) {
 	output.SetCardinality(count);
 }
 
@@ -179,7 +136,7 @@ idx_t FindInputColumn(TableFunctionBindInput &input, const char *name) {
 }
 
 unique_ptr<FunctionData> LerobotTemporalTargetsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, LerobotColumnNames &names) {
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs.empty() || input.inputs[0].IsNull()) {
 		throw BinderException("lerobot_temporal_targets root must not be NULL");
 	}
@@ -369,7 +326,7 @@ OperatorResultType LerobotTemporalTargetsFunction(ExecutionContext &, TableFunct
 			WriteTargetColumn(target, global_state.projected_columns[output_column], row, output.data[output_column]);
 		}
 	}
-	SetOutputCardinality(output, target_input.size(), 0);
+	SetOutputCardinality(output, target_input.size());
 	return OperatorResultType::NEED_MORE_INPUT;
 }
 
