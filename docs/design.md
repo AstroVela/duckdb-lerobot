@@ -283,6 +283,20 @@ the staging tree, then a single directory rename publishes the destination.
 Any bind, encode, Parquet, or metadata error recursively removes the staging
 tree and leaves no readable partial dataset.
 
+Raw image and video frames are spooled per feature under that staging tree
+instead of being retained in an episode-sized vector. At an episode boundary,
+the writer closes the spools, computes visual statistics by positional reads of
+only the rounded-linspace sample, and encodes each camera sequentially with one
+raw frame buffer. Numeric statistics scan the episode's buffer-managed column
+collection twice per dimension batch: once for the exact NumPy reduction tree
+and extrema, and once for the 5000-bin histograms. Features wider than 64
+dimensions are processed in fixed batches, preserving the same value order and
+exact results while capping histogram and reduction scratch space.
+`MAX_VISUAL_FRAME_BYTES` (64 MiB by default) bounds each extension-owned raw
+frame allocation; raw-frame scratch memory is therefore independent of episode
+length and camera count, apart from DuckDB's input/output chunks and
+buffer-managed pages.
+
 LeRobot's control-plane rules remain extension-owned: canonical path
 templates, task indexing, episode routes, metadata chunk/file indices, and
 per-episode plus aggregate statistics. The 5000-bin quantile estimator follows

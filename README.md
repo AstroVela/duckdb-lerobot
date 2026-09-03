@@ -263,6 +263,7 @@ COPY (
   DATA_FILES_SIZE_IN_MB 100,
   VIDEO_FILES_SIZE_IN_MB 200,
   METADATA_BUFFER_SIZE 10,
+  MAX_VISUAL_FRAME_BYTES 67108864,
   ENCODER_THREADS 4
 );
 ```
@@ -275,6 +276,16 @@ Video features use LeRobot's current defaults: AV1/yuv420p for RGB and
 lossless HEVC/gray12le after 12-bit logarithmic quantization for depth.
 Multiple episodes are stream-copy concatenated into a shard, and the episode
 metadata records the resulting `[from_timestamp, to_timestamp)` routes.
+
+COPY uses bounded episode memory. Numeric rows live in DuckDB's buffer-managed
+collection and statistics are computed in bounded streaming passes. Raw visual
+frames are appended to per-feature staging files; visual sampling and video
+encoding read one frame at a time, and cameras are processed sequentially.
+`MAX_VISUAL_FRAME_BYTES` is the strict per-frame scratch-memory contract and
+defaults to 64 MiB. It is not a total dataset or episode byte limit. Statistics
+retain only their final output and one flattened row proportional to the
+declared feature width; reductions and 5000-bin histograms process at most 64
+dimensions at a time, never an episode-sized value array.
 
 On read, depth video codes are dequantized from the canonical
 `video.depth_min`, `video.depth_max`, `video.shift`, and `video.use_log`
