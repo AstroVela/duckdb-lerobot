@@ -51,8 +51,6 @@ string ScanSuffix(LerobotScanKind kind) {
 		return "/meta/episodes/**/*.parquet";
 	case LerobotScanKind::TASKS:
 		return "/meta/tasks.parquet";
-	case LerobotScanKind::FRAMES:
-		return "/data/**/*.parquet";
 	default:
 		throw InternalException("Unknown LeRobot scan kind");
 	}
@@ -466,6 +464,17 @@ unique_ptr<TableRef> LerobotEpisodeFramesBindReplace(ClientContext &context, Tab
 	return make_uniq<SubqueryRef>(std::move(statement));
 }
 
+unique_ptr<TableRef> LerobotFramesBindReplace(ClientContext &context, TableFunctionBindInput &input) {
+	if (input.inputs[0].IsNull()) {
+		throw BinderException("lerobot_frames root must not be NULL");
+	}
+
+	auto root = NormalizeLerobotRoot(StringValue::Get(input.inputs[0]));
+	bool cache_hit;
+	auto metadata = LerobotDatasetMetadata::Get(context, root, GetRefreshParameter(input), cache_hit);
+	return CreateTableFunctionRef("parquet_scan", CreatePathList(metadata->GetDataFiles()));
+}
+
 } // namespace
 
 string NormalizeLerobotRoot(string root) {
@@ -495,10 +504,6 @@ unique_ptr<MultiFileReader> LerobotMultiFileReader::CreateEpisodes(const TableFu
 
 unique_ptr<MultiFileReader> LerobotMultiFileReader::CreateTasks(const TableFunction &function) {
 	return CreateLerobotReader(LerobotScanKind::TASKS, function);
-}
-
-unique_ptr<MultiFileReader> LerobotMultiFileReader::CreateFrames(const TableFunction &function) {
-	return CreateLerobotReader(LerobotScanKind::FRAMES, function);
 }
 
 vector<string> LerobotMultiFileReader::ParsePaths(const Value &input) {
@@ -538,8 +543,11 @@ TableFunctionSet LerobotFunctions::GetTasksFunction(ExtensionLoader &loader) {
 	return CreateNativeScan(loader, "parquet_scan", "lerobot_tasks", LerobotMultiFileReader::CreateTasks);
 }
 
-TableFunctionSet LerobotFunctions::GetFramesFunction(ExtensionLoader &loader) {
-	return CreateNativeScan(loader, "parquet_scan", "lerobot_frames", LerobotMultiFileReader::CreateFrames);
+TableFunctionSet LerobotFunctions::GetFramesFunction() {
+	TableFunction function("lerobot_frames", {LogicalType::VARCHAR}, nullptr, nullptr);
+	function.bind_replace = LerobotFramesBindReplace;
+	function.named_parameters["refresh"] = LogicalType::BOOLEAN;
+	return TableFunctionSet(std::move(function));
 }
 
 TableFunctionSet LerobotFunctions::GetMetadataCacheFunction() {

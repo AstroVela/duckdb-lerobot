@@ -69,7 +69,8 @@ COPY (
 ) TO '{TEST_DIR}/lerobot_scan/meta/tasks.parquet' (FORMAT PARQUET);
 
 # Besides creating frames/chunk-00, this leaves an incompatible, unreferenced
-# Parquet file beneath the same tree. An episode-scoped scan must ignore it.
+# Parquet file beneath the same tree. Both metadata-resolved frame scans must
+# ignore it.
 statement ok
 COPY (
     SELECT 0 AS bootstrap, 'not a frame shard' AS poison
@@ -97,6 +98,20 @@ COPY (
         (2::BIGINT, 5::BIGINT, 0.033333::DOUBLE)
     ) AS frames(episode_index, frame_index, timestamp)
 ) TO '{TEST_DIR}/lerobot_scan/frames/chunk-00/part-0001.parquet' (FORMAT PARQUET);
+
+# The base scan resolves the complete authoritative file list through
+# info.json.data_path and the episode routes. The projected/filter query must
+# therefore read the custom frames/ layout while ignoring both poison files.
+query II
+SELECT episode_index, frame_index
+FROM lerobot_frames('{TEST_DIR}/lerobot_scan')
+WHERE episode_index >= 1
+ORDER BY frame_index;
+----
+1	2
+1	3
+2	4
+2	5
 
 query TTI
 SELECT codebase_version, data_path, fps

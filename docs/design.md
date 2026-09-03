@@ -119,13 +119,19 @@ MP4 path, chunk/file indices, episode-local `from_timestamp` and
 episode is skipped; a partially NULL route is rejected as corrupt metadata.
 The function does not open the MP4.
 
-`lerobot_info`, `lerobot_episodes`, `lerobot_tasks`, and `lerobot_frames` are
-native C++ table functions. Following DuckDB Iceberg's implementation pattern,
-each clones a
+`lerobot_info`, `lerobot_episodes`, and `lerobot_tasks` are native C++ table
+functions. Following DuckDB Iceberg's implementation pattern, each clones a
 registered DuckDB scan function set and replaces only its `MultiFileReader`.
-The LeRobot reader normalizes the dataset root and expands it to the v3 JSON or
-Parquet glob, leaving schema inference, parallel reads, projection pushdown,
-filter pushdown, and row-group pruning to DuckDB.
+The LeRobot reader normalizes the dataset root and expands it to the fixed v3
+metadata path.
+
+`lerobot_frames` is a bind-replacement table function. It loads the immutable
+base route cache, takes its deduplicated file list resolved from the
+authoritative `info.json.data_path` template and episode chunk/file indices,
+and binds that list directly as a native `parquet_scan`. No `data/` glob or
+alternate-layout fallback exists. The resulting scan remains DuckDB's own
+logical get, preserving schema inference, parallel reads, projection and filter
+pushdown, join dynamic filters, footer caching, and row-group pruning.
 
 `lerobot_episode_frames` is a bind-replacement table function. It constructs a
 relational `episode_index IN (...)` predicate over a native `parquet_scan`.
