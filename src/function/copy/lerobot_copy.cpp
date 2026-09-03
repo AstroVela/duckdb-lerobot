@@ -62,6 +62,8 @@ struct LerobotFeature {
 struct LerobotFeatureStats {
 	vector<double> min;
 	vector<double> max;
+	vector<Value> integer_min;
+	vector<Value> integer_max;
 	vector<double> mean;
 	vector<double> stddev;
 	vector<double> q01;
@@ -229,6 +231,21 @@ LogicalType FeatureOutputType(const string &dtype, const vector<idx_t> &shape) {
 		return LogicalType::STRUCT({{"bytes", LogicalType::BLOB}, {"path", LogicalType::VARCHAR}});
 	}
 	return FeatureStorageType(dtype, shape);
+}
+
+bool HasIntegerExtrema(const LerobotFeature &feature) {
+	return !feature.is_image && !feature.is_video && !feature.is_string &&
+	       DtypeToLogicalType(feature.dtype).IsIntegral();
+}
+
+LogicalType StatExtremaLeafType(const LerobotFeature &feature) {
+	if (!HasIntegerExtrema(feature)) {
+		return LogicalType::DOUBLE;
+	}
+	// Native episode metadata converts NumPy arrays to Python lists before
+	// PyArrow inference, which canonicalizes the supported integer values to
+	// int64. uint64 needs its unsigned leaf to cover the complete input domain.
+	return feature.dtype == "uint64" ? LogicalType::UBIGINT : LogicalType::BIGINT;
 }
 
 LogicalType NestedListType(const LogicalType &leaf, idx_t dimensions) {
@@ -536,12 +553,15 @@ void AppendStatColumns(LerobotCopyBindData &bind, const LerobotFeature &feature)
 	if (feature.is_image || feature.is_video) {
 		stat_shape = {feature.shape[2], 1, 1};
 	}
+	auto extrema_type = NestedListType(StatExtremaLeafType(feature), stat_shape.size());
 	auto value_type = NestedListType(LogicalType::DOUBLE, stat_shape.size());
 	auto count_type = LogicalType::LIST(LogicalType::BIGINT);
 	static const char *names[] = {"min", "max", "mean", "std", "count", "q01", "q10", "q50", "q90", "q99"};
 	for (const auto stat_name : names) {
 		bind.episode_names.push_back("stats/" + feature.name + "/" + stat_name);
-		bind.episode_types.push_back(string(stat_name) == "count" ? count_type : value_type);
+		const auto name = string(stat_name);
+		bind.episode_types.push_back(name == "count" ? count_type
+		                                             : (name == "min" || name == "max" ? extrema_type : value_type));
 	}
 }
 
@@ -782,7 +802,7 @@ struct LerobotStatsRowReader {
 	}
 
 	virtual idx_t Count() const = 0;
-	virtual void Next(vector<double> &row) = 0;
+	virtual void Next(vector<double> &row, vector<Value> *exact_row) = 0;
 };
 
 using LerobotStatsReaderFactory = std::function<unique_ptr<LerobotStatsRowReader>()>;
@@ -796,11 +816,44 @@ struct LerobotReductionTotals {
 	vector<T> square_sum;
 };
 
-void ReadStatsRow(LerobotStatsRowReader &reader, idx_t width, vector<double> &row) {
+struct LerobotExactExtrema {
+	vector<Value> row;
+	vector<Value> minimum;
+	vector<Value> maximum;
+};
+
+void ReadStatsRow(LerobotStatsRowReader &reader, idx_t width, vector<double> &row,
+                  LerobotExactExtrema *exact_extrema = nullptr) {
 	row.clear();
-	reader.Next(row);
+	if (exact_extrema) {
+		exact_extrema->row.clear();
+	}
+	reader.Next(row, exact_extrema ? &exact_extrema->row : nullptr);
 	if (row.size() != width) {
 		throw InternalException("LeRobot statistics width changed from %llu to %llu", width, row.size());
+	}
+	if (!exact_extrema) {
+		return;
+	}
+	if (exact_extrema->row.size() != width) {
+		throw InternalException("LeRobot exact statistics width changed from %llu to %llu", width,
+		                        exact_extrema->row.size());
+	}
+	if (exact_extrema->minimum.empty()) {
+		exact_extrema->minimum = exact_extrema->row;
+		exact_extrema->maximum = exact_extrema->row;
+		return;
+	}
+	if (exact_extrema->minimum.size() != width || exact_extrema->maximum.size() != width) {
+		throw InternalException("LeRobot exact extrema width changed");
+	}
+	for (idx_t dimension = 0; dimension < width; dimension++) {
+		if (exact_extrema->row[dimension] < exact_extrema->minimum[dimension]) {
+			exact_extrema->minimum[dimension] = exact_extrema->row[dimension];
+		}
+		if (exact_extrema->row[dimension] > exact_extrema->maximum[dimension]) {
+			exact_extrema->maximum[dimension] = exact_extrema->row[dimension];
+		}
 	}
 }
 
@@ -818,12 +871,12 @@ T PrepareReductionValue(double raw_value, idx_t dimension, vector<double> &minim
 template <class T>
 LerobotReductionTotals<T> NumpyPairwiseStats(LerobotStatsRowReader &reader, idx_t row_width, idx_t dimension_offset,
                                              idx_t width, idx_t count, vector<double> &minimum, vector<double> &maximum,
-                                             vector<double> &row) {
+                                             vector<double> &row, LerobotExactExtrema *exact_extrema = nullptr) {
 	static const idx_t NUMPY_PAIRWISE_BLOCK_SIZE = 128;
 	LerobotReductionTotals<T> result(width);
 	if (count < 8) {
 		for (idx_t index = 0; index < count; index++) {
-			ReadStatsRow(reader, row_width, row);
+			ReadStatsRow(reader, row_width, row, exact_extrema);
 			for (idx_t dimension = 0; dimension < width; dimension++) {
 				const auto value =
 				    PrepareReductionValue<T>(row[dimension_offset + dimension], dimension, minimum, maximum);
@@ -840,7 +893,7 @@ LerobotReductionTotals<T> NumpyPairwiseStats(LerobotStatsRowReader &reader, idx_
 		vector<vector<T>> accumulators(8, vector<T>(width));
 		vector<vector<T>> square_accumulators(8, vector<T>(width));
 		for (idx_t accumulator = 0; accumulator < 8; accumulator++) {
-			ReadStatsRow(reader, row_width, row);
+			ReadStatsRow(reader, row_width, row, exact_extrema);
 			for (idx_t dimension = 0; dimension < width; dimension++) {
 				const auto value =
 				    PrepareReductionValue<T>(row[dimension_offset + dimension], dimension, minimum, maximum);
@@ -852,7 +905,7 @@ LerobotReductionTotals<T> NumpyPairwiseStats(LerobotStatsRowReader &reader, idx_
 		idx_t index;
 		for (index = 8; index < count - (count % 8); index += 8) {
 			for (idx_t accumulator = 0; accumulator < 8; accumulator++) {
-				ReadStatsRow(reader, row_width, row);
+				ReadStatsRow(reader, row_width, row, exact_extrema);
 				for (idx_t dimension = 0; dimension < width; dimension++) {
 					const auto value =
 					    PrepareReductionValue<T>(row[dimension_offset + dimension], dimension, minimum, maximum);
@@ -885,7 +938,7 @@ LerobotReductionTotals<T> NumpyPairwiseStats(LerobotStatsRowReader &reader, idx_
 			result.square_sum[dimension] = square_sum;
 		}
 		for (; index < count; index++) {
-			ReadStatsRow(reader, row_width, row);
+			ReadStatsRow(reader, row_width, row, exact_extrema);
 			for (idx_t dimension = 0; dimension < width; dimension++) {
 				const auto value =
 				    PrepareReductionValue<T>(row[dimension_offset + dimension], dimension, minimum, maximum);
@@ -901,9 +954,10 @@ LerobotReductionTotals<T> NumpyPairwiseStats(LerobotStatsRowReader &reader, idx_
 
 	auto left_count = count / 2;
 	left_count -= left_count % 8;
-	auto left = NumpyPairwiseStats<T>(reader, row_width, dimension_offset, width, left_count, minimum, maximum, row);
-	auto right =
-	    NumpyPairwiseStats<T>(reader, row_width, dimension_offset, width, count - left_count, minimum, maximum, row);
+	auto left = NumpyPairwiseStats<T>(reader, row_width, dimension_offset, width, left_count, minimum, maximum, row,
+	                                  exact_extrema);
+	auto right = NumpyPairwiseStats<T>(reader, row_width, dimension_offset, width, count - left_count, minimum, maximum,
+	                                   row, exact_extrema);
 	for (idx_t dimension = 0; dimension < width; dimension++) {
 		volatile T sum = left.sum[dimension] + right.sum[dimension];
 		volatile T square_sum = left.square_sum[dimension] + right.square_sum[dimension];
@@ -1005,7 +1059,7 @@ double HistogramQuantile(const vector<int64_t> &histogram, const vector<T> &edge
 
 template <class T>
 LerobotFeatureStats ComputeStatsTyped(const LerobotStatsReaderFactory &reader_factory, idx_t width, idx_t output_count,
-                                      bool use_float32) {
+                                      bool use_float32, bool preserve_integer_extrema) {
 	if (width == 0 || output_count == 0) {
 		throw InternalException("Cannot compute empty LeRobot feature statistics");
 	}
@@ -1023,8 +1077,10 @@ LerobotFeatureStats ComputeStatsTyped(const LerobotStatsReaderFactory &reader_fa
 	result.q90_is_float32 = use_float32;
 	result.q99_is_float32 = use_float32;
 	result.stddev_is_float32 = use_float32;
-	result.min.reserve(width);
-	result.max.reserve(width);
+	if (!preserve_integer_extrema) {
+		result.min.reserve(width);
+		result.max.reserve(width);
+	}
 	result.mean.reserve(width);
 	result.stddev.reserve(width);
 	result.q01.reserve(width);
@@ -1032,6 +1088,10 @@ LerobotFeatureStats ComputeStatsTyped(const LerobotStatsReaderFactory &reader_fa
 	result.q50.reserve(width);
 	result.q90.reserve(width);
 	result.q99.reserve(width);
+	LerobotExactExtrema exact_extrema;
+	if (preserve_integer_extrema) {
+		exact_extrema.row.reserve(width);
+	}
 
 	for (idx_t dimension_offset = 0; dimension_offset < width;) {
 		const auto batch_width = MinValue(LEROBOT_STATS_DIMENSION_BATCH_SIZE, width - dimension_offset);
@@ -1044,14 +1104,18 @@ LerobotFeatureStats ComputeStatsTyped(const LerobotStatsReaderFactory &reader_fa
 		vector<double> maximum(batch_width, -std::numeric_limits<double>::infinity());
 		vector<double> row;
 		row.reserve(width);
+		const auto collect_integer_extrema = preserve_integer_extrema && dimension_offset == 0;
+		auto exact_extrema_ptr = collect_integer_extrema ? &exact_extrema : nullptr;
 		if (count == 1) {
-			ReadStatsRow(*reader, width, row);
+			ReadStatsRow(*reader, width, row, exact_extrema_ptr);
 			for (idx_t dimension = 0; dimension < batch_width; dimension++) {
 				const auto value =
 				    PrepareReductionValue<T>(row[dimension_offset + dimension], dimension, minimum, maximum);
 				const auto output = static_cast<double>(value);
-				result.min.push_back(output);
-				result.max.push_back(output);
+				if (!preserve_integer_extrema) {
+					result.min.push_back(output);
+					result.max.push_back(output);
+				}
 				result.mean.push_back(output);
 				result.stddev.push_back(0);
 				result.q01.push_back(output);
@@ -1064,8 +1128,8 @@ LerobotFeatureStats ComputeStatsTyped(const LerobotStatsReaderFactory &reader_fa
 			continue;
 		}
 
-		auto totals =
-		    NumpyPairwiseStats<T>(*reader, width, dimension_offset, batch_width, count, minimum, maximum, row);
+		auto totals = NumpyPairwiseStats<T>(*reader, width, dimension_offset, batch_width, count, minimum, maximum, row,
+		                                    exact_extrema_ptr);
 		for (idx_t dimension = 0; dimension < batch_width; dimension++) {
 			const auto mean = totals.sum[dimension] / static_cast<T>(count);
 			// RunningQuantileStats evaluates these expressions separately in the
@@ -1073,8 +1137,10 @@ LerobotFeatureStats ComputeStatsTyped(const LerobotStatsReaderFactory &reader_fa
 			volatile T average_square = totals.square_sum[dimension] / static_cast<T>(count);
 			volatile T squared_mean = mean * mean;
 			const auto variance = MaxValue(static_cast<T>(0), static_cast<T>(average_square - squared_mean));
-			result.min.push_back(minimum[dimension]);
-			result.max.push_back(maximum[dimension]);
+			if (!preserve_integer_extrema) {
+				result.min.push_back(minimum[dimension]);
+				result.max.push_back(maximum[dimension]);
+			}
 			result.mean.push_back(static_cast<double>(mean));
 			result.stddev.push_back(static_cast<double>(std::sqrt(variance)));
 		}
@@ -1102,24 +1168,51 @@ LerobotFeatureStats ComputeStatsTyped(const LerobotStatsReaderFactory &reader_fa
 		}
 		dimension_offset += batch_width;
 	}
+	if (preserve_integer_extrema) {
+		if (exact_extrema.minimum.size() != width || exact_extrema.maximum.size() != width) {
+			throw InternalException("LeRobot integer extrema did not cover the feature width");
+		}
+		result.integer_min = std::move(exact_extrema.minimum);
+		result.integer_max = std::move(exact_extrema.maximum);
+	}
 	return result;
 }
 
 LerobotFeatureStats ComputeStats(const LerobotStatsReaderFactory &reader_factory, idx_t width, idx_t output_count,
                                  const LerobotFeature &feature) {
 	if (UsesFloat32Statistics(feature)) {
-		return ComputeStatsTyped<float>(reader_factory, width, output_count, true);
+		return ComputeStatsTyped<float>(reader_factory, width, output_count, true, HasIntegerExtrema(feature));
 	}
-	return ComputeStatsTyped<double>(reader_factory, width, output_count, false);
+	return ComputeStatsTyped<double>(reader_factory, width, output_count, false, HasIntegerExtrema(feature));
 }
 
-void MergeStats(LerobotFeatureStats &target, const LerobotFeatureStats &source) {
+void MergeStats(LerobotFeatureStats &target, const LerobotFeatureStats &source, bool has_integer_extrema) {
 	if (target.count == 0) {
 		target = source;
 		return;
 	}
 	if (target.mean.size() != source.mean.size()) {
 		throw InternalException("LeRobot dataset statistics width changed");
+	}
+	if (has_integer_extrema) {
+		if (!target.min.empty() || !target.max.empty() || !source.min.empty() || !source.max.empty() ||
+		    target.integer_min.size() != target.mean.size() || target.integer_max.size() != target.mean.size() ||
+		    source.integer_min.size() != source.mean.size() || source.integer_max.size() != source.mean.size()) {
+			throw InternalException("LeRobot dataset integer extrema width changed");
+		}
+		for (idx_t index = 0; index < target.integer_min.size(); index++) {
+			if (source.integer_min[index] < target.integer_min[index]) {
+				target.integer_min[index] = source.integer_min[index];
+			}
+			if (source.integer_max[index] > target.integer_max[index]) {
+				target.integer_max[index] = source.integer_max[index];
+			}
+		}
+	} else if (!target.integer_min.empty() || !target.integer_max.empty() || !source.integer_min.empty() ||
+	           !source.integer_max.empty() || target.min.size() != target.mean.size() ||
+	           target.max.size() != target.mean.size() || source.min.size() != source.mean.size() ||
+	           source.max.size() != source.mean.size()) {
+		throw InternalException("LeRobot dataset floating extrema width changed");
 	}
 	const auto target_count = static_cast<double>(target.count);
 	const auto source_count = static_cast<double>(source.count);
@@ -1160,8 +1253,10 @@ void MergeStats(LerobotFeatureStats &target, const LerobotFeatureStats &source) 
 		volatile double source_weighted = source_component * source_count;
 		volatile double weighted_variance_sum = target_weighted + source_weighted;
 		const auto total_variance = static_cast<double>(weighted_variance_sum / total_count);
-		target.min[index] = MinValue(target.min[index], source.min[index]);
-		target.max[index] = MaxValue(target.max[index], source.max[index]);
+		if (!has_integer_extrema) {
+			target.min[index] = MinValue(target.min[index], source.min[index]);
+			target.max[index] = MaxValue(target.max[index], source.max[index]);
+		}
 		target.mean[index] = total_mean;
 		target.stddev[index] = std::sqrt(MaxValue(0.0, total_variance));
 		target.q01[index] = MinValue(target.q01[index], source.q01[index]);
@@ -1176,23 +1271,26 @@ void MergeStats(LerobotFeatureStats &target, const LerobotFeatureStats &source) 
 	target.stddev_is_float32 = false;
 }
 
-void FlattenNumericValue(const Value &value, vector<double> &result) {
+void FlattenNumericValue(const Value &value, vector<double> &result, vector<Value> *exact_result) {
 	if (value.IsNull()) {
 		throw InvalidInputException("LeRobot feature values must not be NULL");
 	}
 	if (value.type().id() == LogicalTypeId::ARRAY) {
 		for (const auto &child : ArrayValue::GetChildren(value)) {
-			FlattenNumericValue(child, result);
+			FlattenNumericValue(child, result, exact_result);
 		}
 		return;
 	}
 	if (value.type().id() == LogicalTypeId::LIST) {
 		for (const auto &child : ListValue::GetChildren(value)) {
-			FlattenNumericValue(child, result);
+			FlattenNumericValue(child, result, exact_result);
 		}
 		return;
 	}
 	result.push_back(value.DefaultCastAs(LogicalType::DOUBLE).GetValue<double>());
+	if (exact_result) {
+		exact_result->push_back(value);
+	}
 }
 
 vector<idx_t> SampleVisualFrameIndices(idx_t frame_count) {
@@ -1327,12 +1425,16 @@ struct LerobotCollectionStatsReader : public LerobotStatsRowReader {
 		return collection.Count();
 	}
 
-	void Next(vector<double> &row) override {
+	void Next(vector<double> &row, vector<Value> *exact_row) override {
 		if (position >= Count()) {
 			throw InternalException("LeRobot statistics reader advanced past the collection");
 		}
 		if (generated_timestamp) {
-			row.push_back(static_cast<double>(position) / static_cast<double>(fps));
+			const auto value = static_cast<double>(position) / static_cast<double>(fps);
+			row.push_back(value);
+			if (exact_row) {
+				exact_row->push_back(Value::DOUBLE(value));
+			}
 			position++;
 			return;
 		}
@@ -1342,7 +1444,7 @@ struct LerobotCollectionStatsReader : public LerobotStatsRowReader {
 			}
 			chunk_position = 0;
 		}
-		FlattenNumericValue(chunk.GetValue(0, chunk_position++), row);
+		FlattenNumericValue(chunk.GetValue(0, chunk_position++), row, exact_row);
 		if (row.size() != width) {
 			throw InvalidInputException("LeRobot feature '%s' has %llu values; expected %llu", feature.name, row.size(),
 			                            width);
@@ -1391,7 +1493,7 @@ struct LerobotVisualStatsReader : public LerobotStatsRowReader {
 		return count;
 	}
 
-	void Next(vector<double> &row) override {
+	void Next(vector<double> &row, vector<Value> *exact_row) override {
 		if (position >= count) {
 			throw InternalException("LeRobot visual statistics reader advanced past its sample");
 		}
@@ -1412,7 +1514,11 @@ struct LerobotVisualStatsReader : public LerobotStatsRowReader {
 		const auto x = (pixel_index % sampled_width) * step;
 		const auto first_element = (y * feature.shape[1] + x) * feature.shape[2];
 		for (idx_t channel = 0; channel < feature.shape[2]; channel++) {
-			row.push_back(ReadRawVisualValue(frame, raw_type, first_element + channel));
+			const auto value = ReadRawVisualValue(frame, raw_type, first_element + channel);
+			row.push_back(value);
+			if (exact_row) {
+				exact_row->push_back(Value::DOUBLE(value));
+			}
 		}
 		position++;
 	}
@@ -1460,11 +1566,11 @@ void NormalizeRGBStats(LerobotFeatureStats &stats) {
 	}
 }
 
-LogicalType StatListType(const vector<idx_t> &shape, idx_t depth) {
+LogicalType StatListType(const vector<idx_t> &shape, idx_t depth, const LogicalType &leaf_type) {
 	if (depth + 1 == shape.size()) {
-		return LogicalType::LIST(LogicalType::DOUBLE);
+		return LogicalType::LIST(leaf_type);
 	}
-	return LogicalType::LIST(StatListType(shape, depth + 1));
+	return LogicalType::LIST(StatListType(shape, depth + 1, leaf_type));
 }
 
 Value BuildNestedStatValue(const vector<double> &values, const vector<idx_t> &shape, idx_t depth, idx_t &offset) {
@@ -1482,7 +1588,7 @@ Value BuildNestedStatValue(const vector<double> &values, const vector<idx_t> &sh
 	for (idx_t index = 0; index < shape[depth]; index++) {
 		children.push_back(BuildNestedStatValue(values, shape, depth + 1, offset));
 	}
-	return Value::LIST(StatListType(shape, depth + 1), std::move(children));
+	return Value::LIST(StatListType(shape, depth + 1, LogicalType::DOUBLE), std::move(children));
 }
 
 Value BuildStatValue(const vector<double> &values, const vector<idx_t> &shape) {
@@ -1490,6 +1596,37 @@ Value BuildStatValue(const vector<double> &values, const vector<idx_t> &shape) {
 	auto result = BuildNestedStatValue(values, shape, 0, offset);
 	if (offset != values.size()) {
 		throw InternalException("LeRobot statistic shape did not consume all values");
+	}
+	return result;
+}
+
+Value BuildNestedIntegerStatValue(const vector<Value> &values, const vector<idx_t> &shape, const LogicalType &leaf_type,
+                                  idx_t depth, idx_t &offset) {
+	vector<Value> children;
+	children.reserve(shape[depth]);
+	if (depth + 1 == shape.size()) {
+		for (idx_t index = 0; index < shape[depth]; index++) {
+			if (offset >= values.size()) {
+				throw InternalException("LeRobot integer statistic shape exceeds its value count");
+			}
+			if (!values[offset].type().IsIntegral()) {
+				throw InternalException("LeRobot integer statistic contains a non-integer value");
+			}
+			children.push_back(values[offset++].DefaultCastAs(leaf_type));
+		}
+		return Value::LIST(leaf_type, std::move(children));
+	}
+	for (idx_t index = 0; index < shape[depth]; index++) {
+		children.push_back(BuildNestedIntegerStatValue(values, shape, leaf_type, depth + 1, offset));
+	}
+	return Value::LIST(StatListType(shape, depth + 1, leaf_type), std::move(children));
+}
+
+Value BuildIntegerStatValue(const vector<Value> &values, const vector<idx_t> &shape, const LogicalType &leaf_type) {
+	idx_t offset = 0;
+	auto result = BuildNestedIntegerStatValue(values, shape, leaf_type, 0, offset);
+	if (offset != values.size()) {
+		throw InternalException("LeRobot integer statistic shape did not consume all values");
 	}
 	return result;
 }
@@ -1517,6 +1654,36 @@ string StatsJSONValue(const vector<double> &values, const vector<idx_t> &shape) 
 	auto result = NestedStatsJSON(values, shape, 0, offset);
 	if (offset != values.size()) {
 		throw InternalException("LeRobot statistic JSON shape did not consume all values");
+	}
+	return result;
+}
+
+string NestedIntegerStatsJSON(const vector<Value> &values, const vector<idx_t> &shape, idx_t depth, idx_t &offset) {
+	string result = "[";
+	for (idx_t index = 0; index < shape[depth]; index++) {
+		if (index > 0) {
+			result += ',';
+		}
+		if (depth + 1 == shape.size()) {
+			if (offset >= values.size()) {
+				throw InternalException("LeRobot integer statistic JSON shape exceeds its value count");
+			}
+			if (!values[offset].type().IsIntegral()) {
+				throw InternalException("LeRobot integer statistic JSON contains a non-integer value");
+			}
+			result += values[offset++].ToString();
+		} else {
+			result += NestedIntegerStatsJSON(values, shape, depth + 1, offset);
+		}
+	}
+	return result + ']';
+}
+
+string IntegerStatsJSONValue(const vector<Value> &values, const vector<idx_t> &shape) {
+	idx_t offset = 0;
+	auto result = NestedIntegerStatsJSON(values, shape, 0, offset);
+	if (offset != values.size()) {
+		throw InternalException("LeRobot integer statistic JSON shape did not consume all values");
 	}
 	return result;
 }
@@ -1933,8 +2100,14 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 		if (feature.is_image || feature.is_video) {
 			shape = {feature.shape[2], 1, 1};
 		}
-		row.push_back(BuildStatValue(stats.min, shape));
-		row.push_back(BuildStatValue(stats.max, shape));
+		if (HasIntegerExtrema(feature)) {
+			const auto leaf_type = StatExtremaLeafType(feature);
+			row.push_back(BuildIntegerStatValue(stats.integer_min, shape, leaf_type));
+			row.push_back(BuildIntegerStatValue(stats.integer_max, shape, leaf_type));
+		} else {
+			row.push_back(BuildStatValue(stats.min, shape));
+			row.push_back(BuildStatValue(stats.max, shape));
+		}
 		row.push_back(BuildStatValue(stats.mean, shape));
 		row.push_back(BuildStatValue(stats.stddev, shape));
 		row.push_back(Value::LIST(LogicalType::BIGINT, {Value::BIGINT(stats.count)}));
@@ -2043,7 +2216,8 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 			if (!bind.features[feature_index].HasStatistics()) {
 				continue;
 			}
-			MergeStats(dataset_stats[feature_index], episode_stats[feature_index]);
+			MergeStats(dataset_stats[feature_index], episode_stats[feature_index],
+			           HasIntegerExtrema(bind.features[feature_index]));
 			dataset_stats_present[feature_index] = true;
 		}
 		const auto from_index = total_frames;
@@ -2106,11 +2280,15 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 		if (feature.is_image || feature.is_video) {
 			shape = {feature.shape[2], 1, 1};
 		}
-		return "{\"min\":" + StatsJSONValue(stats.min, shape) + ",\"max\":" + StatsJSONValue(stats.max, shape) +
-		       ",\"mean\":" + StatsJSONValue(stats.mean, shape) + ",\"std\":" + StatsJSONValue(stats.stddev, shape) +
-		       ",\"count\":[" + std::to_string(stats.count) + "],\"q01\":" + StatsJSONValue(stats.q01, shape) +
-		       ",\"q10\":" + StatsJSONValue(stats.q10, shape) + ",\"q50\":" + StatsJSONValue(stats.q50, shape) +
-		       ",\"q90\":" + StatsJSONValue(stats.q90, shape) + ",\"q99\":" + StatsJSONValue(stats.q99, shape) + '}';
+		const auto minimum = HasIntegerExtrema(feature) ? IntegerStatsJSONValue(stats.integer_min, shape)
+		                                                : StatsJSONValue(stats.min, shape);
+		const auto maximum = HasIntegerExtrema(feature) ? IntegerStatsJSONValue(stats.integer_max, shape)
+		                                                : StatsJSONValue(stats.max, shape);
+		return "{\"min\":" + minimum + ",\"max\":" + maximum + ",\"mean\":" + StatsJSONValue(stats.mean, shape) +
+		       ",\"std\":" + StatsJSONValue(stats.stddev, shape) + ",\"count\":[" + std::to_string(stats.count) +
+		       "],\"q01\":" + StatsJSONValue(stats.q01, shape) + ",\"q10\":" + StatsJSONValue(stats.q10, shape) +
+		       ",\"q50\":" + StatsJSONValue(stats.q50, shape) + ",\"q90\":" + StatsJSONValue(stats.q90, shape) +
+		       ",\"q99\":" + StatsJSONValue(stats.q99, shape) + '}';
 	}
 
 	string StatsJSON() const {

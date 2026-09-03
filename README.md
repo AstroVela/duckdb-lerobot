@@ -289,6 +289,11 @@ COPY uses bounded episode memory. Numeric rows live in DuckDB's buffer-managed
 collection and statistics are computed in bounded streaming passes. Raw visual
 frames are appended to per-feature staging files; visual sampling and video
 encoding read one frame at a time, and cameras are processed sequentially.
+Integer `min`/`max` statistics use LeRobot's native-compatible `BIGINT` leaf in
+episode Parquet metadata (`UBIGINT` for the complete `uint64` domain) and retain
+their exact decimal value in `stats.json`; they never pass through `DOUBLE`.
+Integer `mean`, `std`, and quantiles intentionally use LeRobot's floating-point
+reduction contract.
 `MAX_VISUAL_FRAME_BYTES` is the strict per-frame scratch-memory contract and
 defaults to 64 MiB. It is not a total dataset or episode byte limit. Statistics
 retain only their final output and one flattened row proportional to the

@@ -135,6 +135,124 @@ FROM read_text('{TEST_DIR}/lerobot_copy_pairwise_stats/meta/stats.json');
 ----
 true	true
 
+# Integer extrema use native-compatible integer leaves and never pass through
+# DOUBLE. Floating moments and quantiles intentionally keep the native LeRobot
+# floating-point contract.
+statement ok
+COPY (
+    SELECT rows.*,
+           CAST(list_resize([signed_nested[1][2]], 65, signed_nested[1][2]) AS BIGINT[65])
+               AS signed_wide
+    FROM (VALUES
+        (0::BIGINT, 'integer'::VARCHAR,
+         CAST('-128' AS TINYINT), CAST('-32768' AS SMALLINT), CAST('-2147483648' AS INTEGER),
+         CAST('-9223372036854775808' AS BIGINT), 0::UTINYINT, 0::USMALLINT, 0::UINTEGER,
+         CAST('9007199254740993' AS UBIGINT),
+         array_value(
+             array_value(-100::BIGINT, 9007199254740991::BIGINT),
+             array_value(9007199254740993::BIGINT, 100::BIGINT))),
+        (0::BIGINT, 'integer'::VARCHAR,
+         127::TINYINT, 32767::SMALLINT, 2147483647::INTEGER, 9223372036854775807::BIGINT,
+         255::UTINYINT, 65535::USMALLINT, 4294967295::UINTEGER,
+         CAST('18446744073709551615' AS UBIGINT),
+         array_value(
+             array_value(-50::BIGINT, 9007199254740993::BIGINT),
+             array_value(9007199254740991::BIGINT, 200::BIGINT))),
+        (1::BIGINT, 'integer'::VARCHAR,
+         0::TINYINT, 0::SMALLINT, 0::INTEGER, 0::BIGINT,
+         1::UTINYINT, 1::USMALLINT, 1::UINTEGER, CAST('9007199254740997' AS UBIGINT),
+         array_value(
+             array_value(CAST('-9223372036854775808' AS BIGINT), 5::BIGINT),
+             array_value(6::BIGINT, 9223372036854775807::BIGINT))),
+        (1::BIGINT, 'integer'::VARCHAR,
+         1::TINYINT, 1::SMALLINT, 1::INTEGER, 1::BIGINT,
+         2::UTINYINT, 2::USMALLINT, 2::UINTEGER, CAST('9007199254740999' AS UBIGINT),
+         array_value(
+             array_value(-1::BIGINT, 7::BIGINT),
+             array_value(8::BIGINT, 0::BIGINT))),
+        (2::BIGINT, 'integer'::VARCHAR,
+         2::TINYINT, 2::SMALLINT, 2::INTEGER, 9007199254740993::BIGINT,
+         3::UTINYINT, 3::USMALLINT, 3::UINTEGER, CAST('9007199254740993' AS UBIGINT),
+         array_value(
+             array_value(2::BIGINT, 9007199254740993::BIGINT),
+             array_value(2::BIGINT, 2::BIGINT)))
+    ) rows(episode_index, task, signed_i8, signed_i16, signed_i32, signed_i64,
+           unsigned_u8, unsigned_u16, unsigned_u32, unsigned_u64, signed_nested)
+    ORDER BY episode_index
+) TO '{TEST_DIR}/lerobot_copy_integer_stats' (
+    FORMAT lerobot,
+    FPS 30,
+    FEATURES '{"signed_i8":{"dtype":"int8","shape":[1]},"signed_i16":{"dtype":"int16","shape":[1]},"signed_i32":{"dtype":"int32","shape":[1]},"signed_i64":{"dtype":"int64","shape":[1]},"unsigned_u8":{"dtype":"uint8","shape":[1]},"unsigned_u16":{"dtype":"uint16","shape":[1]},"unsigned_u32":{"dtype":"uint32","shape":[1]},"unsigned_u64":{"dtype":"uint64","shape":[1]},"signed_nested":{"dtype":"int64","shape":[2,2]},"signed_wide":{"dtype":"int64","shape":[65]}}'
+);
+
+query TTTTTTTT
+SELECT typeof("stats/signed_i8/min"), typeof("stats/signed_i16/min"),
+       typeof("stats/signed_i32/min"), typeof("stats/signed_i64/min"),
+       typeof("stats/unsigned_u8/max"), typeof("stats/unsigned_u16/max"),
+       typeof("stats/unsigned_u32/max"), typeof("stats/unsigned_u64/max")
+FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_integer_stats')
+LIMIT 1;
+----
+BIGINT[]	BIGINT[]	BIGINT[]	BIGINT[]	BIGINT[]	BIGINT[]	BIGINT[]	UBIGINT[]
+
+query IIIIIIII
+SELECT "stats/signed_i8/min"[1] = CAST('-128' AS TINYINT),
+       "stats/signed_i16/min"[1] = CAST('-32768' AS SMALLINT),
+       "stats/signed_i32/min"[1] = CAST('-2147483648' AS INTEGER),
+       "stats/signed_i64/min"[1] = CAST('-9223372036854775808' AS BIGINT),
+       "stats/unsigned_u8/max"[1] = 255::UTINYINT,
+       "stats/unsigned_u16/max"[1] = 65535::USMALLINT,
+       "stats/unsigned_u32/max"[1] = 4294967295::UINTEGER,
+       "stats/unsigned_u64/max"[1] = CAST('18446744073709551615' AS UBIGINT)
+FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_integer_stats')
+WHERE episode_index = 0;
+----
+true	true	true	true	true	true	true	true
+
+query IITTTTT
+SELECT "stats/signed_nested/min"[1][1] = CAST('-9223372036854775808' AS BIGINT),
+       "stats/signed_nested/max"[2][2] = 9223372036854775807::BIGINT,
+       typeof("stats/signed_nested/min"), typeof("stats/signed_nested/max"),
+       typeof("stats/signed_nested/mean"), typeof("stats/signed_nested/std"),
+       typeof("stats/signed_nested/q50")
+FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_integer_stats')
+WHERE episode_index = 1;
+----
+true	true	BIGINT[][]	BIGINT[][]	DOUBLE[][]	DOUBLE[][]	DOUBLE[][]
+
+query IIIII
+SELECT "stats/signed_nested/min"[1][2] = 9007199254740991::BIGINT,
+       "stats/signed_nested/max"[1][2] = 9007199254740993::BIGINT,
+       "stats/signed_nested/mean"[1][2] = 9007199254740992::DOUBLE,
+       "stats/signed_wide/min"[65] = 9007199254740991::BIGINT,
+       "stats/signed_wide/max"[65] = 9007199254740993::BIGINT
+FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_integer_stats')
+WHERE episode_index = 0;
+----
+true	true	true	true	true
+
+# A singleton takes LeRobot's basic-statistics branch: extrema remain exact,
+# while the floating results expose the expected binary64 rounding above 2^53.
+query IIIIII
+SELECT "stats/signed_i64/min"[1] = 9007199254740993::BIGINT,
+       "stats/signed_i64/max"[1] = 9007199254740993::BIGINT,
+       "stats/signed_i64/mean"[1] = 9007199254740992::DOUBLE,
+       "stats/signed_i64/std"[1] = 0::DOUBLE,
+       "stats/signed_i64/q50"[1] = "stats/signed_i64/mean"[1],
+       typeof("stats/signed_i64/q50") = 'DOUBLE[]'
+FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_integer_stats')
+WHERE episode_index = 2;
+----
+true	true	true	true	true	true
+
+query TTT
+SELECT json_extract_string(content, '$.signed_nested.min[0][0]'),
+       json_extract_string(content, '$.signed_nested.max[1][1]'),
+       json_extract_string(content, '$.unsigned_u64.max[0]')
+FROM read_text('{TEST_DIR}/lerobot_copy_integer_stats/meta/stats.json');
+----
+-9223372036854775808	9223372036854775807	18446744073709551615
+
 statement ok
 COPY (
     SELECT 0::BIGINT AS episode_index, 'block'::VARCHAR AS task,
