@@ -63,6 +63,39 @@ COPY (
     ) AS tasks(task_index, task)
 ) TO '{TEST_DIR}/lerobot_temporal/meta/tasks.parquet' (FORMAT PARQUET);
 
+# A power-of-two high FPS keeps every half-frame input exactly representable,
+# making the expected Python round() ties-to-even behavior unambiguous.
+statement ok
+COPY (SELECT 0 AS bootstrap, 1 AS payload)
+TO '{TEST_DIR}/lerobot_temporal_high_fps' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (SELECT 0 AS bootstrap, 1 AS payload)
+TO '{TEST_DIR}/lerobot_temporal_high_fps/meta' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version,
+           'data.parquet' AS data_path,
+           4096 AS fps,
+           struct_pack(
+               "observation.state" := struct_pack(dtype := 'float32')
+           ) AS features
+) TO '{TEST_DIR}/lerobot_temporal_high_fps/meta/info.json' (FORMAT JSON, ARRAY false);
+
+statement ok
+COPY (
+    SELECT episodes.*, 0 AS metadata_chunk FROM (VALUES
+        (0::BIGINT, 7::BIGINT, 0::BIGINT, 0::BIGINT)
+    ) AS episodes(
+        episode_index,
+        length,
+        "data/chunk_index",
+        "data/file_index"
+    )
+) TO '{TEST_DIR}/lerobot_temporal_high_fps/meta/episodes'
+  (FORMAT PARQUET, PARTITION_BY (metadata_chunk));
+
 query II
 SELECT frame_index, state
 FROM lerobot_episode_frames('{TEST_DIR}/lerobot_temporal', [2])
@@ -70,6 +103,35 @@ ORDER BY frame_index;
 ----
 0	20
 1	21
+
+# Native LeRobot uses Python round(), so exact half-frame offsets round to the
+# even integer. Half a 4096 FPS frame exceeds the default tolerance, so this
+# also verifies that the caller-supplied tolerance is honored.
+query IIII
+SELECT delta_index, delta_frame_offset, target_frame_index,
+       CAST(is_padding AS INTEGER)
+FROM lerobot_temporal_targets(
+    '{TEST_DIR}/lerobot_temporal_high_fps',
+    (SELECT i AS request_id, 0 AS episode_index, 3 AS frame_index, i AS delta_index
+     FROM range(6) offsets(i)),
+    delta_timestamps := [
+        -0.0006103515625,
+        -0.0003662109375,
+        -0.0001220703125,
+         0.0001220703125,
+         0.0003662109375,
+         0.0006103515625
+    ],
+    tolerance := 0.0001220703125
+)
+ORDER BY delta_index;
+----
+0	-2	1	0
+1	-2	1	0
+2	0	3	0
+3	0	3	0
+4	2	5	0
+5	2	5	0
 
 # Each relation row selects one delta. Boundary offsets clamp exactly like
 # LeRobot and duplicate input rows remain distinct through target_ordinal.

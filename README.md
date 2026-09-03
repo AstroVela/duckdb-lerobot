@@ -83,11 +83,12 @@ distinct. Use an order-bearing `request_id` together with `delta_index` and
 `target_ordinal` to restore the caller's tensor order. Padding and the resolved
 target frame are returned explicitly.
 
-`lerobot_temporal_targets` applies the same LeRobot FPS validation, integer
-frame-offset conversion, episode-boundary clamp, and padding semantics without
-opening video. Its input relation has exactly `request_id`, `episode_index`,
-`frame_index`, and `delta_index`. Join the returned `target_frame_index` to
-`lerobot_frames` to fetch any state, action, or other non-video feature.
+`lerobot_temporal_targets` applies the same LeRobot FPS validation,
+Python-compatible ties-to-even integer frame-offset conversion,
+episode-boundary clamp, and padding semantics without opening video. Its input
+relation has exactly `request_id`, `episode_index`, `frame_index`, and
+`delta_index`. Join the returned `target_frame_index` to `lerobot_frames` to
+fetch any state, action, or other non-video feature.
 `lerobot_tasks` scans the current v3 `meta/tasks.parquet` contract directly, so
 joining a frame's `task_index` yields its `task` string while retaining native
 Parquet projection and filter pushdown. Legacy task layouts are not inferred.

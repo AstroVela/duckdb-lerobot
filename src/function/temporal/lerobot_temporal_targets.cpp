@@ -17,6 +17,22 @@
 
 namespace duckdb {
 
+namespace {
+
+int64_t RoundHalfToEven(double value) {
+	const auto lower = std::floor(value);
+	const auto fraction = value - lower;
+	if (fraction < 0.5) {
+		return static_cast<int64_t>(lower);
+	}
+	if (fraction > 0.5) {
+		return static_cast<int64_t>(lower + 1);
+	}
+	return static_cast<int64_t>(std::fmod(lower, 2.0) == 0.0 ? lower : lower + 1);
+}
+
+} // namespace
+
 vector<LerobotTemporalDelta> GetLerobotTemporalDeltas(TableFunctionBindInput &input, int64_t fps, double tolerance,
                                                       const char *function_name) {
 	vector<double> timestamps;
@@ -41,12 +57,15 @@ vector<LerobotTemporalDelta> GetLerobotTemporalDeltas(TableFunctionBindInput &in
 		if (!std::isfinite(timestamp)) {
 			throw BinderException("%s delta_timestamps must be finite", function_name);
 		}
-		const long double scaled = static_cast<long double>(timestamp) * static_cast<long double>(fps);
-		if (scaled < static_cast<long double>(std::numeric_limits<int64_t>::min()) ||
-		    scaled > static_cast<long double>(std::numeric_limits<int64_t>::max())) {
+		// Python round(), used by native LeRobot, resolves exact half ties to the
+		// even integer. Spell the operation out instead of relying on the process
+		// floating-point rounding mode.
+		const auto scaled = timestamp * static_cast<double>(fps);
+		const auto int64_upper_bound = std::ldexp(1.0, 63);
+		if (!std::isfinite(scaled) || scaled < -int64_upper_bound || scaled >= int64_upper_bound) {
 			throw BinderException("%s delta timestamp %.17g is too large", function_name, timestamp);
 		}
-		const auto frame_offset = static_cast<int64_t>(std::llround(scaled));
+		const auto frame_offset = RoundHalfToEven(scaled);
 		const auto canonical_timestamp = static_cast<double>(frame_offset) / static_cast<double>(fps);
 		if (std::fabs(timestamp - canonical_timestamp) > tolerance) {
 			throw BinderException("%s delta timestamp %.17g is not a multiple of 1/fps (%d) within tolerance %.17g",
