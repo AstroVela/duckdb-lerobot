@@ -94,14 +94,15 @@ Non-video temporal features use the corresponding relation operator:
     JOIN lerobot_tasks(root) tasks USING (task_index);
 
 The four named input columns are cast to `BIGINT` and consumed as DuckDB typed
-vectors. Delta timestamps must be integer frame offsets at the dataset FPS.
-The operator looks up the requested episode's cached `length`, clamps the
-target into `[0, length - 1]`, and emits `is_padding`. It does not read feature
-values itself, so the following native Parquet join keeps projection and filter
-pushdown for arbitrary state/action schemas. `target_ordinal` distinguishes
-exact duplicate relation rows. `lerobot_tasks` directly scans the current v3
-`meta/tasks.parquet` schema (`task_index`, `task`); no legacy schema inference
-or fallback is performed.
+vectors. Delta timestamps must be integer frame offsets at the dataset FPS;
+exact half-frame values use Python-compatible ties-to-even rounding, shared
+with both video temporal APIs. The operator looks up the requested episode's
+cached `length`, clamps the target into `[0, length - 1]`, and emits
+`is_padding`. It does not read feature values itself, so the following native
+Parquet join keeps projection and filter pushdown for arbitrary state/action
+schemas. `target_ordinal` distinguishes exact duplicate relation rows.
+`lerobot_tasks` directly scans the current v3 `meta/tasks.parquet` schema
+(`task_index`, `task`); no legacy schema inference or fallback is performed.
 
 Video alignment is a separate metadata-only phase:
 

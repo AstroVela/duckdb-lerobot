@@ -90,6 +90,21 @@ ORDER BY delta_ordinal;
 7	1	0	0	3
 7	2	0	1	3
 
+# Video windows use the same Python-compatible ties-to-even conversion as
+# non-video temporal targets. Projecting metadata avoids opening the MP4.
+query III
+SELECT delta_ordinal, delta_frame_offset, target_frame_index
+FROM lerobot_video_windows(
+    '{TEST_DIR}/lerobot_video_projection',
+    [struct_pack(request_id := 8::BIGINT, episode_index := 0::BIGINT, frame_index := 0::BIGINT)],
+    delta_timestamps := [-0.25, 0.25],
+    tolerance := 0.25
+)
+ORDER BY delta_ordinal;
+----
+0	0	0
+1	0	0
+
 # Duplicate request identifiers and target frames remain distinct logical rows.
 query III
 SELECT request_id, request_ordinal, target_frame_index
@@ -128,6 +143,25 @@ ORDER BY target_ordinal;
 9	1	0	1	0	0	0.0	observation.images.front
 10	2	1	0	0	0	0.0	observation.images.front
 11	3	2	0	1	0	0.5	observation.images.front
+
+# Relation video targets share that conversion path and preserve both
+# half-frame requests as distinct logical targets.
+query IIII
+SELECT delta_index, delta_frame_offset, target_frame_index,
+       CAST(is_padding AS INTEGER)
+FROM lerobot_video_targets(
+    '{TEST_DIR}/lerobot_video_projection',
+    (SELECT * FROM (VALUES
+        (40, 0, 0, 'observation.images.front', 0),
+        (41, 0, 0, 'observation.images.front', 1)
+    ) targets(request_id, episode_index, frame_index, video_key, delta_index)),
+    delta_timestamps := [-0.25, 0.25],
+    tolerance := 0.25
+)
+ORDER BY delta_index;
+----
+0	0	0	0
+1	0	0	0
 
 # Filters in the child relation run before routing/decode. Metadata-only output
 # projection must not open the deliberately missing MP4.
