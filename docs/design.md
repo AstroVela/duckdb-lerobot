@@ -186,7 +186,10 @@ uses a streaming DuckDB query for the three alignment columns from only the
 routed data shards, then expands the requested camera routes one target at a
 time. A global scheduler logically partitions those targets by MP4 shard while
 placing them into fixed-size buffers. Each buffer is sorted independently, and
-a gap greater than 10 seconds starts a new seek cluster.
+a gap greater than 10 seconds starts a new seek cluster. A cluster also ends
+before its timestamp span, multiplied by dataset FPS and including both endpoint
+frames, would exceed 20,000 estimated frames. This bounds sparse targets whose
+adjacent gaps are exactly 10 seconds without shortening the supported video.
 
 The number of queued targets is bounded as well as the size of an individual
 shard buffer. If many shards each have a partial buffer, the scheduler flushes
@@ -198,17 +201,20 @@ up to the smaller of `decode_threads` and `max_cached_decoders`.
 
 The DuckDB file handle, FFmpeg container, codec, frames, and RGB conversion
 context stay open when a decoder is returned between buffers. A monotonic next
-buffer within `cluster_gap` continues the existing forward decode; a backward
-target, a larger gap, or an in-buffer cluster boundary seeks backward to the
-preceding keyframe. Once a decoded timestamp crosses a target, the decoder
-picks the closer of that frame and its predecessor; ties select the predecessor.
+buffer within `cluster_gap` continues the existing forward decode only when the
+combined FPS-scaled cluster span remains within 20,000 frames; a backward target,
+a larger gap, a span overflow, or an in-buffer cluster boundary seeks backward
+to the preceding keyframe. Once a decoded timestamp crosses a target, the
+decoder picks the closer of that frame and its predecessor; ties select the
+predecessor.
 A match farther away than the configured tolerance is rejected. The default
 tolerance is `1e-4` seconds, matching current LeRobot; callers can explicitly
 select a wider tolerance for approximate legacy media. Seeking uses the video
 stream's own time base and starts one tick before the target, then aligns on
-frame PTS with best-effort timestamps only as a fallback. A 20,000-frame budget
-is shared by an entire target buffer, preventing a dense series of individually
-successful matches from hiding corrupt routing metadata.
+frame PTS with best-effort timestamps only as a fallback. The decoded-frame
+counter resets per seek. Its limit is derived from the estimated cluster work
+plus a 20,000-frame emergency margin, leaving room for keyframe preroll while
+still detecting corrupt routing metadata or pathological decode progress.
 
 The table function emits at most 16 rows and 64 MiB of image data per call by
 default. Target buffers hold at most 256 entries by default, and a global LRU

@@ -45,12 +45,14 @@ statistics, or data blocks; those remain native DuckDB responsibilities.
 Native video decode is available as the third stage. `lerobot_video_frames`
 streams only the selected episodes' frame timestamps, adds each episode's video
 offset, and routes targets into bounded per-MP4-shard buffers. Targets are
-timestamp-sorted inside each buffer and split at gaps larger than 10 seconds.
-Decoder sessions stay open across buffers, continue forward when timestamps are
-nearby, and otherwise seek backward to the preceding keyframe. A bounded LRU
-pool closes least-recently-used idle decoders when more shards are encountered
-than can remain open. Results are small Arrow-compatible batches of interleaved
-RGB24 or single-channel float32 depth bytes, not Python image objects.
+timestamp-sorted inside each buffer and split at gaps larger than 10 seconds or
+before their FPS-scaled span exceeds 20,000 frames. Decoder sessions stay open
+across buffers, continue forward while timestamps are nearby and the accumulated
+cluster remains within that span, and otherwise seek backward to the preceding
+keyframe. A bounded LRU pool closes least-recently-used idle decoders when more
+shards are encountered than can remain open. Results are small Arrow-compatible
+batches of interleaved RGB24 or single-channel float32 depth bytes, not Python
+image objects.
 
 Native dataset creation is available through DuckDB's COPY surface. `FORMAT
 lerobot` delegates data, episode metadata, and task tables to DuckDB's native
@@ -374,9 +376,12 @@ LEROBOT_FFMPEG_TESTS=1 make test
 `frame_indices` is the pre-decode sampling control for the low-level frame API;
 training reads should normally use `lerobot_video_windows`. `tolerance`
 defaults to `1e-4` seconds like native LeRobot, `cluster_gap` defaults to 10
-seconds, and `batch_size` defaults to 16 output rows. `max_output_bytes`
-independently caps image bytes emitted by one call at 64 MiB (a single larger
-frame is still emitted).
+seconds, and clusters are additionally capped at an estimated 20,000-frame
+timestamp span using dataset FPS. Each seek receives that cluster's estimated
+work plus a 20,000-frame emergency margin, so the guard detects pathological
+decode progress without limiting video duration. `batch_size` defaults to 16
+output rows. `max_output_bytes` independently caps image bytes emitted by one
+call at 64 MiB (a single larger frame is still emitted).
 
 `target_buffer_size` defaults to 256 alignment targets per shard buffer.
 `max_cached_decoders` defaults to 8 decoder sessions, while

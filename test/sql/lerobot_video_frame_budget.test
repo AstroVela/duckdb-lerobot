@@ -1,0 +1,125 @@
+# name: test/sql/lerobot_video_frame_budget.test
+# description: Long sparse target clusters are bounded by estimated frame span
+# group: [lerobot]
+
+require-env LEROBOT_FFMPEG_TESTS
+
+require parquet
+
+require json
+
+require lerobot
+
+statement ok
+COPY (SELECT 0 AS bootstrap, 1 AS payload)
+TO '{TEST_DIR}/lerobot_video_frame_budget' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (SELECT 0 AS bootstrap, 1 AS payload)
+TO '{TEST_DIR}/lerobot_video_frame_budget/meta' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version,
+           'data.parquet' AS data_path,
+           'video-{file_index:03d}.mp4' AS video_path,
+           30 AS fps,
+           struct_pack(
+               "observation.images.front" := struct_pack(dtype := 'video')
+           ) AS features
+) TO '{TEST_DIR}/lerobot_video_frame_budget/meta/info.json' (FORMAT JSON, ARRAY false);
+
+statement ok
+COPY (
+    SELECT episodes.*, 0 AS metadata_chunk FROM (VALUES
+        (0::BIGINT, 20701::BIGINT, 0::BIGINT, 0::BIGINT,
+         0::BIGINT, 0::BIGINT, 0.0::DOUBLE, 20701 / 30.0)
+    ) AS episodes(
+        episode_index,
+        length,
+        "data/chunk_index",
+        "data/file_index",
+        "videos/observation.images.front/chunk_index",
+        "videos/observation.images.front/file_index",
+        "videos/observation.images.front/from_timestamp",
+        "videos/observation.images.front/to_timestamp"
+    )
+) TO '{TEST_DIR}/lerobot_video_frame_budget/meta/episodes'
+  (FORMAT PARQUET, PARTITION_BY ('metadata_chunk'));
+
+statement ok
+COPY (
+    SELECT 0::BIGINT AS episode_index,
+           frame_index,
+           frame_index / 30.0 AS timestamp
+    FROM range(20701) frames(frame_index)
+) TO '{TEST_DIR}/lerobot_video_frame_budget/data.parquet' (FORMAT PARQUET);
+
+statement ok
+COPY (
+    SELECT content
+    FROM read_blob('{WORKING_DIR}/test/data/lerobot/long-20701.mp4')
+) TO '{TEST_DIR}/lerobot_video_frame_budget/video-000.mp4' (FORMAT BLOB);
+
+# Seventy targets are exactly 10 seconds apart and fit in one target buffer.
+# The 20,701-frame video used to exhaust the old per-buffer 20,000-frame guard.
+query IR
+SELECT count(decoded_timestamp), round(max(decoded_timestamp), 6)
+FROM lerobot_video_targets(
+    '{TEST_DIR}/lerobot_video_frame_budget',
+    (SELECT target_index AS request_id,
+            0::BIGINT AS episode_index,
+            target_index * 300 AS frame_index,
+            'observation.images.front' AS video_key,
+            0::BIGINT AS delta_index
+     FROM range(70) targets(target_index)),
+    delta_timestamps := [0.0],
+    target_buffer_size := 256,
+    decode_threads := 1,
+    max_cached_decoders := 1
+);
+----
+70	690.0
+
+# One-target buffers must reuse the open decoder for nearby targets while the
+# accumulated span still forces a second seek before crossing 20,000 frames.
+statement ok
+PRAGMA enable_profiling='json';
+
+statement ok
+SET profiling_output = '{TEST_DIR}/lerobot_video_frame_budget/profile.json';
+
+query IR
+SELECT count(decoded_timestamp), round(max(decoded_timestamp), 6)
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_frame_budget',
+    [0],
+    video_keys := ['observation.images.front'],
+    frame_indices := [
+        0, 300, 600, 900, 1200, 1500, 1800, 2100, 2400, 2700,
+        3000, 3300, 3600, 3900, 4200, 4500, 4800, 5100, 5400, 5700,
+        6000, 6300, 6600, 6900, 7200, 7500, 7800, 8100, 8400, 8700,
+        9000, 9300, 9600, 9900, 10200, 10500, 10800, 11100, 11400, 11700,
+        12000, 12300, 12600, 12900, 13200, 13500, 13800, 14100, 14400, 14700,
+        15000, 15300, 15600, 15900, 16200, 16500, 16800, 17100, 17400, 17700,
+        18000, 18300, 18600, 18900, 19200, 19500, 19800, 20100, 20400, 20700
+    ],
+    target_buffer_size := 1,
+    max_pending_targets := 1,
+    decode_threads := 1,
+    max_cached_decoders := 1
+);
+----
+70	690.0
+
+statement ok
+PRAGMA disable_profiling;
+
+query I
+SELECT count(*) = 2 AND count(DISTINCT entry.key) = 2
+FROM read_text('{TEST_DIR}/lerobot_video_frame_budget/profile.json') profile,
+     json_tree(profile.content) entry
+WHERE (entry.key = 'LeRobot Decoder Opens' AND json_extract_string(entry.value, '$') = '1')
+   OR (entry.key = 'LeRobot Decoder Seeks' AND json_extract_string(entry.value, '$') = '2');
+----
+true
