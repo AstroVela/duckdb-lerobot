@@ -131,7 +131,9 @@ authoritative `info.json.data_path` template and episode chunk/file indices,
 and binds that list directly as a native `parquet_scan`. No `data/` glob or
 alternate-layout fallback exists. The resulting scan remains DuckDB's own
 logical get, preserving schema inference, parallel reads, projection and filter
-pushdown, join dynamic filters, footer caching, and row-group pruning.
+pushdown, join dynamic filters, footer caching, and row-group pruning. Its
+function set retains the native Parquet overloads and named parameters; the
+bind replacement forwards those parameters after consuming only `refresh`.
 
 `lerobot_episode_frames` is a bind-replacement table function. It constructs a
 relational `episode_index IN (...)` predicate over a native `parquet_scan`.

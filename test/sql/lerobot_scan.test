@@ -93,7 +93,7 @@ COPY (
 
 statement ok
 COPY (
-    SELECT * FROM (VALUES
+    SELECT frames.*, 'schema-v2'::VARCHAR AS shard_marker FROM (VALUES
         (2::BIGINT, 4::BIGINT, 0.0::DOUBLE),
         (2::BIGINT, 5::BIGINT, 0.033333::DOUBLE)
     ) AS frames(episode_index, frame_index, timestamp)
@@ -112,6 +112,24 @@ ORDER BY frame_index;
 1	3
 2	4
 2	5
+
+# The native Parquet overloads and named parameters survive metadata-first
+# replacement. union_by_name exposes the later shard's evolved column,
+# filename proves native options reach the replacement scan, and refresh must
+# remain extension-owned rather than being passed to parquet_scan.
+query ITT
+SELECT frame_index, coalesce(shard_marker, 'missing'), filename
+FROM lerobot_frames(
+    ['{TEST_DIR}/lerobot_scan'],
+    refresh := true,
+    union_by_name := true,
+    filename := true
+)
+WHERE frame_index IN (1, 4)
+ORDER BY frame_index;
+----
+1	missing	{TEST_DIR}/lerobot_scan/frames/chunk-00/part-0000.parquet
+4	schema-v2	{TEST_DIR}/lerobot_scan/frames/chunk-00/part-0001.parquet
 
 query TTI
 SELECT codebase_version, data_path, fps

@@ -26,7 +26,9 @@ format-specific `MultiFileReader`. `lerobot_frames` resolves the authoritative
 `info.json.data_path` file list through the route cache and binds that list
 directly to native `parquet_scan`. DuckDB therefore retains its native
 projection, filter, dynamic-filter, parallel I/O, footer-cache, and row-group
-pruning paths without assuming a `data/` directory.
+pruning paths without assuming a `data/` directory. Native Parquet overloads
+and named scan options are preserved and forwarded; `refresh` remains the one
+LeRobot-owned metadata option.
 
 Frame scans cache the small LeRobot control plane: `meta/info.json` plus each
 episode's `length` and data-shard mapping from `meta/episodes`. The cache

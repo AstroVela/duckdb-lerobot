@@ -236,6 +236,20 @@ unique_ptr<TableFunctionRef> CreateTableFunctionRef(const char *name, Value argu
 	return result;
 }
 
+unique_ptr<TableFunctionRef> CreateTableFunctionRef(const char *name, Value argument,
+                                                    const named_parameter_map_t &named_parameters) {
+	vector<unique_ptr<ParsedExpression>> children;
+	children.push_back(make_uniq<ConstantExpression>(std::move(argument)));
+	for (const auto &entry : named_parameters) {
+		auto parameter = make_uniq<ConstantExpression>(entry.second);
+		parameter->SetAlias(entry.first);
+		children.push_back(std::move(parameter));
+	}
+	auto result = make_uniq<TableFunctionRef>();
+	result->function = make_uniq<FunctionExpression>(name, std::move(children));
+	return result;
+}
+
 Value CreatePathList(const vector<string> &paths) {
 	vector<Value> values;
 	values.reserve(paths.size());
@@ -469,10 +483,17 @@ unique_ptr<TableRef> LerobotFramesBindReplace(ClientContext &context, TableFunct
 		throw BinderException("lerobot_frames root must not be NULL");
 	}
 
-	auto root = NormalizeLerobotRoot(StringValue::Get(input.inputs[0]));
+	auto root_reader = MultiFileReader::CreateDefault("lerobot_frames");
+	auto roots = root_reader->ParsePaths(input.inputs[0]);
+	if (roots.size() != 1) {
+		throw BinderException("LeRobot scans require exactly one dataset root");
+	}
+	auto root = NormalizeLerobotRoot(std::move(roots[0]));
 	bool cache_hit;
 	auto metadata = LerobotDatasetMetadata::Get(context, root, GetRefreshParameter(input), cache_hit);
-	return CreateTableFunctionRef("parquet_scan", CreatePathList(metadata->GetDataFiles()));
+	auto parquet_parameters = input.named_parameters;
+	parquet_parameters.erase("refresh");
+	return CreateTableFunctionRef("parquet_scan", CreatePathList(metadata->GetDataFiles()), parquet_parameters);
 }
 
 } // namespace
@@ -543,11 +564,15 @@ TableFunctionSet LerobotFunctions::GetTasksFunction(ExtensionLoader &loader) {
 	return CreateNativeScan(loader, "parquet_scan", "lerobot_tasks", LerobotMultiFileReader::CreateTasks);
 }
 
-TableFunctionSet LerobotFunctions::GetFramesFunction() {
-	TableFunction function("lerobot_frames", {LogicalType::VARCHAR}, nullptr, nullptr);
-	function.bind_replace = LerobotFramesBindReplace;
-	function.named_parameters["refresh"] = LogicalType::BOOLEAN;
-	return TableFunctionSet(std::move(function));
+TableFunctionSet LerobotFunctions::GetFramesFunction(ExtensionLoader &loader) {
+	auto result = loader.GetTableFunction("parquet_scan").functions;
+	for (auto &function : result.functions) {
+		function.name = "lerobot_frames";
+		function.bind_replace = LerobotFramesBindReplace;
+		function.named_parameters["refresh"] = LogicalType::BOOLEAN;
+	}
+	result.name = "lerobot_frames";
+	return result;
 }
 
 TableFunctionSet LerobotFunctions::GetMetadataCacheFunction() {
