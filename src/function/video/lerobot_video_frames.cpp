@@ -59,9 +59,10 @@ static const idx_t LEROBOT_MAX_CACHED_DECODERS = 1024;
 static const idx_t LEROBOT_MAX_DECODE_THREADS = 1024;
 static const idx_t LEROBOT_MAX_PENDING_TARGETS = 10 * 1024 * 1024;
 static const idx_t LEROBOT_MAX_WINDOW_TARGETS = 100000;
-static const idx_t LEROBOT_DECODE_FRAME_BUDGET = 20000;
+static const idx_t LEROBOT_MAX_CLUSTER_FRAME_SPAN = 20000;
 static const double LEROBOT_DEFAULT_CLUSTER_GAP_SECONDS = 10.0;
 #ifdef LEROBOT_HAVE_FFMPEG
+static const idx_t LEROBOT_DECODE_FRAME_SAFETY_MARGIN = 20000;
 static const uint16_t LEROBOT_DEPTH_QMAX = 4095;
 #endif
 
@@ -434,10 +435,41 @@ struct LerobotVideoDecodeMetrics {
 };
 
 struct LerobotDecodeBuffer {
+	LerobotDecodeBuffer(idx_t shard_index_p, int64_t fps_p) : shard_index(shard_index_p), fps(fps_p) {
+	}
+
 	idx_t shard_index;
+	int64_t fps;
 	vector<LerobotDecodeTarget> targets;
 	vector<vector<idx_t>> clusters;
 };
+
+idx_t EstimateFrameSpan(double first_timestamp, double last_timestamp, int64_t fps) {
+	D_ASSERT(fps > 0);
+	if (last_timestamp <= first_timestamp) {
+		return 1;
+	}
+	const auto frame_span =
+	    std::ceil((static_cast<long double>(last_timestamp) - static_cast<long double>(first_timestamp)) *
+	              static_cast<long double>(fps)) +
+	    1;
+	const auto maximum = std::numeric_limits<idx_t>::max();
+	if (frame_span >= static_cast<long double>(maximum)) {
+		return maximum;
+	}
+	return static_cast<idx_t>(frame_span);
+}
+
+#ifdef LEROBOT_HAVE_FFMPEG
+idx_t DecodeFrameBudget(double first_timestamp, double last_timestamp, int64_t fps) {
+	const auto expected_frames = EstimateFrameSpan(first_timestamp, last_timestamp, fps);
+	const auto maximum = std::numeric_limits<idx_t>::max();
+	if (expected_frames > maximum - LEROBOT_DECODE_FRAME_SAFETY_MARGIN) {
+		return maximum;
+	}
+	return expected_frames + LEROBOT_DECODE_FRAME_SAFETY_MARGIN;
+}
+#endif
 
 struct LerobotVideoFramesBindData final : public TableFunctionData {
 	LerobotVideoFramesBindData(shared_ptr<LerobotVideoMetadata> metadata_p, vector<LerobotVideoRoute> routes_p,
@@ -491,6 +523,8 @@ struct LerobotVideoFramesBindData final : public TableFunctionData {
 };
 
 void FinalizeDecodeBuffer(LerobotDecodeBuffer &buffer, double cluster_gap) {
+	D_ASSERT(buffer.fps > 0);
+	buffer.clusters.clear();
 	std::sort(buffer.targets.begin(), buffer.targets.end(),
 	          [](const LerobotDecodeTarget &left, const LerobotDecodeTarget &right) {
 		          if (left.video_timestamp != right.video_timestamp) {
@@ -514,9 +548,12 @@ void FinalizeDecodeBuffer(LerobotDecodeBuffer &buffer, double cluster_gap) {
 		bool new_cluster = buffer.clusters.empty();
 		if (!new_cluster) {
 			const auto previous_index = buffer.clusters.back().back();
-			new_cluster =
-			    buffer.targets[target_index].video_timestamp - buffer.targets[previous_index].video_timestamp >
-			    cluster_gap;
+			const auto first_index = buffer.clusters.back().front();
+			const auto adjacent_gap =
+			    buffer.targets[target_index].video_timestamp - buffer.targets[previous_index].video_timestamp;
+			const auto frame_span = EstimateFrameSpan(buffer.targets[first_index].video_timestamp,
+			                                          buffer.targets[target_index].video_timestamp, buffer.fps);
+			new_cluster = adjacent_gap > cluster_gap || frame_span > LEROBOT_MAX_CLUSTER_FRAME_SPAN;
 		}
 		if (new_cluster) {
 			buffer.clusters.push_back(vector<idx_t>());
@@ -939,12 +976,13 @@ public:
 	      io_state(context_p, video_path, metrics_p), metrics(metrics_p), format_context(nullptr),
 	      avio_context(nullptr), codec_context(nullptr), packet(nullptr), previous_frame(nullptr),
 	      current_frame(nullptr), video_stream(nullptr), sws_context(nullptr), cluster_position(0), target_position(0),
-	      decoded_frames_in_buffer(0), demux_eof(false), flush_sent(false), decoder_eof(false), have_previous(false),
-	      have_current(false), previous_timestamp(0), current_timestamp(0), have_last_target(false),
-	      last_target_timestamp(0), have_converted_frame(false), converted_timestamp(0), converted_source_width(0),
-	      converted_source_height(0), converted_source_format(AV_PIX_FMT_NONE), depth_scale(0), depth_offset(0),
-	      sws_source_width(0), sws_source_height(0), sws_source_format(AV_PIX_FMT_NONE), resize_source_width(0),
-	      resize_source_height(0), resize_target_width(0), resize_target_height(0) {
+	      decoded_frames_since_seek(0), decode_frame_budget(0), demux_eof(false), flush_sent(false), decoder_eof(false),
+	      have_previous(false), have_current(false), previous_timestamp(0), current_timestamp(0),
+	      have_last_target(false), last_target_timestamp(0), have_cluster_start(false), cluster_start_timestamp(0),
+	      have_converted_frame(false), converted_timestamp(0), converted_source_width(0), converted_source_height(0),
+	      converted_source_format(AV_PIX_FMT_NONE), depth_scale(0), depth_offset(0), sws_source_width(0),
+	      sws_source_height(0), sws_source_format(AV_PIX_FMT_NONE), resize_source_width(0), resize_source_height(0),
+	      resize_target_width(0), resize_target_height(0) {
 		if (video_feature_metadata.is_depth_map) {
 			if (video_feature_metadata.use_log) {
 				const auto log_min = std::log(video_feature_metadata.depth_min + video_feature_metadata.shift);
@@ -980,13 +1018,18 @@ public:
 		buffer = &buffer_p;
 		cluster_position = 0;
 		target_position = 0;
-		decoded_frames_in_buffer = 0;
 
-		const auto earliest = buffer->targets[buffer->clusters.front().front()].video_timestamp;
-		const bool continue_decode = have_last_target && !decoder_eof && earliest + 1e-9 >= last_target_timestamp &&
-		                             earliest - last_target_timestamp <= options.cluster_gap;
+		const auto &first_cluster = buffer->clusters.front();
+		const auto earliest = buffer->targets[first_cluster.front()].video_timestamp;
+		const auto latest = buffer->targets[first_cluster.back()].video_timestamp;
+		const bool continue_decode =
+		    have_last_target && have_cluster_start && !decoder_eof && earliest + 1e-9 >= last_target_timestamp &&
+		    earliest - last_target_timestamp <= options.cluster_gap &&
+		    EstimateFrameSpan(cluster_start_timestamp, latest, buffer->fps) <= LEROBOT_MAX_CLUSTER_FRAME_SPAN;
 		if (!continue_decode) {
 			StartCluster();
+		} else {
+			decode_frame_budget = DecodeFrameBudget(cluster_start_timestamp, latest, buffer->fps);
 		}
 	}
 
@@ -1151,6 +1194,11 @@ private:
 
 		const auto &cluster = buffer->clusters[cluster_position];
 		const auto earliest = buffer->targets[cluster.front()].video_timestamp;
+		const auto latest = buffer->targets[cluster.back()].video_timestamp;
+		decoded_frames_since_seek = 0;
+		cluster_start_timestamp = earliest;
+		have_cluster_start = true;
+		decode_frame_budget = DecodeFrameBudget(earliest, latest, buffer->fps);
 		const auto stream_time_base = av_q2d(video_stream->time_base);
 		if (!std::isfinite(stream_time_base) || stream_time_base <= 0 ||
 		    earliest > static_cast<double>(std::numeric_limits<int64_t>::max()) * stream_time_base) {
@@ -1193,14 +1241,15 @@ private:
 					throw InvalidInputException("FFmpeg returned non-monotonic timestamps for LeRobot video '%s'",
 					                            video_path);
 				}
-				decoded_frames_in_buffer++;
+				decoded_frames_since_seek++;
 				metrics.frames_decoded.fetch_add(1, std::memory_order_relaxed);
-				if ((decoded_frames_in_buffer & 255) == 0) {
+				if ((decoded_frames_since_seek & 255) == 0) {
 					CheckForInterrupt(context);
 				}
-				if (decoded_frames_in_buffer > LEROBOT_DECODE_FRAME_BUDGET) {
-					throw InvalidInputException("Exceeded the %d-frame decode budget while aligning LeRobot video '%s'",
-					                            LEROBOT_DECODE_FRAME_BUDGET, video_path);
+				if (decoded_frames_since_seek > decode_frame_budget) {
+					throw InvalidInputException(
+					    "Exceeded the %llu-frame per-seek decode budget while aligning LeRobot video '%s'",
+					    static_cast<unsigned long long>(decode_frame_budget), video_path);
 				}
 				return true;
 			}
@@ -1478,7 +1527,8 @@ private:
 	SwsContext *sws_context;
 	idx_t cluster_position;
 	idx_t target_position;
-	idx_t decoded_frames_in_buffer;
+	idx_t decoded_frames_since_seek;
+	idx_t decode_frame_budget;
 	bool demux_eof;
 	bool flush_sent;
 	bool decoder_eof;
@@ -1488,6 +1538,8 @@ private:
 	double current_timestamp;
 	bool have_last_target;
 	double last_target_timestamp;
+	bool have_cluster_start;
+	double cluster_start_timestamp;
 	bool have_converted_frame;
 	double converted_timestamp;
 	int converted_source_width;
@@ -1953,8 +2005,7 @@ void BuildTargetBuffers(ClientContext &context, const LerobotVideoTargetsBindDat
 	for (auto &shard_targets : targets_by_shard) {
 		idx_t position = 0;
 		while (position < shard_targets.second.size()) {
-			auto buffer = make_uniq<LerobotDecodeBuffer>();
-			buffer->shard_index = shard_targets.first;
+			auto buffer = make_uniq<LerobotDecodeBuffer>(shard_targets.first, bind_data.metadata->GetFPS());
 			const auto count =
 			    std::min<idx_t>(bind_data.options.target_buffer_size, shard_targets.second.size() - position);
 			buffer->targets.insert(buffer->targets.end(), shard_targets.second.begin() + position,
@@ -2296,8 +2347,7 @@ private:
 		if (entry == partial_buffers.end() || entry->second.targets.empty()) {
 			return;
 		}
-		auto buffer = make_uniq<LerobotDecodeBuffer>();
-		buffer->shard_index = shard_index;
+		auto buffer = make_uniq<LerobotDecodeBuffer>(shard_index, bind_data.metadata->GetFPS());
 		buffer->targets = std::move(entry->second.targets);
 		partial_buffers.erase(entry);
 		auto lru_entry = partial_lru_entries.find(shard_index);
