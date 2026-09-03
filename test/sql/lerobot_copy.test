@@ -160,6 +160,36 @@ FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_pairwise_block');
 ----
 true	true
 
+# A long, wide episode must stay inside DuckDB's buffer-manager budget. The
+# writer scans the spillable episode collection instead of retaining one
+# extension-owned double vector per feature dimension. Sixty-five dimensions
+# also cross the fixed 64-dimension statistics scratch batch.
+statement ok
+SET memory_limit = '64MB';
+
+statement ok
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'bounded'::VARCHAR AS task,
+           CAST(list_resize([(i % 100)::FLOAT], 65, (i % 100)::FLOAT) AS FLOAT[65])
+               AS "observation.state"
+    FROM range(100000) rows(i)
+) TO '{TEST_DIR}/lerobot_copy_bounded_stats' (
+    FORMAT lerobot,
+    FPS 30,
+    FEATURES '{"observation.state":{"dtype":"float32","shape":[65],"names":null}}'
+);
+
+query III
+SELECT length = 100000,
+       "stats/observation.state/min"[1] = 0,
+       "stats/observation.state/max"[65] = 99
+FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_bounded_stats');
+----
+true	true	true
+
+statement ok
+RESET memory_limit;
+
 statement ok
 COPY (
     SELECT 0::BIGINT AS episode_index, 'singleton'::VARCHAR AS task,

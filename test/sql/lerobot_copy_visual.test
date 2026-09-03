@@ -127,6 +127,63 @@ FROM read_text('{TEST_DIR}/lerobot_copy_video/meta/info.json');
 ----
 true	true	true
 
+# Each camera is spooled and encoded sequentially. The byte contract applies
+# to one raw frame, so multiple cameras and frames can exceed the configured
+# value cumulatively without retaining an episode-sized copy in memory.
+statement ok
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'multi camera'::VARCHAR AS task,
+           from_hex(repeat(CASE WHEN frame_index % 2 = 0 THEN '102030' ELSE '405060' END, 4096))
+               AS "observation.images.front",
+           from_hex(repeat(CASE WHEN frame_index % 2 = 0 THEN '706050' ELSE '302010' END, 4096))
+               AS "observation.images.wrist"
+    FROM range(12) frames(frame_index)
+    ORDER BY frame_index
+) TO '{TEST_DIR}/lerobot_copy_multi_camera' (
+    FORMAT lerobot,
+    FPS 10,
+    FEATURES '{"observation.images.front":{"dtype":"video","shape":[64,64,3],"names":["height","width","channels"]},"observation.images.wrist":{"dtype":"video","shape":[64,64,3],"names":["height","width","channels"]}}',
+    MAX_VISUAL_FRAME_BYTES 12288,
+    ENCODER_THREADS 1
+);
+
+query II
+SELECT count(*), count(DISTINCT regexp_extract(file, 'observation[.]images[.][^/]+'))
+FROM glob('{TEST_DIR}/lerobot_copy_multi_camera/videos/**/*.mp4');
+----
+2	2
+
+query III
+SELECT count(*), count(DISTINCT video_key), min(octet_length(image))
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_copy_multi_camera',
+    [0],
+    video_keys := ['observation.images.front', 'observation.images.wrist'],
+    frame_indices := [0, 11]
+);
+----
+4	2	12288
+
+statement error
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'too large'::VARCHAR AS task,
+           from_hex(repeat('102030', 4096)) AS "observation.images.front"
+) TO '{TEST_DIR}/lerobot_copy_visual_limit_failed' (
+    FORMAT lerobot,
+    FPS 10,
+    FEATURES '{"observation.images.front":{"dtype":"video","shape":[64,64,3],"names":["height","width","channels"]}}',
+    MAX_VISUAL_FRAME_BYTES 12287,
+    ENCODER_THREADS 1
+);
+----
+exceeding MAX_VISUAL_FRAME_BYTES=12287
+
+query I
+SELECT count(*)
+FROM glob('{TEST_DIR}/lerobot_copy_visual_limit_failed*');
+----
+0
+
 # Integer depth input is HWC uint16 little-endian in millimetres. It is
 # quantized with LeRobot's 12-bit logarithmic mapping and encoded losslessly.
 statement ok

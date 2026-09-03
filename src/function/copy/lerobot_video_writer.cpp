@@ -1,6 +1,7 @@
 #include "function/lerobot_video_writer.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 
 #include <cmath>
@@ -316,12 +317,13 @@ idx_t LerobotVisualWriter::ExpectedFrameBytes(idx_t width, idx_t height, Lerobot
 	return bytes * multiplier;
 }
 
-LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(const string &path, const vector<string> &frames,
+LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const string &path,
+                                                         const string &raw_frames_path, idx_t frame_count,
                                                          const LerobotVideoEncodeOptions &options) {
 #ifndef LEROBOT_HAVE_FFMPEG
 	throw MissingExtensionException("FORMAT lerobot video writing requires FFmpeg development libraries");
 #else
-	if (frames.empty()) {
+	if (frame_count == 0) {
 		throw InvalidInputException("Cannot encode an empty LeRobot video");
 	}
 	if (options.width > NumericLimits<int>::Maximum() || options.height > NumericLimits<int>::Maximum() ||
@@ -329,11 +331,14 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(const string &path, con
 		throw InvalidInputException("LeRobot video dimensions or FPS exceed FFmpeg limits");
 	}
 	const auto expected_size = ExpectedFrameBytes(options.width, options.height, options.raw_type);
-	for (const auto &frame : frames) {
-		if (frame.size() != expected_size) {
-			throw InvalidInputException("LeRobot visual frame has %llu bytes; expected %llu", frame.size(),
-			                            expected_size);
-		}
+	if (frame_count > NumericLimits<idx_t>::Maximum() / expected_size) {
+		throw InvalidInputException("LeRobot raw video spool size is too large");
+	}
+	const auto expected_file_size = frame_count * expected_size;
+	auto raw_frames = fs.OpenFile(raw_frames_path, FileFlags::FILE_FLAGS_READ);
+	if (raw_frames->GetFileSize() != expected_file_size) {
+		throw IOException("LeRobot raw video spool '%s' has %llu bytes; expected %llu", raw_frames_path,
+		                  raw_frames->GetFileSize(), expected_file_size);
 	}
 
 	const auto is_depth = options.raw_type != LerobotRawVisualType::RGB24;
@@ -430,13 +435,15 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(const string &path, con
 		}
 	}
 
-	for (idx_t frame_index = 0; frame_index < frames.size(); frame_index++) {
+	string raw_frame(expected_size, '\0');
+	for (idx_t frame_index = 0; frame_index < frame_count; frame_index++) {
+		raw_frames->Read(&raw_frame[0], expected_size, frame_index * expected_size);
 		ThrowOnFFmpegError(av_frame_make_writable(target_frame.get()), "make an encoder frame writable for", path);
 		if (is_depth) {
-			FillDepthFrame(frames[frame_index], options.raw_type, options.width, options.height, *target_frame);
+			FillDepthFrame(raw_frame, options.raw_type, options.width, options.height, *target_frame);
 		} else {
-			const uint8_t *source_data[] = {reinterpret_cast<const uint8_t *>(frames[frame_index].data()), nullptr,
-			                                nullptr, nullptr};
+			const uint8_t *source_data[] = {reinterpret_cast<const uint8_t *>(raw_frame.data()), nullptr, nullptr,
+			                                nullptr};
 			int source_lines[] = {NumericCast<int>(options.width * 3), 0, 0, 0};
 			const auto rows = sws_scale(scaler.get(), source_data, source_lines, 0, codec_context->height,
 			                            target_frame->data, target_frame->linesize);
@@ -447,17 +454,17 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(const string &path, con
 		}
 		target_frame->pts = NumericCast<int64_t>(frame_index);
 		ThrowOnFFmpegError(avcodec_send_frame(codec_context.get(), target_frame.get()), "submit a frame for", path);
-		DrainEncoder(*codec_context, *output, *stream, *packet, path, is_depth && frames.size() <= 2);
+		DrainEncoder(*codec_context, *output, *stream, *packet, path, is_depth && frame_count <= 2);
 	}
 	ThrowOnFFmpegError(avcodec_send_frame(codec_context.get(), nullptr), "flush the encoder for", path);
-	DrainEncoder(*codec_context, *output, *stream, *packet, path, is_depth && frames.size() <= 2);
+	DrainEncoder(*codec_context, *output, *stream, *packet, path, is_depth && frame_count <= 2);
 	ThrowOnFFmpegError(av_write_trailer(output.get()), "write the MP4 trailer for", path);
 
 	LerobotEncodedVideoInfo result;
 	result.codec = is_depth ? "hevc" : "av1";
 	result.pixel_format = is_depth ? "gray12le" : "yuv420p";
-	result.duration = static_cast<double>(frames.size()) / static_cast<double>(options.fps);
-	result.frame_count = frames.size();
+	result.duration = static_cast<double>(frame_count) / static_cast<double>(options.fps);
+	result.frame_count = frame_count;
 	return result;
 #endif
 }

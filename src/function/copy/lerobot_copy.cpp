@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -30,7 +31,9 @@ static const idx_t LEROBOT_DEFAULT_CHUNK_SIZE = 1000;
 static const double LEROBOT_DEFAULT_DATA_FILE_SIZE_MB = 100;
 static const double LEROBOT_DEFAULT_VIDEO_FILE_SIZE_MB = 200;
 static const idx_t LEROBOT_DEFAULT_METADATA_BUFFER_SIZE = 10;
+static const idx_t LEROBOT_DEFAULT_MAX_VISUAL_FRAME_BYTES = 64ULL * 1024ULL * 1024ULL;
 static const idx_t LEROBOT_QUANTILE_BIN_COUNT = 5000;
+static const idx_t LEROBOT_STATS_DIMENSION_BATCH_SIZE = 64;
 static const char *LEROBOT_CODEBASE_VERSION = "v3.0";
 static const char *LEROBOT_DATA_PATH = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet";
 static const char *LEROBOT_VIDEO_PATH = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4";
@@ -72,24 +75,6 @@ struct LerobotFeatureStats {
 	bool q90_is_float32 = false;
 	bool q99_is_float32 = false;
 	bool stddev_is_float32 = false;
-	int64_t count = 0;
-};
-
-struct LerobotStatsAccumulator {
-	explicit LerobotStatsAccumulator(idx_t width_p = 0) : values(width_p) {
-	}
-
-	void Add(const vector<double> &row) {
-		if (row.size() != values.size()) {
-			throw InternalException("LeRobot statistics width changed from %llu to %llu", values.size(), row.size());
-		}
-		for (idx_t index = 0; index < row.size(); index++) {
-			values[index].push_back(row[index]);
-		}
-		count++;
-	}
-
-	vector<vector<double>> values;
 	int64_t count = 0;
 };
 
@@ -501,6 +486,7 @@ struct LerobotCopyBindData : public FunctionData {
 	double data_file_size_mb = LEROBOT_DEFAULT_DATA_FILE_SIZE_MB;
 	double video_file_size_mb = LEROBOT_DEFAULT_VIDEO_FILE_SIZE_MB;
 	idx_t metadata_buffer_size = LEROBOT_DEFAULT_METADATA_BUFFER_SIZE;
+	idx_t max_visual_frame_bytes = LEROBOT_DEFAULT_MAX_VISUAL_FRAME_BYTES;
 	optional_idx encoder_threads;
 	string robot_type;
 	bool has_robot_type = false;
@@ -523,6 +509,7 @@ struct LerobotCopyBindData : public FunctionData {
 		result->data_file_size_mb = data_file_size_mb;
 		result->video_file_size_mb = video_file_size_mb;
 		result->metadata_buffer_size = metadata_buffer_size;
+		result->max_visual_frame_bytes = max_visual_frame_bytes;
 		result->encoder_threads = encoder_threads;
 		result->robot_type = robot_type;
 		result->has_robot_type = has_robot_type;
@@ -535,7 +522,8 @@ struct LerobotCopyBindData : public FunctionData {
 		return input_names == other.input_names && input_types == other.input_types && fps == other.fps &&
 		       features_json == other.features_json && chunks_size == other.chunks_size &&
 		       data_file_size_mb == other.data_file_size_mb && video_file_size_mb == other.video_file_size_mb &&
-		       metadata_buffer_size == other.metadata_buffer_size && encoder_threads == other.encoder_threads &&
+		       metadata_buffer_size == other.metadata_buffer_size &&
+		       max_visual_frame_bytes == other.max_visual_frame_bytes && encoder_threads == other.encoder_threads &&
 		       has_robot_type == other.has_robot_type && robot_type == other.robot_type;
 	}
 };
@@ -610,6 +598,14 @@ unique_ptr<FunctionData> LerobotCopyBind(ClientContext &context, CopyFunctionBin
 	}
 	result->chunks_size = static_cast<idx_t>(chunks_size);
 	result->metadata_buffer_size = static_cast<idx_t>(metadata_buffer_size);
+	const auto &max_visual_frame_bytes = GetSingleOption(input, "max_visual_frame_bytes", false);
+	if (!max_visual_frame_bytes.IsNull()) {
+		auto value = max_visual_frame_bytes.DefaultCastAs(LogicalType::UBIGINT).GetValue<uint64_t>();
+		if (value == 0 || value > NumericLimits<idx_t>::Maximum()) {
+			throw BinderException("LeRobot MAX_VISUAL_FRAME_BYTES must be a positive integer");
+		}
+		result->max_visual_frame_bytes = static_cast<idx_t>(value);
+	}
 	const auto &encoder_threads = GetSingleOption(input, "encoder_threads", false);
 	if (!encoder_threads.IsNull()) {
 		auto value = encoder_threads.DefaultCastAs(LogicalType::UBIGINT).GetValue<uint64_t>();
@@ -712,6 +708,7 @@ void LerobotCopyOptions(ClientContext &, CopyOptionsInput &input) {
 	input.options["data_files_size_in_mb"] = CopyOption(LogicalType::DOUBLE, CopyOptionMode::WRITE_ONLY);
 	input.options["video_files_size_in_mb"] = CopyOption(LogicalType::DOUBLE, CopyOptionMode::WRITE_ONLY);
 	input.options["metadata_buffer_size"] = CopyOption(LogicalType::UBIGINT, CopyOptionMode::WRITE_ONLY);
+	input.options["max_visual_frame_bytes"] = CopyOption(LogicalType::UBIGINT, CopyOptionMode::WRITE_ONLY);
 	input.options["encoder_threads"] = CopyOption(LogicalType::UBIGINT, CopyOptionMode::WRITE_ONLY);
 }
 
@@ -780,86 +777,205 @@ bool UsesFloat32Statistics(const LerobotFeature &feature) {
 	       feature.dtype == "int16" || feature.dtype == "uint8" || feature.dtype == "uint16" || feature.dtype == "bool";
 }
 
-double HistogramQuantile(const vector<double> &values, double minimum, double maximum, double quantile,
-                         bool use_float32, bool &is_float32_result) {
-	is_float32_result = use_float32;
-	if (values.size() < 2) {
-		if (use_float32) {
-			float sum = 0;
-			for (const auto value : values) {
-				sum += static_cast<float>(value);
-			}
-			return static_cast<double>(sum / static_cast<float>(values.size()));
-		}
-		double sum = 0;
-		for (const auto value : values) {
-			sum += value;
-		}
-		return sum / static_cast<double>(values.size());
+struct LerobotStatsRowReader {
+	virtual ~LerobotStatsRowReader() {
 	}
-	vector<int64_t> histogram(LEROBOT_QUANTILE_BIN_COUNT, 0);
-	vector<float> float_edges;
-	vector<double> double_edges;
-	if (use_float32) {
-		// NumPy 2.x keeps np.linspace's output in float32 when LeRobot feeds it
-		// float32 extrema. Preserve those rounded edges: interpolation itself is
-		// promoted to float64 by the histogram counters.
-		const auto low = static_cast<float>(minimum) - static_cast<float>(1e-10);
-		const auto high = static_cast<float>(maximum) + static_cast<float>(1e-10);
-		const auto step = (high - low) / static_cast<float>(LEROBOT_QUANTILE_BIN_COUNT);
-		float_edges.reserve(LEROBOT_QUANTILE_BIN_COUNT + 1);
-		for (idx_t index = 0; index <= LEROBOT_QUANTILE_BIN_COUNT; index++) {
-			// NumPy's float32 linspace performs its multiply and add as two
-			// separately rounded operations. Prevent the compiler from
-			// contracting them into an FMA.
-			volatile float product = static_cast<float>(index) * step;
-			auto edge = product;
-			edge += low;
-			float_edges.push_back(edge);
-		}
-		float_edges.back() = high;
-		for (const auto value : values) {
-			const auto input = static_cast<float>(value);
-			auto iterator = std::upper_bound(float_edges.begin(), float_edges.end(), input);
-			idx_t bin;
-			if (iterator == float_edges.begin()) {
-				bin = 0;
-			} else if (iterator == float_edges.end()) {
-				bin = LEROBOT_QUANTILE_BIN_COUNT - 1;
-			} else {
-				bin = NumericCast<idx_t>(iterator - float_edges.begin() - 1);
+
+	virtual idx_t Count() const = 0;
+	virtual void Next(vector<double> &row) = 0;
+};
+
+using LerobotStatsReaderFactory = std::function<unique_ptr<LerobotStatsRowReader>()>;
+
+template <class T>
+struct LerobotReductionTotals {
+	explicit LerobotReductionTotals(idx_t width) : sum(width, static_cast<T>(0)), square_sum(width, static_cast<T>(0)) {
+	}
+
+	vector<T> sum;
+	vector<T> square_sum;
+};
+
+void ReadStatsRow(LerobotStatsRowReader &reader, idx_t width, vector<double> &row) {
+	row.clear();
+	reader.Next(row);
+	if (row.size() != width) {
+		throw InternalException("LeRobot statistics width changed from %llu to %llu", width, row.size());
+	}
+}
+
+template <class T>
+T PrepareReductionValue(double raw_value, idx_t dimension, vector<double> &minimum, vector<double> &maximum) {
+	const auto value = static_cast<T>(raw_value);
+	if (!std::isfinite(value)) {
+		throw InvalidInputException("LeRobot numeric features cannot contain NaN or infinity");
+	}
+	minimum[dimension] = MinValue(minimum[dimension], static_cast<double>(value));
+	maximum[dimension] = MaxValue(maximum[dimension], static_cast<double>(value));
+	return value;
+}
+
+template <class T>
+LerobotReductionTotals<T> NumpyPairwiseStats(LerobotStatsRowReader &reader, idx_t row_width, idx_t dimension_offset,
+                                             idx_t width, idx_t count, vector<double> &minimum, vector<double> &maximum,
+                                             vector<double> &row) {
+	static const idx_t NUMPY_PAIRWISE_BLOCK_SIZE = 128;
+	LerobotReductionTotals<T> result(width);
+	if (count < 8) {
+		for (idx_t index = 0; index < count; index++) {
+			ReadStatsRow(reader, row_width, row);
+			for (idx_t dimension = 0; dimension < width; dimension++) {
+				const auto value =
+				    PrepareReductionValue<T>(row[dimension_offset + dimension], dimension, minimum, maximum);
+				volatile T product = value * value;
+				volatile T updated_sum = result.sum[dimension] + value;
+				volatile T updated_square_sum = result.square_sum[dimension] + product;
+				result.sum[dimension] = updated_sum;
+				result.square_sum[dimension] = updated_square_sum;
 			}
-			histogram[bin]++;
 		}
-	} else {
-		const auto low = minimum - 1e-10;
-		const auto high = maximum + 1e-10;
-		const auto step = (high - low) / static_cast<double>(LEROBOT_QUANTILE_BIN_COUNT);
-		double_edges.reserve(LEROBOT_QUANTILE_BIN_COUNT + 1);
-		for (idx_t index = 0; index <= LEROBOT_QUANTILE_BIN_COUNT; index++) {
-			// Keep multiply and add as separate IEEE operations, matching
-			// NumPy's in-place `y *= step; y += start` implementation.
-			volatile double product = static_cast<double>(index) * step;
-			auto edge = product;
-			edge += low;
-			double_edges.push_back(edge);
-		}
-		double_edges.back() = high;
-		for (const auto value : values) {
-			auto iterator = std::upper_bound(double_edges.begin(), double_edges.end(), value);
-			idx_t bin;
-			if (iterator == double_edges.begin()) {
-				bin = 0;
-			} else if (iterator == double_edges.end()) {
-				bin = LEROBOT_QUANTILE_BIN_COUNT - 1;
-			} else {
-				bin = NumericCast<idx_t>(iterator - double_edges.begin() - 1);
+		return result;
+	}
+	if (count <= NUMPY_PAIRWISE_BLOCK_SIZE) {
+		vector<vector<T>> accumulators(8, vector<T>(width));
+		vector<vector<T>> square_accumulators(8, vector<T>(width));
+		for (idx_t accumulator = 0; accumulator < 8; accumulator++) {
+			ReadStatsRow(reader, row_width, row);
+			for (idx_t dimension = 0; dimension < width; dimension++) {
+				const auto value =
+				    PrepareReductionValue<T>(row[dimension_offset + dimension], dimension, minimum, maximum);
+				volatile T product = value * value;
+				accumulators[accumulator][dimension] = value;
+				square_accumulators[accumulator][dimension] = product;
 			}
-			histogram[bin]++;
+		}
+		idx_t index;
+		for (index = 8; index < count - (count % 8); index += 8) {
+			for (idx_t accumulator = 0; accumulator < 8; accumulator++) {
+				ReadStatsRow(reader, row_width, row);
+				for (idx_t dimension = 0; dimension < width; dimension++) {
+					const auto value =
+					    PrepareReductionValue<T>(row[dimension_offset + dimension], dimension, minimum, maximum);
+					volatile T product = value * value;
+					volatile T updated_sum = accumulators[accumulator][dimension] + value;
+					volatile T updated_square_sum = square_accumulators[accumulator][dimension] + product;
+					accumulators[accumulator][dimension] = updated_sum;
+					square_accumulators[accumulator][dimension] = updated_square_sum;
+				}
+			}
+		}
+		for (idx_t dimension = 0; dimension < width; dimension++) {
+			// This is NumPy's exact eight-way collapse order from loops_utils.h.src.
+			volatile T sum_01 = accumulators[0][dimension] + accumulators[1][dimension];
+			volatile T sum_23 = accumulators[2][dimension] + accumulators[3][dimension];
+			volatile T sum_45 = accumulators[4][dimension] + accumulators[5][dimension];
+			volatile T sum_67 = accumulators[6][dimension] + accumulators[7][dimension];
+			volatile T sum_0123 = sum_01 + sum_23;
+			volatile T sum_4567 = sum_45 + sum_67;
+			volatile T sum = sum_0123 + sum_4567;
+			result.sum[dimension] = sum;
+
+			volatile T square_sum_01 = square_accumulators[0][dimension] + square_accumulators[1][dimension];
+			volatile T square_sum_23 = square_accumulators[2][dimension] + square_accumulators[3][dimension];
+			volatile T square_sum_45 = square_accumulators[4][dimension] + square_accumulators[5][dimension];
+			volatile T square_sum_67 = square_accumulators[6][dimension] + square_accumulators[7][dimension];
+			volatile T square_sum_0123 = square_sum_01 + square_sum_23;
+			volatile T square_sum_4567 = square_sum_45 + square_sum_67;
+			volatile T square_sum = square_sum_0123 + square_sum_4567;
+			result.square_sum[dimension] = square_sum;
+		}
+		for (; index < count; index++) {
+			ReadStatsRow(reader, row_width, row);
+			for (idx_t dimension = 0; dimension < width; dimension++) {
+				const auto value =
+				    PrepareReductionValue<T>(row[dimension_offset + dimension], dimension, minimum, maximum);
+				volatile T product = value * value;
+				volatile T updated_sum = result.sum[dimension] + value;
+				volatile T updated_square_sum = result.square_sum[dimension] + product;
+				result.sum[dimension] = updated_sum;
+				result.square_sum[dimension] = updated_square_sum;
+			}
+		}
+		return result;
+	}
+
+	auto left_count = count / 2;
+	left_count -= left_count % 8;
+	auto left = NumpyPairwiseStats<T>(reader, row_width, dimension_offset, width, left_count, minimum, maximum, row);
+	auto right =
+	    NumpyPairwiseStats<T>(reader, row_width, dimension_offset, width, count - left_count, minimum, maximum, row);
+	for (idx_t dimension = 0; dimension < width; dimension++) {
+		volatile T sum = left.sum[dimension] + right.sum[dimension];
+		volatile T square_sum = left.square_sum[dimension] + right.square_sum[dimension];
+		result.sum[dimension] = sum;
+		result.square_sum[dimension] = square_sum;
+	}
+	return result;
+}
+
+template <class T>
+struct LerobotHistogram {
+	LerobotHistogram(idx_t width, const vector<double> &minimum, const vector<double> &maximum)
+	    : counts(width, vector<int64_t>(LEROBOT_QUANTILE_BIN_COUNT, 0)),
+	      edges(width, vector<T>(LEROBOT_QUANTILE_BIN_COUNT + 1)) {
+		for (idx_t dimension = 0; dimension < width; dimension++) {
+			const auto low = static_cast<T>(minimum[dimension]) - static_cast<T>(1e-10);
+			const auto high = static_cast<T>(maximum[dimension]) + static_cast<T>(1e-10);
+			const auto step = (high - low) / static_cast<T>(LEROBOT_QUANTILE_BIN_COUNT);
+			for (idx_t index = 0; index <= LEROBOT_QUANTILE_BIN_COUNT; index++) {
+				// NumPy's linspace multiply and add are separately rounded.
+				volatile T product = static_cast<T>(index) * step;
+				auto edge = product;
+				edge += low;
+				edges[dimension][index] = edge;
+			}
+			edges[dimension].back() = high;
 		}
 	}
 
-	const auto target_count = quantile * static_cast<double>(values.size());
+	vector<vector<int64_t>> counts;
+	vector<vector<T>> edges;
+};
+
+template <class T>
+LerobotHistogram<T> BuildHistogram(const LerobotStatsReaderFactory &reader_factory, idx_t row_width,
+                                   idx_t dimension_offset, idx_t width, idx_t count, const vector<double> &minimum,
+                                   const vector<double> &maximum) {
+	LerobotHistogram<T> result(width, minimum, maximum);
+	auto reader = reader_factory();
+	if (reader->Count() != count) {
+		throw InternalException("LeRobot statistics reader count changed from %llu to %llu", count, reader->Count());
+	}
+	vector<double> row;
+	row.reserve(row_width);
+	for (idx_t index = 0; index < count; index++) {
+		ReadStatsRow(*reader, row_width, row);
+		for (idx_t dimension = 0; dimension < width; dimension++) {
+			const auto value = static_cast<T>(row[dimension_offset + dimension]);
+			if (!std::isfinite(value)) {
+				throw InvalidInputException("LeRobot numeric features cannot contain NaN or infinity");
+			}
+			const auto &edges = result.edges[dimension];
+			auto iterator = std::upper_bound(edges.begin(), edges.end(), value);
+			idx_t bin;
+			if (iterator == edges.begin()) {
+				bin = 0;
+			} else if (iterator == edges.end()) {
+				bin = LEROBOT_QUANTILE_BIN_COUNT - 1;
+			} else {
+				bin = NumericCast<idx_t>(iterator - edges.begin() - 1);
+			}
+			result.counts[dimension][bin]++;
+		}
+	}
+	return result;
+}
+
+template <class T>
+double HistogramQuantile(const vector<int64_t> &histogram, const vector<T> &edges, idx_t count, double quantile,
+                         bool use_float32, bool &is_float32_result) {
+	is_float32_result = use_float32;
+	const auto target_count = quantile * static_cast<double>(count);
 	int64_t cumulative = 0;
 	for (idx_t bin = 0; bin < histogram.size(); bin++) {
 		const auto before = cumulative;
@@ -867,173 +983,134 @@ double HistogramQuantile(const vector<double> &values, double minimum, double ma
 		if (static_cast<double>(cumulative) < target_count) {
 			continue;
 		}
-		if (bin == 0) {
-			return use_float32 ? static_cast<double>(float_edges[0]) : double_edges[0];
-		}
-		if (histogram[bin] == 0) {
-			return use_float32 ? static_cast<double>(float_edges[bin]) : double_edges[bin];
+		if (bin == 0 || histogram[bin] == 0) {
+			return static_cast<double>(edges[bin]);
 		}
 		const auto fraction = (target_count - static_cast<double>(before)) / static_cast<double>(histogram[bin]);
 		if (use_float32) {
 			is_float32_result = false;
-			const auto bin_width = float_edges[bin + 1] - float_edges[bin];
+			const auto bin_width = edges[bin + 1] - edges[bin];
 			volatile double interpolation = fraction * static_cast<double>(bin_width);
-			auto result = static_cast<double>(float_edges[bin]);
+			auto result = static_cast<double>(edges[bin]);
 			result += interpolation;
 			return result;
 		}
-		volatile double interpolation = fraction * (double_edges[bin + 1] - double_edges[bin]);
-		auto result = double_edges[bin];
+		volatile double interpolation = fraction * static_cast<double>(edges[bin + 1] - edges[bin]);
+		auto result = static_cast<double>(edges[bin]);
 		result += interpolation;
 		return result;
 	}
-	return use_float32 ? static_cast<double>(float_edges.back()) : double_edges.back();
+	return static_cast<double>(edges.back());
 }
 
 template <class T>
-T LoadNumpyReductionValue(const vector<double> &values, idx_t index, bool square) {
-	const auto value = static_cast<T>(values[index]);
-	if (!square) {
-		return value;
-	}
-	// `batch ** 2` is materialized before NumPy reduces it. Keep this
-	// multiplication in the input dtype rather than letting a wider accumulator
-	// or fused expression change the rounded element value.
-	volatile T product = value * value;
-	return product;
-}
-
-template <class T>
-T NumpyPairwiseSum(const vector<double> &values, idx_t offset, idx_t count, bool square) {
-	static const idx_t NUMPY_PAIRWISE_BLOCK_SIZE = 128;
-	if (count < 8) {
-		volatile T result = static_cast<T>(0);
-		for (idx_t index = 0; index < count; index++) {
-			result += LoadNumpyReductionValue<T>(values, offset + index, square);
-		}
-		return result;
-	}
-	if (count <= NUMPY_PAIRWISE_BLOCK_SIZE) {
-		T accumulators[8];
-		for (idx_t accumulator = 0; accumulator < 8; accumulator++) {
-			accumulators[accumulator] = LoadNumpyReductionValue<T>(values, offset + accumulator, square);
-		}
-		idx_t index;
-		for (index = 8; index < count - (count % 8); index += 8) {
-			for (idx_t accumulator = 0; accumulator < 8; accumulator++) {
-				volatile T updated = accumulators[accumulator] +
-				                     LoadNumpyReductionValue<T>(values, offset + index + accumulator, square);
-				accumulators[accumulator] = updated;
-			}
-		}
-		// This is NumPy's exact eight-way collapse order from loops_utils.h.src.
-		volatile T sum_01 = accumulators[0] + accumulators[1];
-		volatile T sum_23 = accumulators[2] + accumulators[3];
-		volatile T sum_45 = accumulators[4] + accumulators[5];
-		volatile T sum_67 = accumulators[6] + accumulators[7];
-		volatile T sum_0123 = sum_01 + sum_23;
-		volatile T sum_4567 = sum_45 + sum_67;
-		volatile T result = sum_0123 + sum_4567;
-		for (; index < count; index++) {
-			result += LoadNumpyReductionValue<T>(values, offset + index, square);
-		}
-		return result;
-	}
-
-	auto left_count = count / 2;
-	left_count -= left_count % 8;
-	const auto left = NumpyPairwiseSum<T>(values, offset, left_count, square);
-	const auto right = NumpyPairwiseSum<T>(values, offset + left_count, count - left_count, square);
-	volatile T result = left + right;
-	return result;
-}
-
-LerobotFeatureStats ComputeStats(const LerobotStatsAccumulator &input, const LerobotFeature &feature) {
-	if (input.count <= 0 || input.values.empty()) {
+LerobotFeatureStats ComputeStatsTyped(const LerobotStatsReaderFactory &reader_factory, idx_t width, idx_t output_count,
+                                      bool use_float32) {
+	if (width == 0 || output_count == 0) {
 		throw InternalException("Cannot compute empty LeRobot feature statistics");
 	}
+	auto count_reader = reader_factory();
+	const auto count = count_reader->Count();
+	if (count == 0 || count > static_cast<idx_t>(NumericLimits<int64_t>::Maximum())) {
+		throw InternalException("LeRobot statistics value count is empty or too large");
+	}
+	count_reader.reset();
 	LerobotFeatureStats result;
-	result.count = input.count;
-	const auto use_float32 = UsesFloat32Statistics(feature);
+	result.count = NumericCast<int64_t>(output_count);
 	result.q01_is_float32 = use_float32;
 	result.q10_is_float32 = use_float32;
 	result.q50_is_float32 = use_float32;
 	result.q90_is_float32 = use_float32;
 	result.q99_is_float32 = use_float32;
 	result.stddev_is_float32 = use_float32;
-	for (const auto &dimension : input.values) {
-		if (dimension.empty()) {
-			throw InternalException("Cannot compute an empty LeRobot statistic dimension");
+	result.min.reserve(width);
+	result.max.reserve(width);
+	result.mean.reserve(width);
+	result.stddev.reserve(width);
+	result.q01.reserve(width);
+	result.q10.reserve(width);
+	result.q50.reserve(width);
+	result.q90.reserve(width);
+	result.q99.reserve(width);
+
+	for (idx_t dimension_offset = 0; dimension_offset < width;) {
+		const auto batch_width = MinValue(LEROBOT_STATS_DIMENSION_BATCH_SIZE, width - dimension_offset);
+		auto reader = reader_factory();
+		if (reader->Count() != count) {
+			throw InternalException("LeRobot statistics reader count changed from %llu to %llu", count,
+			                        reader->Count());
 		}
-		auto minimum = use_float32 ? static_cast<double>(static_cast<float>(dimension[0])) : dimension[0];
-		auto maximum = minimum;
-		double mean;
-		double stddev;
-		if (use_float32) {
-			for (const auto raw_value : dimension) {
-				const auto value = static_cast<float>(raw_value);
-				if (!std::isfinite(value)) {
-					throw InvalidInputException("LeRobot numeric features cannot contain NaN or infinity");
-				}
-				minimum = MinValue(minimum, static_cast<double>(value));
-				maximum = MaxValue(maximum, static_cast<double>(value));
+		vector<double> minimum(batch_width, std::numeric_limits<double>::infinity());
+		vector<double> maximum(batch_width, -std::numeric_limits<double>::infinity());
+		vector<double> row;
+		row.reserve(width);
+		if (count == 1) {
+			ReadStatsRow(*reader, width, row);
+			for (idx_t dimension = 0; dimension < batch_width; dimension++) {
+				const auto value =
+				    PrepareReductionValue<T>(row[dimension_offset + dimension], dimension, minimum, maximum);
+				const auto output = static_cast<double>(value);
+				result.min.push_back(output);
+				result.max.push_back(output);
+				result.mean.push_back(output);
+				result.stddev.push_back(0);
+				result.q01.push_back(output);
+				result.q10.push_back(output);
+				result.q50.push_back(output);
+				result.q90.push_back(output);
+				result.q99.push_back(output);
 			}
-			if (dimension.size() == 1) {
-				// get_feature_stats uses its basic np.std path for a singleton,
-				// which returns zero without squaring a potentially huge value.
-				mean = minimum;
-				stddev = 0;
-			} else {
-				const auto sum = NumpyPairwiseSum<float>(dimension, 0, dimension.size(), false);
-				const auto square_sum = NumpyPairwiseSum<float>(dimension, 0, dimension.size(), true);
-				const auto float_mean = sum / static_cast<float>(dimension.size());
-				// RunningQuantileStats evaluates these NumPy expressions one at a
-				// time in float32. Materialize both operands so compiler FMA
-				// contraction cannot change the final ulp.
-				volatile float average_square = square_sum / static_cast<float>(dimension.size());
-				volatile float squared_mean = float_mean * float_mean;
-				const auto variance = MaxValue(0.0f, static_cast<float>(average_square - squared_mean));
-				mean = static_cast<double>(float_mean);
-				stddev = static_cast<double>(std::sqrt(variance));
-			}
-		} else {
-			for (const auto value : dimension) {
-				if (!std::isfinite(value)) {
-					throw InvalidInputException("LeRobot numeric features cannot contain NaN or infinity");
-				}
-				minimum = MinValue(minimum, value);
-				maximum = MaxValue(maximum, value);
-			}
-			if (dimension.size() == 1) {
-				mean = minimum;
-				stddev = 0;
-			} else {
-				const auto sum = NumpyPairwiseSum<double>(dimension, 0, dimension.size(), false);
-				const auto square_sum = NumpyPairwiseSum<double>(dimension, 0, dimension.size(), true);
-				mean = sum / static_cast<double>(dimension.size());
-				volatile double average_square = square_sum / static_cast<double>(dimension.size());
-				volatile double squared_mean = mean * mean;
-				const auto variance = MaxValue(0.0, static_cast<double>(average_square - squared_mean));
-				stddev = std::sqrt(variance);
-			}
+			dimension_offset += batch_width;
+			continue;
 		}
-		result.min.push_back(minimum);
-		result.max.push_back(maximum);
-		result.mean.push_back(mean);
-		result.stddev.push_back(stddev);
-		bool quantile_is_float32;
-		result.q01.push_back(HistogramQuantile(dimension, minimum, maximum, 0.01, use_float32, quantile_is_float32));
-		result.q01_is_float32 = result.q01_is_float32 && quantile_is_float32;
-		result.q10.push_back(HistogramQuantile(dimension, minimum, maximum, 0.10, use_float32, quantile_is_float32));
-		result.q10_is_float32 = result.q10_is_float32 && quantile_is_float32;
-		result.q50.push_back(HistogramQuantile(dimension, minimum, maximum, 0.50, use_float32, quantile_is_float32));
-		result.q50_is_float32 = result.q50_is_float32 && quantile_is_float32;
-		result.q90.push_back(HistogramQuantile(dimension, minimum, maximum, 0.90, use_float32, quantile_is_float32));
-		result.q90_is_float32 = result.q90_is_float32 && quantile_is_float32;
-		result.q99.push_back(HistogramQuantile(dimension, minimum, maximum, 0.99, use_float32, quantile_is_float32));
-		result.q99_is_float32 = result.q99_is_float32 && quantile_is_float32;
+
+		auto totals =
+		    NumpyPairwiseStats<T>(*reader, width, dimension_offset, batch_width, count, minimum, maximum, row);
+		for (idx_t dimension = 0; dimension < batch_width; dimension++) {
+			const auto mean = totals.sum[dimension] / static_cast<T>(count);
+			// RunningQuantileStats evaluates these expressions separately in the
+			// input dtype. Volatile prevents contraction from changing the last ulp.
+			volatile T average_square = totals.square_sum[dimension] / static_cast<T>(count);
+			volatile T squared_mean = mean * mean;
+			const auto variance = MaxValue(static_cast<T>(0), static_cast<T>(average_square - squared_mean));
+			result.min.push_back(minimum[dimension]);
+			result.max.push_back(maximum[dimension]);
+			result.mean.push_back(static_cast<double>(mean));
+			result.stddev.push_back(static_cast<double>(std::sqrt(variance)));
+		}
+
+		reader.reset();
+		auto histogram =
+		    BuildHistogram<T>(reader_factory, width, dimension_offset, batch_width, count, minimum, maximum);
+		for (idx_t dimension = 0; dimension < batch_width; dimension++) {
+			bool quantile_is_float32;
+			result.q01.push_back(HistogramQuantile(histogram.counts[dimension], histogram.edges[dimension], count, 0.01,
+			                                       use_float32, quantile_is_float32));
+			result.q01_is_float32 = result.q01_is_float32 && quantile_is_float32;
+			result.q10.push_back(HistogramQuantile(histogram.counts[dimension], histogram.edges[dimension], count, 0.10,
+			                                       use_float32, quantile_is_float32));
+			result.q10_is_float32 = result.q10_is_float32 && quantile_is_float32;
+			result.q50.push_back(HistogramQuantile(histogram.counts[dimension], histogram.edges[dimension], count, 0.50,
+			                                       use_float32, quantile_is_float32));
+			result.q50_is_float32 = result.q50_is_float32 && quantile_is_float32;
+			result.q90.push_back(HistogramQuantile(histogram.counts[dimension], histogram.edges[dimension], count, 0.90,
+			                                       use_float32, quantile_is_float32));
+			result.q90_is_float32 = result.q90_is_float32 && quantile_is_float32;
+			result.q99.push_back(HistogramQuantile(histogram.counts[dimension], histogram.edges[dimension], count, 0.99,
+			                                       use_float32, quantile_is_float32));
+			result.q99_is_float32 = result.q99_is_float32 && quantile_is_float32;
+		}
+		dimension_offset += batch_width;
 	}
 	return result;
+}
+
+LerobotFeatureStats ComputeStats(const LerobotStatsReaderFactory &reader_factory, idx_t width, idx_t output_count,
+                                 const LerobotFeature &feature) {
+	if (UsesFloat32Statistics(feature)) {
+		return ComputeStatsTyped<float>(reader_factory, width, output_count, true);
+	}
+	return ComputeStatsTyped<double>(reader_factory, width, output_count, false);
 }
 
 void MergeStats(LerobotFeatureStats &target, const LerobotFeatureStats &source) {
@@ -1186,37 +1263,174 @@ double ReadRawVisualValue(const string &frame, LerobotRawVisualType raw_type, id
 	return static_cast<double>(value);
 }
 
-LerobotStatsAccumulator BuildVisualStats(const LerobotFeature &feature, const vector<string> &frames,
-                                         LerobotRawVisualType raw_type) {
-	const auto channels = feature.shape[2];
-	const auto height = feature.shape[0];
-	const auto width = feature.shape[1];
-	LerobotStatsAccumulator result(channels);
-	const auto sampled_indices = SampleVisualFrameIndices(frames.size());
-	const auto largest_dimension = MaxValue(height, width);
-	idx_t step = 1;
-	if (largest_dimension >= 300) {
-		step = MaxValue<idx_t>(1, largest_dimension / 150);
+struct LerobotVisualSpool {
+	void Initialize(string path_p) {
+		path = std::move(path_p);
+		frame_size = 0;
+		frame_count = 0;
+		write_handle.reset();
 	}
-	for (const auto frame_index : sampled_indices) {
-		const auto &frame = frames[frame_index];
-		const auto expected = LerobotVisualWriter::ExpectedFrameBytes(width, height, raw_type);
-		if (frame.size() != expected) {
+
+	void Append(FileSystem &fs, const char *frame_data, idx_t size) {
+		if (!write_handle) {
+			fs.CreateDirectoriesRecursive(StringUtil::GetFilePath(path));
+			write_handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW |
+			                                     FileFlags::FILE_FLAGS_EXCLUSIVE_CREATE);
+			frame_size = size;
+		} else if (size != frame_size) {
+			throw InvalidInputException("LeRobot visual frames change size within an episode");
+		}
+		if (frame_count == NumericLimits<idx_t>::Maximum() ||
+		    frame_size > NumericLimits<idx_t>::Maximum() / (frame_count + 1)) {
+			throw InvalidInputException("LeRobot visual spool is too large");
+		}
+		auto written = write_handle->Write(const_cast<char *>(frame_data), size);
+		if (written < 0 || static_cast<idx_t>(written) != size) {
+			throw IOException("Failed to write a complete LeRobot visual frame to '%s'", path);
+		}
+		frame_count++;
+	}
+
+	void Close() {
+		if (!write_handle) {
+			return;
+		}
+		write_handle->Close();
+		write_handle.reset();
+	}
+
+	void Remove(FileSystem &fs) {
+		Close();
+		if (!path.empty() && fs.FileExists(path)) {
+			fs.RemoveFile(path);
+		}
+	}
+
+	string path;
+	unique_ptr<FileHandle> write_handle;
+	idx_t frame_size = 0;
+	idx_t frame_count = 0;
+};
+
+struct LerobotCollectionStatsReader : public LerobotStatsRowReader {
+	LerobotCollectionStatsReader(const ColumnDataCollection &collection_p, const LerobotFeature &feature_p,
+	                             idx_t width_p, idx_t fps_p)
+	    : collection(collection_p), feature(feature_p), width(width_p), fps(fps_p),
+	      generated_timestamp(!feature.user_defined && feature.name == "timestamp") {
+		if (!generated_timestamp) {
+			collection.InitializeScan(scan_state, {feature.output_index}, ColumnDataScanProperties::DISALLOW_ZERO_COPY);
+			collection.InitializeScanChunk(scan_state, chunk);
+		}
+	}
+
+	idx_t Count() const override {
+		return collection.Count();
+	}
+
+	void Next(vector<double> &row) override {
+		if (position >= Count()) {
+			throw InternalException("LeRobot statistics reader advanced past the collection");
+		}
+		if (generated_timestamp) {
+			row.push_back(static_cast<double>(position) / static_cast<double>(fps));
+			position++;
+			return;
+		}
+		while (chunk_position >= chunk.size()) {
+			if (!collection.Scan(scan_state, chunk)) {
+				throw InternalException("LeRobot statistics collection ended early");
+			}
+			chunk_position = 0;
+		}
+		FlattenNumericValue(chunk.GetValue(0, chunk_position++), row);
+		if (row.size() != width) {
+			throw InvalidInputException("LeRobot feature '%s' has %llu values; expected %llu", feature.name, row.size(),
+			                            width);
+		}
+		position++;
+	}
+
+	const ColumnDataCollection &collection;
+	const LerobotFeature &feature;
+	idx_t width;
+	idx_t fps;
+	bool generated_timestamp;
+	ColumnDataScanState scan_state;
+	DataChunk chunk;
+	idx_t chunk_position = 0;
+	idx_t position = 0;
+};
+
+struct LerobotVisualStatsReader : public LerobotStatsRowReader {
+	LerobotVisualStatsReader(FileSystem &fs, const LerobotFeature &feature_p, const LerobotVisualSpool &spool_p,
+	                         LerobotRawVisualType raw_type_p, const vector<idx_t> &sampled_indices_p, idx_t step_p)
+	    : feature(feature_p), spool(spool_p), raw_type(raw_type_p), sampled_indices(sampled_indices_p), step(step_p),
+	      sampled_height(1 + (feature.shape[0] - 1) / step), sampled_width(1 + (feature.shape[1] - 1) / step) {
+		const auto expected = LerobotVisualWriter::ExpectedFrameBytes(feature.shape[1], feature.shape[0], raw_type);
+		if (spool.frame_size != expected || spool.frame_count == 0) {
 			throw InvalidInputException("LeRobot visual feature '%s' changes raw frame type or dimensions",
 			                            feature.name);
 		}
-		for (idx_t y = 0; y < height; y += step) {
-			for (idx_t x = 0; x < width; x += step) {
-				for (idx_t channel = 0; channel < channels; channel++) {
-					const auto element = (y * width + x) * channels + channel;
-					result.values[channel].push_back(ReadRawVisualValue(frame, raw_type, element));
-				}
-			}
+		if (sampled_indices.empty()) {
+			throw InternalException("LeRobot visual statistics sample cannot be empty");
+		}
+		if (sampled_height > NumericLimits<idx_t>::Maximum() / sampled_width ||
+		    sampled_height * sampled_width > NumericLimits<idx_t>::Maximum() / sampled_indices.size()) {
+			throw InvalidInputException("LeRobot visual statistics sample is too large");
+		}
+		values_per_frame = sampled_height * sampled_width;
+		count = values_per_frame * sampled_indices.size();
+		read_handle = fs.OpenFile(spool.path, FileFlags::FILE_FLAGS_READ);
+		if (spool.frame_count > NumericLimits<idx_t>::Maximum() / spool.frame_size ||
+		    read_handle->GetFileSize() != spool.frame_count * spool.frame_size) {
+			throw IOException("LeRobot visual spool '%s' has an invalid size", spool.path);
 		}
 	}
-	result.count = NumericCast<int64_t>(sampled_indices.size());
-	return result;
-}
+
+	idx_t Count() const override {
+		return count;
+	}
+
+	void Next(vector<double> &row) override {
+		if (position >= count) {
+			throw InternalException("LeRobot visual statistics reader advanced past its sample");
+		}
+		const auto sample_index = position / values_per_frame;
+		if (sample_index != loaded_sample) {
+			if (frame.empty()) {
+				frame.resize(spool.frame_size);
+			}
+			const auto frame_index = sampled_indices[sample_index];
+			if (frame_index >= spool.frame_count) {
+				throw InternalException("LeRobot visual statistics sampled an invalid frame");
+			}
+			read_handle->Read(&frame[0], frame.size(), frame_index * frame.size());
+			loaded_sample = sample_index;
+		}
+		const auto pixel_index = position % values_per_frame;
+		const auto y = (pixel_index / sampled_width) * step;
+		const auto x = (pixel_index % sampled_width) * step;
+		const auto first_element = (y * feature.shape[1] + x) * feature.shape[2];
+		for (idx_t channel = 0; channel < feature.shape[2]; channel++) {
+			row.push_back(ReadRawVisualValue(frame, raw_type, first_element + channel));
+		}
+		position++;
+	}
+
+	const LerobotFeature &feature;
+	const LerobotVisualSpool &spool;
+	LerobotRawVisualType raw_type;
+	const vector<idx_t> &sampled_indices;
+	idx_t step;
+	idx_t sampled_height;
+	idx_t sampled_width;
+	idx_t values_per_frame = 0;
+	idx_t count = 0;
+	unique_ptr<FileHandle> read_handle;
+	string frame;
+	idx_t loaded_sample = DConstants::INVALID_INDEX;
+	idx_t position = 0;
+};
 
 void NormalizeRGBStats(LerobotFeatureStats &stats) {
 	static const double RGB_MAX = 255.0;
@@ -1381,6 +1595,9 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 			return;
 		}
 		try {
+			for (auto &spool : current_visual_spools) {
+				spool.Close();
+			}
 			data_writer.global_data.reset();
 			episodes_writer.global_data.reset();
 			tasks_writer.global_data.reset();
@@ -1404,17 +1621,17 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 		current_data = make_uniq<ColumnDataCollection>(context, bind.data_types,
 		                                               ColumnDataAllocatorType::BUFFER_MANAGER_ALLOCATOR);
 		current_data->InitializeAppend(current_data_append_state);
-		current_stats.clear();
-		current_stats.reserve(bind.features.size());
-		for (const auto &feature : bind.features) {
-			idx_t width = 0;
-			if (feature.HasStatistics()) {
-				width = feature.is_image || feature.is_video ? feature.shape[2] : ShapeWidth(feature.shape);
+		current_visual_spools.clear();
+		current_visual_spools.resize(bind.features.size());
+		for (idx_t feature_index = 0; feature_index < bind.features.size(); feature_index++) {
+			const auto &feature = bind.features[feature_index];
+			if (!feature.is_image && !feature.is_video) {
+				continue;
 			}
-			current_stats.emplace_back(width);
+			current_visual_spools[feature_index].Initialize(
+			    fs.JoinPath(stage_root, ".tmp/raw/" + std::to_string(feature_index) + "/episode-" +
+			                                std::to_string(current_episode) + ".raw"));
 		}
-		current_visual_frames.clear();
-		current_visual_frames.resize(bind.features.size());
 		current_video_routes.clear();
 		current_video_routes.resize(bind.features.size());
 		has_current_episode = true;
@@ -1449,33 +1666,17 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 		}
 	}
 
-	void AddStatsRow(DataChunk &output, idx_t row, idx_t frame_index) {
-		for (idx_t feature_index = 0; feature_index < bind.features.size(); feature_index++) {
-			auto &feature = bind.features[feature_index];
-			if (!feature.HasStatistics()) {
-				continue;
-			}
-			if (feature.is_image || feature.is_video) {
-				continue;
-			}
-			vector<double> values;
-			values.reserve(ShapeWidth(feature.shape));
-			if (!feature.user_defined && feature.name == "timestamp") {
-				// LeRobot computes statistics before Arrow casts the generated
-				// timestamp column to its declared float32 storage type.
-				values.push_back(static_cast<double>(frame_index) / static_cast<double>(bind.fps));
-			} else {
-				FlattenNumericValue(output.GetValue(feature.output_index, row), values);
-			}
-			current_stats[feature_index].Add(values);
-		}
-	}
-
 	void AppendRun(DataChunk &input, idx_t offset, idx_t count) {
 		DataChunk output;
 		output.Initialize(context, bind.data_types, count);
-		for (const auto &feature : bind.features) {
-			if (!feature.user_defined || feature.is_image || feature.is_video) {
+		vector<UnifiedVectorFormat> visual_formats(bind.features.size());
+		for (idx_t feature_index = 0; feature_index < bind.features.size(); feature_index++) {
+			const auto &feature = bind.features[feature_index];
+			if (feature.is_image || feature.is_video) {
+				input.data[feature.input_index].ToUnifiedFormat(input.size(), visual_formats[feature_index]);
+				continue;
+			}
+			if (!feature.user_defined) {
 				continue;
 			}
 			VectorOperations::Copy(input.data[feature.input_index], output.data[feature.output_index], offset + count,
@@ -1489,12 +1690,21 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 				if (!feature.is_image && !feature.is_video) {
 					continue;
 				}
-				auto value = input.GetValue(feature.input_index, input_row);
-				const auto &raw_value = StringValue::Get(value);
-				auto raw_frame = string(raw_value.data(), raw_value.size());
-				const auto raw_type = ResolveRawVisualType(feature_index, raw_frame.size());
-				current_visual_frames[feature_index].push_back(raw_frame);
+				const auto &format = visual_formats[feature_index];
+				const auto source_index = format.sel->get_index(input_row);
+				if (!format.validity.RowIsValid(source_index)) {
+					throw InvalidInputException("LeRobot feature '%s' must not contain NULL", feature.name);
+				}
+				const auto &raw_value = format.GetData<string_t>()[source_index];
+				if (raw_value.GetSize() > bind.max_visual_frame_bytes) {
+					throw InvalidInputException(
+					    "LeRobot visual feature '%s' frame has %llu bytes, exceeding MAX_VISUAL_FRAME_BYTES=%llu",
+					    feature.name, raw_value.GetSize(), bind.max_visual_frame_bytes);
+				}
+				const auto raw_type = ResolveRawVisualType(feature_index, raw_value.GetSize());
+				current_visual_spools[feature_index].Append(fs, raw_value.GetData(), raw_value.GetSize());
 				if (feature.is_image) {
+					string raw_frame(raw_value.GetData(), raw_value.GetSize());
 					auto encoded =
 					    LerobotVisualWriter::EncodeImage(raw_frame, feature.shape[1], feature.shape[0], raw_type);
 					output.data[feature.output_index].SetValue(
@@ -1528,9 +1738,6 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 			}
 		}
 		output.SetCardinality(count);
-		for (idx_t row = 0; row < count; row++) {
-			AddStatsRow(output, row, current_episode_frames + row);
-		}
 		current_data->Append(current_data_append_state, output);
 		current_episode_frames += count;
 	}
@@ -1616,8 +1823,12 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 			options.fps = bind.fps;
 			options.encoder_threads = bind.encoder_threads;
 			options.raw_type = visual_raw_types[feature_index];
-			auto encoded =
-			    LerobotVisualWriter::EncodeVideo(episode_path, current_visual_frames[feature_index], options);
+			const auto &spool = current_visual_spools[feature_index];
+			if (spool.frame_count != current_episode_frames) {
+				throw InternalException("LeRobot video spool has %llu frames for a %llu-frame episode",
+				                        spool.frame_count, current_episode_frames);
+			}
+			auto encoded = LerobotVisualWriter::EncodeVideo(fs, episode_path, spool.path, spool.frame_count, options);
 			if (encoded.frame_count != current_episode_frames) {
 				throw InternalException("LeRobot video encoder wrote %llu frames for a %llu-frame episode",
 				                        encoded.frame_count, current_episode_frames);
@@ -1676,6 +1887,45 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 			route.from_timestamp = from_timestamp;
 			route.to_timestamp = shard.duration;
 		}
+	}
+
+	void CloseVisualSpools() {
+		for (auto &spool : current_visual_spools) {
+			spool.Close();
+		}
+	}
+
+	void RemoveVisualSpools() {
+		for (auto &spool : current_visual_spools) {
+			spool.Remove(fs);
+		}
+	}
+
+	LerobotFeatureStats ComputeEpisodeStats(idx_t feature_index) {
+		const auto &feature = bind.features[feature_index];
+		if (feature.is_image || feature.is_video) {
+			const auto &spool = current_visual_spools[feature_index];
+			if (spool.frame_count != current_episode_frames || !visual_raw_types_present[feature_index]) {
+				throw InternalException("LeRobot visual feature '%s' has an incomplete episode spool", feature.name);
+			}
+			auto sampled_indices = SampleVisualFrameIndices(spool.frame_count);
+			const auto largest_dimension = MaxValue(feature.shape[0], feature.shape[1]);
+			idx_t step = 1;
+			if (largest_dimension >= 300) {
+				step = MaxValue<idx_t>(1, largest_dimension / 150);
+			}
+			LerobotStatsReaderFactory reader_factory = [&]() -> unique_ptr<LerobotStatsRowReader> {
+				return make_uniq<LerobotVisualStatsReader>(fs, feature, spool, visual_raw_types[feature_index],
+				                                           sampled_indices, step);
+			};
+			return ComputeStats(reader_factory, feature.shape[2], sampled_indices.size(), feature);
+		}
+
+		const auto width = ShapeWidth(feature.shape);
+		LerobotStatsReaderFactory reader_factory = [&]() -> unique_ptr<LerobotStatsRowReader> {
+			return make_uniq<LerobotCollectionStatsReader>(*current_data, feature, width, bind.fps);
+		};
+		return ComputeStats(reader_factory, width, current_episode_frames, feature);
 	}
 
 	void AddStatsToEpisodeRow(vector<Value> &row, const LerobotFeature &feature, const LerobotFeatureStats &stats) {
@@ -1769,25 +2019,29 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 		if (current_episode_frames == 0) {
 			throw InvalidInputException("LeRobot episodes cannot be empty");
 		}
-		EnsureDataWriter(current_episode_frames);
-		const auto episode_data_chunk = data_chunk_index;
-		const auto episode_data_file = data_file_index;
-		data_writer.Flush(context, std::move(current_data));
-		EncodeEpisodeVideos();
-
+		CloseVisualSpools();
 		vector<LerobotFeatureStats> episode_stats(bind.features.size());
 		for (idx_t feature_index = 0; feature_index < bind.features.size(); feature_index++) {
 			if (!bind.features[feature_index].HasStatistics()) {
 				continue;
 			}
 			const auto &feature = bind.features[feature_index];
-			if (feature.is_image || feature.is_video) {
-				current_stats[feature_index] =
-				    BuildVisualStats(feature, current_visual_frames[feature_index], visual_raw_types[feature_index]);
-			}
-			episode_stats[feature_index] = ComputeStats(current_stats[feature_index], feature);
+			episode_stats[feature_index] = ComputeEpisodeStats(feature_index);
 			if ((feature.is_image || feature.is_video) && !feature.is_depth) {
 				NormalizeRGBStats(episode_stats[feature_index]);
+			}
+		}
+
+		EnsureDataWriter(current_episode_frames);
+		const auto episode_data_chunk = data_chunk_index;
+		const auto episode_data_file = data_file_index;
+		data_writer.Flush(context, std::move(current_data));
+		EncodeEpisodeVideos();
+		RemoveVisualSpools();
+
+		for (idx_t feature_index = 0; feature_index < bind.features.size(); feature_index++) {
+			if (!bind.features[feature_index].HasStatistics()) {
+				continue;
 			}
 			MergeStats(dataset_stats[feature_index], episode_stats[feature_index]);
 			dataset_stats_present[feature_index] = true;
@@ -1977,10 +2231,9 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 	vector<string> tasks;
 	vector<string> current_episode_tasks;
 	unordered_set<string> current_episode_task_set;
-	vector<LerobotStatsAccumulator> current_stats;
 	vector<LerobotFeatureStats> dataset_stats;
 	vector<bool> dataset_stats_present;
-	vector<vector<string>> current_visual_frames;
+	vector<LerobotVisualSpool> current_visual_spools;
 	vector<LerobotRawVisualType> visual_raw_types;
 	vector<bool> visual_raw_types_present;
 	vector<LerobotVideoRoute> current_video_routes;

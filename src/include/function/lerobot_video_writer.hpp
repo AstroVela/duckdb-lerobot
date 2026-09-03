@@ -12,6 +12,8 @@
 
 namespace duckdb {
 
+class FileSystem;
+
 enum class LerobotRawVisualType : uint8_t { RGB24, DEPTH_UINT16, DEPTH_FLOAT32 };
 
 struct LerobotVideoEncodeOptions {
@@ -32,8 +34,8 @@ struct LerobotEncodedVideoInfo {
 struct LerobotVisualWriter {
 	static bool Available();
 
-	static LerobotEncodedVideoInfo EncodeVideo(const string &path, const vector<string> &frames,
-	                                           const LerobotVideoEncodeOptions &options);
+	static LerobotEncodedVideoInfo EncodeVideo(FileSystem &fs, const string &path, const string &raw_frames_path,
+	                                           idx_t frame_count, const LerobotVideoEncodeOptions &options);
 	static void ConcatenateVideos(const vector<string> &input_paths, const string &list_path,
 	                              const string &output_path);
 	static string EncodeImage(const string &raw_frame, idx_t width, idx_t height, LerobotRawVisualType raw_type);
