@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 namespace duckdb {
