@@ -389,3 +389,30 @@ SELECT *
 FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_incomplete_depth', refresh := true);
 ----
 uses a legacy depth marker; use info.is_depth_map instead
+
+# Duplicate video keys are rejected globally rather than only when their
+# occurrences happen to be adjacent in the source object.
+statement ok
+COPY (
+    SELECT 0 AS bootstrap, 1 AS payload
+) TO '{TEST_DIR}/lerobot_duplicate_video_key' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (
+    SELECT 0 AS bootstrap, 1 AS payload
+) TO '{TEST_DIR}/lerobot_duplicate_video_key/meta' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version,
+           'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet' AS data_path,
+           'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
+           30 AS fps,
+           json('{"observation.images.front":{"dtype":"video"},"observation.images.wrist":{"dtype":"video"},"observation.images.front":{"dtype":"video"}}') AS features
+) TO '{TEST_DIR}/lerobot_duplicate_video_key/meta/info.json' (FORMAT JSON, ARRAY false);
+
+statement error
+SELECT *
+FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_duplicate_video_key');
+----
+Duplicate LeRobot video feature key 'observation.images.front' in info.json

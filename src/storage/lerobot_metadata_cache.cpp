@@ -221,6 +221,7 @@ ParsedLerobotInfo ReadLerobotInfo(Connection &connection, const string &info_pat
 	}
 
 	ParsedLerobotInfo info;
+	unordered_set<string> video_keys_seen;
 	bool found_record = false;
 	while (true) {
 		auto chunk = info_result->Fetch();
@@ -253,6 +254,9 @@ ParsedLerobotInfo ReadLerobotInfo(Connection &connection, const string &info_pat
 				auto video_key = StringValue::Get(chunk->GetValue(5, row));
 				if (video_key.empty()) {
 					throw BinderException("LeRobot video feature keys must not be empty");
+				}
+				if (!video_keys_seen.insert(video_key).second) {
+					throw BinderException("Duplicate LeRobot video feature key '%s' in info.json", video_key);
 				}
 				if (!chunk->GetValue(13, row).IsNull() || !chunk->GetValue(14, row).IsNull()) {
 					throw BinderException(
@@ -327,11 +331,6 @@ ParsedLerobotInfo ReadLerobotInfo(Connection &connection, const string &info_pat
 	}
 	if (info.fps <= 0) {
 		throw BinderException("LeRobot info.json fps must be positive");
-	}
-	for (idx_t index = 1; index < info.video_keys.size(); index++) {
-		if (info.video_keys[index - 1] == info.video_keys[index]) {
-			throw BinderException("Duplicate LeRobot video feature key '%s' in info.json", info.video_keys[index]);
-		}
 	}
 	if (!info.video_keys.empty() && info.video_path_template.empty()) {
 		throw BinderException("LeRobot info.json requires video_path when video features are present");
