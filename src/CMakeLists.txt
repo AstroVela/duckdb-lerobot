@@ -1,6 +1,7 @@
 set(EXTENSION_SOURCES
     lerobot_extension.cpp
     function/lerobot_functions.cpp
+    function/lerobot_schema.cpp
     function/copy/lerobot_copy.cpp
     function/copy/lerobot_video_writer.cpp
     function/scan/lerobot_scan.cpp

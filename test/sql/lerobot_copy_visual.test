@@ -388,6 +388,9 @@ statement ok
 COPY (
     SELECT 'v3.0' AS codebase_version,
            10 AS fps,
+           1 AS total_episodes,
+           2 AS total_frames,
+           1 AS total_tasks,
            'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet' AS data_path,
            'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
            struct_pack(
@@ -428,6 +431,9 @@ statement ok
 COPY (
     SELECT 'v3.0' AS codebase_version,
            10 AS fps,
+           2 AS total_episodes,
+           4 AS total_frames,
+           2 AS total_tasks,
            'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet' AS data_path,
            'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
            struct_pack(

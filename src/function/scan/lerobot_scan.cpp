@@ -43,6 +43,29 @@ bool IsHuggingFaceRepoId(const string &root) {
 	return true;
 }
 
+LogicalType BinaryAsStringType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::BLOB:
+		return LogicalType::VARCHAR;
+	case LogicalTypeId::STRUCT: {
+		child_list_t<LogicalType> children;
+		for (const auto &child : StructType::GetChildTypes(type)) {
+			children.emplace_back(child.first, BinaryAsStringType(child.second));
+		}
+		return LogicalType::STRUCT(std::move(children));
+	}
+	case LogicalTypeId::LIST:
+		return LogicalType::LIST(BinaryAsStringType(ListType::GetChildType(type)));
+	case LogicalTypeId::ARRAY:
+		return LogicalType::ARRAY(BinaryAsStringType(ArrayType::GetChildType(type)), ArrayType::GetSize(type));
+	case LogicalTypeId::MAP:
+		return LogicalType::MAP(BinaryAsStringType(MapType::KeyType(type)),
+		                        BinaryAsStringType(MapType::ValueType(type)));
+	default:
+		return type;
+	}
+}
+
 string ScanSuffix(LerobotScanKind kind) {
 	switch (kind) {
 	case LerobotScanKind::INFO:
@@ -51,6 +74,8 @@ string ScanSuffix(LerobotScanKind kind) {
 		return "/meta/episodes/**/*.parquet";
 	case LerobotScanKind::TASKS:
 		return "/meta/tasks.parquet";
+	case LerobotScanKind::FRAMES:
+		return "/data/**/*.parquet";
 	default:
 		throw InternalException("Unknown LeRobot scan kind");
 	}
@@ -60,6 +85,16 @@ unique_ptr<MultiFileReader> CreateLerobotReader(LerobotScanKind kind, const Tabl
 	return make_uniq<LerobotMultiFileReader>(kind);
 }
 
+void LerobotScanSerialize(Serializer &, const optional_ptr<FunctionData>, const TableFunction &) {
+	// Match DuckDB Iceberg: a dataset-root reader cannot use parquet_scan's
+	// file-list serializer without losing the root and its metadata semantics.
+	throw NotImplementedException("LeRobot scan serialization is not implemented");
+}
+
+unique_ptr<FunctionData> LerobotScanDeserialize(Deserializer &, TableFunction &) {
+	throw NotImplementedException("LeRobot scan deserialization is not implemented");
+}
+
 void SetOutputCardinality(DataChunk &output, idx_t count) {
 	output.SetCardinality(count);
 }
@@ -67,11 +102,14 @@ void SetOutputCardinality(DataChunk &output, idx_t count) {
 TableFunctionSet CreateNativeScan(ExtensionLoader &loader, const char *source_name, const char *target_name,
                                   table_function_get_multi_file_reader_t create_reader) {
 	// Follow the Iceberg extension's scan construction: copy the native reader
-	// from the catalog, then inject only LeRobot's dataset-root expansion.
+	// from the catalog, then inject LeRobot's dataset-root expansion and its
+	// explicit serialization boundary.
 	auto &source = loader.GetTableFunction(source_name);
 	auto result = source.functions;
 	for (auto &function : result.functions) {
 		function.get_multi_file_reader = create_reader;
+		function.serialize = LerobotScanSerialize;
+		function.deserialize = LerobotScanDeserialize;
 		function.name = target_name;
 	}
 	result.name = target_name;
@@ -491,6 +529,12 @@ unique_ptr<TableRef> LerobotFramesBindReplace(ClientContext &context, TableFunct
 	auto root = NormalizeLerobotRoot(std::move(roots[0]));
 	bool cache_hit;
 	auto metadata = LerobotDatasetMetadata::Get(context, root, GetRefreshParameter(input), cache_hit);
+	if (metadata->GetDataFiles().empty()) {
+		// The original bind uses the LeRobot MultiFileReader to publish the
+		// info.json-derived schema without opening a nonexistent Parquet file.
+		input.named_parameters.erase("refresh");
+		return nullptr;
+	}
 	auto parquet_parameters = input.named_parameters;
 	parquet_parameters.erase("refresh");
 	return CreateTableFunctionRef("parquet_scan", CreatePathList(metadata->GetDataFiles()), parquet_parameters);
@@ -527,16 +571,153 @@ unique_ptr<MultiFileReader> LerobotMultiFileReader::CreateTasks(const TableFunct
 	return CreateLerobotReader(LerobotScanKind::TASKS, function);
 }
 
+unique_ptr<MultiFileReader> LerobotMultiFileReader::CreateFrames(const TableFunction &function) {
+	return CreateLerobotReader(LerobotScanKind::FRAMES, function);
+}
+
 vector<string> LerobotMultiFileReader::ParsePaths(const Value &input) {
 	auto roots = MultiFileReader::ParsePaths(input);
 	if (roots.size() != 1) {
 		throw BinderException("LeRobot scans require exactly one dataset root");
 	}
-	return {NormalizeLerobotRoot(std::move(roots[0])) + ScanSuffix(kind)};
+	root = NormalizeLerobotRoot(std::move(roots[0]));
+	return {root + ScanSuffix(kind)};
+}
+
+shared_ptr<MultiFileList> LerobotMultiFileReader::CreateFileList(ClientContext &context, const vector<string> &paths,
+                                                                 const FileGlobInput &glob_input) {
+	if (kind == LerobotScanKind::INFO) {
+		return MultiFileReader::CreateFileList(context, paths, glob_input);
+	}
+	if (root.empty()) {
+		throw InternalException("LeRobot dataset root was not parsed before file-list creation");
+	}
+	Value binary_setting;
+	if (context.TryGetCurrentSetting("binary_as_string", binary_setting)) {
+		binary_as_string = BooleanValue::Get(binary_setting);
+	}
+
+	auto info = ReadLerobotDatasetInfo(context, root);
+	int64_t expected_count;
+	const char *description;
+	switch (kind) {
+	case LerobotScanKind::EPISODES:
+		expected_count = info.total_episodes;
+		description = "episode metadata";
+		empty_names = std::move(info.episode_schema.names);
+		empty_types = std::move(info.episode_schema.types);
+		break;
+	case LerobotScanKind::TASKS:
+		expected_count = info.total_tasks;
+		description = "task metadata";
+		empty_names = {"task_index", "task"};
+		empty_types = {LogicalType::BIGINT, LogicalType::VARCHAR};
+		break;
+	case LerobotScanKind::FRAMES:
+		expected_count = info.total_frames;
+		description = "frame data";
+		empty_names = std::move(info.frame_schema.names);
+		empty_types = std::move(info.frame_schema.types);
+		break;
+	default:
+		throw InternalException("Unexpected LeRobot scan kind during file-list creation");
+	}
+
+	if (expected_count == 0) {
+		empty_dataset = true;
+		return MultiFileReader::CreateFileList(context, vector<string> {}, FileGlobOptions::ALLOW_EMPTY);
+	}
+	auto result = MultiFileReader::CreateFileList(context, paths, glob_input);
+	if (result->GetExpandResult() == FileExpandResult::NO_FILES) {
+		throw IOException("LeRobot info.json declares %lld %s rows, but no files were found", expected_count,
+		                  description);
+	}
+	return result;
+}
+
+bool LerobotMultiFileReader::ParseOption(const string &key, const Value &val, MultiFileOptions &options,
+                                         ClientContext &context) {
+	auto normalized_key = StringUtil::Lower(key);
+	if (normalized_key == "refresh") {
+		if (val.IsNull()) {
+			throw BinderException("refresh must not be NULL");
+		}
+		BooleanValue::Get(val);
+		return true;
+	}
+	if (normalized_key == "file_row_number") {
+		if (val.IsNull()) {
+			throw BinderException("file_row_number must not be NULL");
+		}
+		file_row_number = BooleanValue::Get(val);
+	}
+	if (normalized_key == "binary_as_string") {
+		if (val.IsNull()) {
+			throw BinderException("binary_as_string must not be NULL");
+		}
+		binary_as_string = BooleanValue::Get(val);
+	}
+	if (normalized_key == "schema") {
+		has_explicit_schema =
+		    !val.IsNull() && val.type().id() == LogicalTypeId::MAP && !ListValue::GetChildren(val).empty();
+	}
+	return MultiFileReader::ParseOption(key, val, options, context);
+}
+
+bool LerobotMultiFileReader::Bind(MultiFileOptions &options, MultiFileList &, vector<LogicalType> &return_types,
+                                  vector<string> &names, MultiFileReaderBindData &bind_data) {
+	if (!empty_dataset) {
+		return false;
+	}
+	if (has_explicit_schema) {
+		// Let the native Parquet binder validate and publish an explicit schema.
+		return false;
+	}
+	if (options.hive_partitioning) {
+		throw BinderException("hive_partitioning cannot be inferred for an empty LeRobot dataset");
+	}
+	options.auto_detect_hive_partitioning = false;
+	names = empty_names;
+	return_types = empty_types;
+	if (binary_as_string) {
+		for (auto &type : return_types) {
+			type = BinaryAsStringType(type);
+		}
+	}
+	if (file_row_number) {
+		if (StringUtil::CIFind(names, "file_row_number") != DConstants::INVALID_INDEX) {
+			throw BinderException(
+			    "Using file_row_number option on a schema with column named file_row_number is not supported");
+		}
+		names.push_back("file_row_number");
+		return_types.push_back(LogicalType::BIGINT);
+	}
+	bind_data.schema = MultiFileColumnDefinition::ColumnsFromNamesAndTypes(names, return_types);
+	if (file_row_number) {
+		bind_data.schema.back().identifier = Value::INTEGER(MultiFileReader::ORDINAL_FIELD_ID);
+	}
+	bind_data.mapping = MultiFileColumnMappingMode::BY_NAME;
+	return true;
 }
 
 unique_ptr<MultiFileReader> LerobotMultiFileReader::Copy() const {
-	return make_uniq<LerobotMultiFileReader>(kind);
+	auto result = make_uniq<LerobotMultiFileReader>(kind);
+	result->function_name = function_name;
+	result->root = root;
+	result->empty_names = empty_names;
+	result->empty_types = empty_types;
+	result->empty_dataset = empty_dataset;
+	result->has_explicit_schema = has_explicit_schema;
+	result->file_row_number = file_row_number;
+	result->binary_as_string = binary_as_string;
+	return std::move(result);
+}
+
+FileGlobInput LerobotMultiFileReader::GetGlobInput(MultiFileReaderInterface &interface) {
+	if (kind == LerobotScanKind::INFO) {
+		return MultiFileReader::GetGlobInput(interface);
+	}
+	return FileGlobInput(FileGlobOptions::ALLOW_EMPTY, "parquet");
 }
 
 TableFunctionSet LerobotFunctions::GetLayoutFunction() {
@@ -569,6 +750,9 @@ TableFunctionSet LerobotFunctions::GetFramesFunction(ExtensionLoader &loader) {
 	for (auto &function : result.functions) {
 		function.name = "lerobot_frames";
 		function.bind_replace = LerobotFramesBindReplace;
+		function.get_multi_file_reader = LerobotMultiFileReader::CreateFrames;
+		function.serialize = LerobotScanSerialize;
+		function.deserialize = LerobotScanDeserialize;
 		function.named_parameters["refresh"] = LogicalType::BOOLEAN;
 	}
 	result.name = "lerobot_frames";

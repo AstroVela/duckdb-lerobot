@@ -345,6 +345,133 @@ WHERE decode(key) = 'huggingface'
 ----
 2
 
+# Native LeRobot publishes info.json but no Parquet metadata or data files when
+# a newly created dataset has no episodes. FORMAT lerobot keeps that layout,
+# and every reader derives its empty schema from the committed info.json.
+statement ok
+COPY (
+    SELECT 0::BIGINT AS episode_index,
+           ''::VARCHAR AS task,
+           array_value(0::FLOAT, 0::FLOAT) AS "observation.state",
+           0::BIGINT AS action,
+           NULL::BLOB AS "observation.images.image",
+           NULL::BLOB AS "observation.images.video",
+           NULL::BLOB AS "observation.images.depth"
+    WHERE false
+) TO '{TEST_DIR}/lerobot_copy_empty' (
+    FORMAT lerobot,
+    FPS 30,
+    FEATURES '{"observation.state":{"dtype":"float32","shape":[2],"names":["x","y"]},"action":{"dtype":"int64","shape":[1],"names":null},"observation.images.image":{"dtype":"image","shape":[2,3,3],"names":["height","width","channels"]},"observation.images.video":{"dtype":"video","shape":[2,3,3],"names":["height","width","channels"]},"observation.images.depth":{"dtype":"video","shape":[2,3,1],"names":["height","width","channels"],"info":{"is_depth_map":true}}}'
+);
+
+query III
+SELECT total_episodes, total_frames, total_tasks
+FROM lerobot_info('{TEST_DIR}/lerobot_copy_empty');
+----
+0	0	0
+
+query IIII
+SELECT episode_count, data_file_count, video_key_count, fps = 30
+FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_copy_empty');
+----
+0	0	2	true
+
+query IIII
+SELECT video_key_count, route_count, video_file_count, fps = 30
+FROM lerobot_video_metadata_cache('{TEST_DIR}/lerobot_copy_empty');
+----
+2	0	0	true
+
+query III
+SELECT (SELECT count(*) FROM lerobot_frames('{TEST_DIR}/lerobot_copy_empty')),
+       (SELECT count(*) FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_empty')),
+       (SELECT count(*) FROM lerobot_tasks('{TEST_DIR}/lerobot_copy_empty'));
+----
+0	0	0
+
+query IIIII
+SELECT count(*) = 8,
+       count_if(column_name = 'observation.state' AND column_type = 'FLOAT[]') = 1,
+       count_if(column_name = 'action' AND column_type = 'BIGINT') = 1,
+       count_if(column_name = 'observation.images.image' AND contains(column_type, 'bytes BLOB')) = 1,
+       count_if(column_name = 'timestamp' AND column_type = 'FLOAT') = 1
+FROM (DESCRIBE SELECT * FROM lerobot_frames('{TEST_DIR}/lerobot_copy_empty'));
+----
+true	true	true	true	true
+
+query I
+SELECT count_if(column_name = 'observation.images.image' AND contains(column_type, 'bytes VARCHAR')) = 1
+FROM (DESCRIBE SELECT * FROM lerobot_frames(
+    '{TEST_DIR}/lerobot_copy_empty', binary_as_string := true
+));
+----
+true
+
+query IIIIII
+SELECT count(*) = 117,
+       count_if(column_name = 'videos/observation.images.video/from_timestamp' AND column_type = 'DOUBLE') = 1,
+       count_if(column_name = 'stats/action/min' AND column_type = 'BIGINT[]') = 1,
+       count_if(column_name = 'stats/action/mean' AND column_type = 'DOUBLE[]') = 1,
+       count_if(column_name = 'stats/observation.images.depth/q90' AND column_type = 'DOUBLE[][][]') = 1,
+       count_if(column_name = 'meta/episodes/file_index' AND column_type = 'BIGINT') = 1
+FROM (DESCRIBE SELECT * FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_empty'));
+----
+true	true	true	true	true	true
+
+query III
+SELECT count(*) = 2,
+       count_if(column_name = 'task_index' AND column_type = 'BIGINT') = 1,
+       count_if(column_name = 'task' AND column_type = 'VARCHAR') = 1
+FROM (DESCRIBE SELECT * FROM lerobot_tasks('{TEST_DIR}/lerobot_copy_empty'));
+----
+true	true	true
+
+query II
+SELECT count_if(column_name = 'filename' AND column_type = 'VARCHAR') = 1,
+       count_if(column_name = 'file_row_number' AND column_type = 'BIGINT') = 1
+FROM (DESCRIBE SELECT * FROM lerobot_frames(
+    '{TEST_DIR}/lerobot_copy_empty', filename := true, file_row_number := true
+));
+----
+true	true
+
+# Native Parquet explicit-schema binding remains available without a footer.
+query I
+SELECT count(*)
+FROM lerobot_frames(
+    '{TEST_DIR}/lerobot_copy_empty',
+    schema := map {0: {name: 'sample', type: 'INTEGER', default_value: NULL}},
+    filename := true,
+    file_row_number := true
+);
+----
+0
+
+query III
+SELECT count(*) = 3,
+       count_if(column_name = 'sample' AND column_type = 'INTEGER') = 1,
+       count_if(column_name IN ('filename', 'file_row_number')) = 2
+FROM (DESCRIBE SELECT * FROM lerobot_frames(
+    '{TEST_DIR}/lerobot_copy_empty',
+    schema := map {0: {name: 'sample', type: 'INTEGER', default_value: NULL}},
+    filename := true,
+    file_row_number := true
+));
+----
+true	true	true
+
+query I
+SELECT count(*)
+FROM lerobot_episode_frames('{TEST_DIR}/lerobot_copy_empty', []);
+----
+0
+
+query I
+SELECT count(*)
+FROM glob('{TEST_DIR}/lerobot_copy_empty/**/*.parquet');
+----
+0
+
 # Create-only publication prevents an accidental overwrite.
 statement error
 COPY (
@@ -424,3 +551,17 @@ COPY (
 );
 ----
 feature names must not contain '/'
+
+# DuckDB identifiers are case-insensitive. Generated feature names must use the
+# same rule so COPY cannot publish an ambiguous schema that its reader rejects.
+statement error
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'pick'::VARCHAR AS task,
+           0::FLOAT AS "Timestamp"
+) TO '{TEST_DIR}/lerobot_copy_reserved_feature_name' (
+    FORMAT lerobot,
+    FPS 10,
+    FEATURES '{"Timestamp":{"dtype":"float32","shape":[1]}}'
+);
+----
+feature 'Timestamp' is generated by FORMAT lerobot

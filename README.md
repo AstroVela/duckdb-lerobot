@@ -35,6 +35,13 @@ episode's `length` and data-shard mapping from `meta/episodes`. The cache
 resolves custom `data_path` templates and hands either the complete or selected
 deduplicated file list to DuckDB before Parquet binding.
 
+The current v3 `total_episodes`, `total_frames`, and `total_tasks` fields are
+authoritative. A zero-episode dataset has only its committed `meta/info.json`;
+no synthetic empty Parquet files are written. Metadata caches skip episode
+I/O, while frame, episode, and task scans bind zero-row schemas directly from
+`info.json.features`, including Parquet list types, image structs, video routes,
+and episode statistics.
+
 Video routing is available as a metadata-only second stage. It resolves each
 requested episode and video feature to its full MP4 path and timestamp range,
 without opening or decoding the MP4. Its episode-camera routes live in a
