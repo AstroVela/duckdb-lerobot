@@ -1,0 +1,149 @@
+name: Native CI
+
+on:
+  push:
+    branches:
+      - v1.5-variegata
+  pull_request:
+    branches:
+      - v1.5-variegata
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}
+  cancel-in-progress: true
+
+jobs:
+  native-tests:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: release-no-ffmpeg
+            name: Release / FFmpeg disabled
+            build_type: Release
+            ffmpeg: false
+            sanitizers: false
+            cmake_options: >-
+              -DLEROBOT_ENABLE_FFMPEG=OFF
+              -DENABLE_SANITIZER=OFF
+              -DENABLE_UBSAN=OFF
+          - id: release-ffmpeg
+            name: Release / FFmpeg enabled
+            build_type: Release
+            ffmpeg: true
+            sanitizers: false
+            cmake_options: >-
+              -DLEROBOT_ENABLE_FFMPEG=ON
+              -DENABLE_SANITIZER=OFF
+              -DENABLE_UBSAN=OFF
+          - id: sanitize-ffmpeg
+            name: ASAN + UBSAN / FFmpeg enabled
+            build_type: RelWithDebInfo
+            ffmpeg: true
+            sanitizers: true
+            cmake_options: >-
+              -DLEROBOT_ENABLE_FFMPEG=ON
+              -DFORCE_ASSERT=ON
+              -DENABLE_SANITIZER=ON
+              -DENABLE_UBSAN=ON
+
+    env:
+      CMAKE_GENERATOR: Ninja
+      JOBS: 4
+
+    steps:
+      - name: Check out the pinned DuckDB source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ccache ninja-build pkg-config
+
+      - name: Install FFmpeg development packages
+        if: matrix.ffmpeg
+        run: |
+          sudo apt-get install -y -qq \
+            ffmpeg \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libdav1d-dev \
+            libsvtav1-dev \
+            libswscale-dev \
+            libx265-dev
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: >-
+            native-${{ runner.os }}-duckdb-1.5.5-${{ matrix.id }}-${{ github.sha }}
+          restore-keys: |
+            native-${{ runner.os }}-duckdb-1.5.5-${{ matrix.id }}-
+
+      - name: Build and run the complete extension suite
+        env:
+          BUILD_DIR: build/${{ matrix.id }}
+          BUILD_TYPE: ${{ matrix.build_type }}
+          EXTRA_CMAKE_ARGS: >-
+            ${{ matrix.cmake_options }}
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+        run: |
+          ccache --max-size=750M
+          ccache --zero-stats
+          if [[ "${{ matrix.ffmpeg }}" == "true" ]]; then
+            export LEROBOT_FFMPEG_TESTS=1
+          fi
+          if [[ "${{ matrix.sanitizers }}" == "true" ]]; then
+            export ASAN_OPTIONS='detect_leaks=0:halt_on_error=1'
+            export UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1'
+          fi
+          make test \
+            BUILD_DIR="${BUILD_DIR}" \
+            BUILD_TYPE="${BUILD_TYPE}" \
+            JOBS="${JOBS}" \
+            EXTRA_CMAKE_ARGS="${EXTRA_CMAKE_ARGS}"
+          ccache --show-stats
+
+      - name: Verify pinned build configuration
+        env:
+          BUILD_DIR: build/${{ matrix.id }}
+        run: |
+          expected_duckdb_commit="$(git ls-tree HEAD duckdb | awk '{print $3}')"
+          test "${expected_duckdb_commit}" = 'd8cdaa33fda8df955cc76ef58a280f68f4cd43fa'
+          test "$(git -C duckdb rev-parse HEAD)" = "${expected_duckdb_commit}"
+          grep -Fxq 'CMAKE_CXX_STANDARD:STRING=11' "${BUILD_DIR}/CMakeCache.txt"
+          if [[ "${{ matrix.ffmpeg }}" == "true" ]]; then
+            grep -q -- '-DLEROBOT_HAVE_FFMPEG=1' "${BUILD_DIR}/compile_commands.json"
+          else
+            ! grep -q -- '-DLEROBOT_HAVE_FFMPEG=1' "${BUILD_DIR}/compile_commands.json"
+          fi
+          if [[ "${{ matrix.sanitizers }}" == "true" ]]; then
+            grep -q -- '-fsanitize=address' "${BUILD_DIR}/compile_commands.json"
+            grep -q -- '-fsanitize=undefined' "${BUILD_DIR}/compile_commands.json"
+          fi
+
+      - name: Reject generated or build files outside ignored paths
+        run: |
+          if git ls-files | grep -Eq '(^|/)(build|cmake-build-[^/]*|duckdb_unittest_tempdir|__pycache__)(/|$)|[.]pyc$'; then
+            echo 'Tracked build artifact detected'
+            exit 1
+          fi
+          if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
+            git status --short --untracked-files=all
+            echo 'Build generated an unignored repository file'
+            exit 1
+          fi

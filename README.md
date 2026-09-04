@@ -401,6 +401,19 @@ H.264 decode test explicitly with:
 LEROBOT_FFMPEG_TESTS=1 make test
 ```
 
+The native CI matrix pins the DuckDB submodule at v1.5.5/C++11 and runs three
+configurations on Ubuntu 24.04: a metadata-only release build, an FFmpeg-enabled
+release build with every visual test enabled, and an FFmpeg-enabled
+ASAN+UBSAN build. CMake options can be reproduced locally without replacing the
+project's standard configure command, for example:
+
+```bash
+LEROBOT_FFMPEG_TESTS=1 make test \
+  BUILD_DIR=build/sanitize \
+  BUILD_TYPE=RelWithDebInfo \
+  EXTRA_CMAKE_ARGS="-DLEROBOT_ENABLE_FFMPEG=ON -DFORCE_ASSERT=ON -DENABLE_SANITIZER=ON -DENABLE_UBSAN=ON"
+```
+
 `frame_indices` is the pre-decode sampling control for the low-level frame API;
 training reads should normally use `lerobot_video_windows`. `tolerance`
 defaults to `1e-4` seconds like native LeRobot, `cluster_gap` defaults to 10
