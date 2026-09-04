@@ -61,12 +61,16 @@ def copy_sql(
     pixels = height * width
     camera_columns = []
     for index, camera in enumerate(cameras):
-        red = (31 + index * 47) % 256
-        green = (73 + index * 29) % 256
-        blue = (113 + index * 61) % 256
-        pixel = f"{red:02x}{green:02x}{blue:02x}"
+        # Multiplication by an odd number permutes the 24-bit color space. The
+        # combined frame/camera ordinal therefore yields deterministic, widely
+        # separated colors without repeating within realistic benchmark sizes.
+        color = (
+            f"((row_index * {camera_count} + {index}) * 2654435761 + 104729) "
+            "% 16777216"
+        )
         camera_columns.append(
-            f"from_hex(repeat('{pixel}', {pixels})) AS {sql_identifier(camera)}"
+            f"from_hex(repeat(printf('%06x', ({color})::UBIGINT), {pixels})) "
+            f"AS {sql_identifier(camera)}"
         )
     columns = ",\n               ".join(camera_columns)
     return f"""
@@ -99,7 +103,7 @@ def process_counters(pid: int) -> dict[str, int]:
         pass
     try:
         for line in Path(f"/proc/{pid}/status").read_text().splitlines():
-            if line.startswith("VmRSS:"):
+            if line.startswith("VmHWM:"):
                 result["peak_rss_bytes"] = int(line.split()[1]) * 1024
                 break
     except (OSError, ValueError, IndexError):
