@@ -1,0 +1,251 @@
+# name: test/sql/lerobot_video_pipeline.test
+# description: Bounded parallel timestamp producers feed LeRobot video source consumers
+# group: [lerobot]
+
+require parquet
+
+require json
+
+require lerobot
+
+statement ok
+COPY (SELECT 0 AS bootstrap, 1 AS payload)
+TO '{TEST_DIR}/lerobot_video_pipeline' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (SELECT 0 AS bootstrap, 1 AS payload)
+TO '{TEST_DIR}/lerobot_video_pipeline/meta' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version,
+           'data-{file_index:03d}.parquet' AS data_path,
+           'video-{file_index:03d}.mp4' AS video_path,
+           2 AS fps,
+           2 AS total_episodes,
+           4 AS total_frames,
+           0 AS total_tasks,
+           struct_pack(
+               "observation.images.front" := struct_pack(dtype := 'video'),
+               "observation.images.wrist" := struct_pack(dtype := 'video')
+           ) AS features
+) TO '{TEST_DIR}/lerobot_video_pipeline/meta/info.json' (FORMAT JSON, ARRAY false);
+
+statement ok
+COPY (
+    SELECT episodes.*, 0 AS metadata_chunk FROM (VALUES
+        (0::BIGINT, 2::BIGINT, 0::BIGINT, 0::BIGINT,
+         0::BIGINT, 0::BIGINT, 0.0::DOUBLE, 0.5::DOUBLE,
+         0::BIGINT, 2::BIGINT, 0.0::DOUBLE, 0.5::DOUBLE),
+        (1::BIGINT, 2::BIGINT, 0::BIGINT, 1::BIGINT,
+         0::BIGINT, 1::BIGINT, 0.0::DOUBLE, 0.5::DOUBLE,
+         0::BIGINT, 3::BIGINT, 0.0::DOUBLE, 0.5::DOUBLE)
+    ) AS episodes(
+        episode_index,
+        length,
+        "data/chunk_index",
+        "data/file_index",
+        "videos/observation.images.front/chunk_index",
+        "videos/observation.images.front/file_index",
+        "videos/observation.images.front/from_timestamp",
+        "videos/observation.images.front/to_timestamp",
+        "videos/observation.images.wrist/chunk_index",
+        "videos/observation.images.wrist/file_index",
+        "videos/observation.images.wrist/from_timestamp",
+        "videos/observation.images.wrist/to_timestamp"
+    )
+) TO '{TEST_DIR}/lerobot_video_pipeline/meta/episodes'
+  (FORMAT PARQUET, PARTITION_BY ('metadata_chunk'));
+
+statement ok
+COPY (
+    SELECT * FROM (VALUES
+        (0::BIGINT, 0::BIGINT, 0.0::DOUBLE),
+        (0::BIGINT, 1::BIGINT, 0.5::DOUBLE)
+    ) AS frames(episode_index, frame_index, timestamp)
+) TO '{TEST_DIR}/lerobot_video_pipeline/data-000.parquet' (FORMAT PARQUET);
+
+statement ok
+COPY (
+    SELECT * FROM (VALUES
+        (1::BIGINT, 0::BIGINT, 0.0::DOUBLE),
+        (1::BIGINT, 1::BIGINT, 0.5::DOUBLE)
+    ) AS frames(episode_index, frame_index, timestamp)
+) TO '{TEST_DIR}/lerobot_video_pipeline/data-001.parquet' (FORMAT PARQUET);
+
+# Metadata-only scans never open these files, but the paths must exist for
+# dataset fingerprint validation.
+statement ok
+COPY (SELECT unhex('00') AS content)
+TO '{TEST_DIR}/lerobot_video_pipeline/video-000.mp4' (FORMAT BLOB);
+
+statement ok
+COPY (SELECT unhex('00') AS content)
+TO '{TEST_DIR}/lerobot_video_pipeline/video-001.mp4' (FORMAT BLOB);
+
+statement ok
+COPY (SELECT unhex('00') AS content)
+TO '{TEST_DIR}/lerobot_video_pipeline/video-002.mp4' (FORMAT BLOB);
+
+statement ok
+COPY (SELECT unhex('00') AS content)
+TO '{TEST_DIR}/lerobot_video_pipeline/video-003.mp4' (FORMAT BLOB);
+
+statement ok
+SET threads = 4;
+
+# Two data files create two independently owned source queries. A one-target
+# bound exercises producer deschedule/reschedule and multi-producer fan-in.
+query IIRRT rowsort
+SELECT episode_index, frame_index, timestamp, video_timestamp, video_path
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_pipeline',
+    [0, 1],
+    video_keys := ['observation.images.front'],
+    producer_threads := 2,
+    target_buffer_size := 1,
+    max_pending_targets := 1
+);
+----
+0	0	0.0	0.0	{TEST_DIR}/lerobot_video_pipeline/video-000.mp4
+0	1	0.5	0.5	{TEST_DIR}/lerobot_video_pipeline/video-000.mp4
+1	0	0.0	0.0	{TEST_DIR}/lerobot_video_pipeline/video-001.mp4
+1	1	0.5	0.5	{TEST_DIR}/lerobot_video_pipeline/video-001.mp4
+
+query IIIIR
+SELECT request_id, request_ordinal, episode_index, target_frame_index, timestamp
+FROM lerobot_video_windows(
+    '{TEST_DIR}/lerobot_video_pipeline',
+    [struct_pack(request_id := 10::BIGINT, episode_index := 0::BIGINT, frame_index := 0::BIGINT),
+     struct_pack(request_id := 20::BIGINT, episode_index := 1::BIGINT, frame_index := 1::BIGINT)],
+    video_keys := ['observation.images.front'],
+    delta_timestamps := [0.0],
+    producer_threads := 2,
+    target_buffer_size := 1,
+    max_pending_targets := 1
+)
+ORDER BY request_ordinal;
+----
+10	0	0	0	0.0
+20	1	1	1	0.5
+
+statement ok
+PRAGMA enable_profiling='json';
+
+statement ok
+SET profiling_output = '{TEST_DIR}/lerobot_video_pipeline/profile.json';
+
+query I
+SELECT count(*)
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_pipeline',
+    [0, 1],
+    producer_threads := 2,
+    target_buffer_size := 1,
+    max_pending_targets := 1
+);
+----
+8
+
+statement ok
+PRAGMA disable_profiling;
+
+query I
+SELECT CAST(
+    contains(content, 'LeRobot Source Queries') AND
+    contains(content, 'LeRobot Producer Tasks') AND
+    contains(content, 'LeRobot Producer Waits') AND
+    contains(content, 'LeRobot Consumer Waits') AND
+    contains(content, '"LeRobot Source Queries": "2"') AND
+    contains(content, '"LeRobot Producer Tasks": "2"') AND
+    contains(content, '"LeRobot Queue High Watermark": "1"')
+AS INTEGER)
+FROM read_text('{TEST_DIR}/lerobot_video_pipeline/profile.json');
+----
+1
+
+# In synchronous scan mode the only DuckDB thread drives queued producer tasks
+# itself; waiting on a condition variable here would deadlock.
+statement ok
+SET threads = 1;
+
+statement ok
+SET debug_physical_table_scan_execution_strategy = 'synchronous';
+
+query I
+SELECT count(*)
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_pipeline',
+    [0, 1],
+    video_keys := ['observation.images.front'],
+    producer_threads := 2,
+    target_buffer_size := 1,
+    max_pending_targets := 1
+);
+----
+4
+
+statement ok
+SET debug_physical_table_scan_execution_strategy = 'default';
+
+# LIMIT must cancel/deschedule producers without poisoning the next query on
+# the same connection.
+query I
+SELECT episode_index
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_pipeline',
+    [0, 1],
+    video_keys := ['observation.images.front'],
+    producer_threads := 2,
+    target_buffer_size := 1,
+    max_pending_targets := 1
+)
+LIMIT 1;
+----
+0
+
+query I
+SELECT count(*)
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_pipeline',
+    [0, 1],
+    video_keys := ['observation.images.front'],
+    producer_threads := 2,
+    target_buffer_size := 1,
+    max_pending_targets := 1
+);
+----
+4
+
+statement error
+SELECT *
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_pipeline',
+    [0],
+    producer_threads := 0
+);
+----
+producer_threads must be between 1
+
+# A failure inside one background query is published to consumers and cancels
+# the other producer instead of being mistaken for source exhaustion.
+statement ok
+COPY (
+    SELECT 1::BIGINT AS episode_index,
+           0::BIGINT AS frame_index,
+           'not-a-number'::VARCHAR AS timestamp
+) TO '{TEST_DIR}/lerobot_video_pipeline/data-001.parquet'
+  (FORMAT PARQUET, OVERWRITE_OR_IGNORE TRUE);
+
+statement error
+SELECT count(*)
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_pipeline',
+    [0, 1],
+    video_keys := ['observation.images.front'],
+    producer_threads := 2,
+    target_buffer_size := 1,
+    max_pending_targets := 1
+);
+----
+Failed to read LeRobot frame timestamps

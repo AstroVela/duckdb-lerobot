@@ -398,9 +398,13 @@ call at 64 MiB (a single larger frame is still emitted).
 
 `target_buffer_size` defaults to 256 alignment targets per shard buffer.
 `max_cached_decoders` defaults to 8 decoder sessions, while
-`decode_threads` independently defaults to 8 workers. `max_pending_targets`
-defaults to twice `target_buffer_size * decode_threads`; the scheduler flushes
-the least-recently-used partial shard buffer before crossing that bound.
+`decode_threads` independently defaults to 8 workers. Source timestamp reads
+are partitioned by routed Parquet file and run on up to 4 background producer
+tasks by default; set `producer_threads` independently to change that limit.
+`max_pending_targets` defaults to twice `target_buffer_size * decode_threads`;
+producers deschedule at that strict queue bound and consumers reschedule them
+after taking a buffer. A partial shard buffer is published before a producer
+blocks so even a one-target bound can always make progress.
 `max_open_shards` remains a deprecated compatibility alias for
 `max_cached_decoders`. Actual concurrent decoder work cannot exceed either the
 worker or decoder-session limit, but changing one no longer silently rewrites
@@ -416,9 +420,10 @@ source APIs also evaluate pushed output filters themselves. RGB and dequantized
 depth data are written directly into DuckDB `BLOB` vectors.
 
 With JSON profiling enabled, `lerobot_video_frames` and
-`lerobot_video_windows` publish targets, decoder acquires/cache hits/opens/
-evictions, decoder seeks, AVIO seeks, video bytes read, frames decoded, RGB
-and depth conversions, and same-frame fan-out hits. See the
+`lerobot_video_windows` publish source query/task/chunk counts, producer and
+consumer waits, queue high-watermark, targets, decoder acquires/cache
+hits/opens/evictions, decoder seeks, AVIO seeks, video bytes read, frames
+decoded, RGB and depth conversions, and same-frame fan-out hits. See the
 [A/B benchmark harness](benchmark/README.md) for matching DuckDB, Daft, and
 native LeRobot runs and the current adaptive-threshold/hardware-decode decision
 gates.

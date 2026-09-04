@@ -116,7 +116,9 @@ The timed DuckDB query exercises `lerobot_video_targets`. Its profiler pass
 replays the same selection through `lerobot_video_frames`, because DuckDB's
 source-table profiler hook exposes per-worker decoder metrics there. The result
 records this distinction in `profile_scope`; profiler timing is not the timed
-relation result.
+relation result. Use `--producer-threads 1` and `--producer-threads 4` on a
+multi-data-file fixture to compare serial and parallel source production; the
+profile records source query/task/chunk counts, waits, and queue high-watermark.
 
 ## Local multi-shard stress fixture
 

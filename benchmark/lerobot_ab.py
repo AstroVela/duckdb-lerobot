@@ -258,6 +258,7 @@ def source_profile_queries(
             f"batch_size := {args.batch_size}, "
             f"target_buffer_size := {args.target_buffer_size}, "
             f"decode_threads := {args.decode_threads}, "
+            f"producer_threads := {args.producer_threads}, "
             f"max_cached_decoders := {args.max_cached_decoders}, "
             f"max_pending_targets := {args.max_pending_targets}, "
             f"max_output_bytes := {args.max_output_bytes}, "
@@ -837,6 +838,7 @@ def run_command(args: argparse.Namespace) -> int:
             "batch_size": args.batch_size,
             "target_buffer_size": args.target_buffer_size,
             "decode_threads": args.decode_threads,
+            "producer_threads": args.producer_threads,
             "max_cached_decoders": args.max_cached_decoders,
             "max_pending_targets": args.max_pending_targets,
             "max_output_bytes": args.max_output_bytes,
@@ -953,6 +955,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--batch-size", type=int, default=16)
     run.add_argument("--target-buffer-size", type=int, default=256)
     run.add_argument("--decode-threads", type=int, default=8)
+    run.add_argument("--producer-threads", type=int, default=4)
     run.add_argument("--max-cached-decoders", type=int, default=8)
     run.add_argument("--max-pending-targets", type=int, default=4096)
     run.add_argument("--max-output-bytes", type=int, default=64 * 1024 * 1024)
