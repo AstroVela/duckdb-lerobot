@@ -151,9 +151,17 @@ unique_ptr<TableRef> LerobotScanBindReplace(ClientContext &context, TableFunctio
 	auto data_files = metadata->ResolveDataFiles(episode_indices);
 	if (data_files.empty()) {
 		if (!metadata->GetDataFiles().empty()) {
-			// An empty selection on a non-empty dataset still has the native
-			// Parquet schema. Bind one authoritative shard but filter every row.
-			data_files.push_back(metadata->GetDataFiles().front());
+			// An empty selection on a non-empty dataset still has a native
+			// Parquet schema. Union inference must inspect every authoritative
+			// shard; otherwise one shard is sufficient to bind the zero-row scan.
+			auto union_option = parameters.find("union_by_name");
+			const auto union_by_name = union_option != parameters.end() && !union_option->second.IsNull() &&
+			                           BooleanValue::Get(union_option->second);
+			if (union_by_name) {
+				data_files = metadata->GetDataFiles();
+			} else {
+				data_files.push_back(metadata->GetDataFiles().front());
+			}
 			return CreateFilteredFrameScan(std::move(data_files), parameters, episode_indices);
 		}
 		const auto &schema = metadata->GetFrameSchema();

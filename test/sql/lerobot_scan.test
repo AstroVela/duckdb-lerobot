@@ -371,7 +371,28 @@ FROM (DESCRIBE SELECT *
 
 query I
 SELECT count(*)
+FROM (DESCRIBE SELECT * FROM lerobot_scan(
+    '{TEST_DIR}/lerobot_scan',
+    episode_indices := [],
+    union_by_name := true
+))
+WHERE column_name = 'shard_marker';
+----
+1
+
+query I
+SELECT count(*)
 FROM lerobot_scan('{TEST_DIR}/lerobot_scan', episode_indices := [999]);
+----
+0
+
+query I
+SELECT count(shard_marker)
+FROM lerobot_scan(
+    '{TEST_DIR}/lerobot_scan',
+    episode_indices := [999],
+    union_by_name := true
+);
 ----
 0
 
