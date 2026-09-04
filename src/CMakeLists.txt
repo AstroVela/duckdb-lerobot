@@ -13,8 +13,7 @@ set(EXTENSION_SOURCES
     function/temporal/lerobot_temporal_targets.cpp
     function/video/lerobot_video_frames.cpp
     function/video/lerobot_video_options.cpp
-    storage/lerobot_metadata_cache.cpp
-)
+    storage/lerobot_metadata_cache.cpp)
 
 include_directories(include)
 
@@ -104,7 +103,8 @@ elseif(LEROBOT_ENABLE_FFMPEG)
 else()
   message(
     STATUS
-      "LeRobot native FFmpeg video read/write support disabled by LEROBOT_ENABLE_FFMPEG=OFF")
+      "LeRobot native FFmpeg video read/write support disabled by LEROBOT_ENABLE_FFMPEG=OFF"
+  )
 endif()
 
 install(

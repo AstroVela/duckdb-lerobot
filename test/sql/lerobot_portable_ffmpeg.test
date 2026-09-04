@@ -44,7 +44,7 @@ FROM lerobot_video_frames(
 query II
 SELECT count(*),
        min(left(hex(("observation.images.still").bytes), 16) = '89504E470D0A1A0A')
-FROM lerobot_frames('{TEST_DIR}/lerobot_portable_ffmpeg');
+FROM lerobot_scan('{TEST_DIR}/lerobot_portable_ffmpeg');
 ----
 2	true
 

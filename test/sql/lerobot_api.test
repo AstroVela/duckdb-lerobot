@@ -1,6 +1,6 @@
 # name: test/sql/lerobot_api.test
 # description: LeRobot exposes only its pre-release SQL data surface
-# group: [lerobot]
+# group: [sql]
 
 require parquet
 

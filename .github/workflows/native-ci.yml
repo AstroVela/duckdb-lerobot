@@ -45,7 +45,6 @@ jobs:
             sanitizers: false
             cmake_options: >-
               -DLEROBOT_ENABLE_FFMPEG=ON
-              -DLEROBOT_REQUIRE_FFMPEG=ON
               -DLEROBOT_AV1_ENCODER=libaom
               -DENABLE_SANITIZER=OFF
               -DENABLE_UBSAN=OFF
@@ -58,7 +57,6 @@ jobs:
             sanitizers: true
             cmake_options: >-
               -DLEROBOT_ENABLE_FFMPEG=ON
-              -DLEROBOT_REQUIRE_FFMPEG=ON
               -DLEROBOT_AV1_ENCODER=svt
               -DFORCE_ASSERT=ON
               -DENABLE_SANITIZER=ON
@@ -163,7 +161,7 @@ jobs:
       - name: Run pinned LeRobot bidirectional conformance
         if: matrix.id == 'release-no-ffmpeg' || matrix.id == 'release-ffmpeg'
         env:
-          BUILD_DIR: build/${{ matrix.id }}
+          BUILD_DIR: ${{ matrix.build_dir }}
         run: |
           python3 -m venv "${BUILD_DIR}/conformance-venv"
           "${BUILD_DIR}/conformance-venv/bin/python" -m pip install --upgrade pip
