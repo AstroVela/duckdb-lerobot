@@ -10,5 +10,5 @@ configure_ci: install_ci_dependencies
 
 install_ci_dependencies:
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
-		brew install nasm; \
+		bash .github/scripts/install_macos_nasm.sh; \
 	fi
