@@ -8,7 +8,9 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/atomic.hpp"
 #include "duckdb/common/optional_idx.hpp"
+#include "duckdb/common/optional_ptr.hpp"
 
 namespace duckdb {
 
@@ -22,6 +24,7 @@ struct LerobotVideoEncodeOptions {
 	idx_t fps = 0;
 	optional_idx encoder_threads;
 	LerobotRawVisualType raw_type = LerobotRawVisualType::RGB24;
+	optional_ptr<atomic<bool>> cancelled;
 };
 
 struct LerobotEncodedVideoInfo {

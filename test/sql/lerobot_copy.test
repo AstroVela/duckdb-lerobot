@@ -8,6 +8,19 @@ require json
 
 require lerobot
 
+statement error
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'invalid workers'::VARCHAR AS task,
+           1.0::FLOAT AS action
+) TO '{TEST_DIR}/lerobot_copy_invalid_video_workers' (
+    FORMAT lerobot,
+    FPS 10,
+    FEATURES '{"action":{"dtype":"float32","shape":[1],"names":null}}',
+    VIDEO_WORKERS 0
+);
+----
+LeRobot VIDEO_WORKERS must be between 1 and the DuckDB thread limit
+
 # A tiny data-file limit forces the second episode into the next chunk. One
 # metadata row per flush exercises the same rotation path for meta/episodes.
 statement ok

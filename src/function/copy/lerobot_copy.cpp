@@ -1,4 +1,5 @@
 #include "function/lerobot_copy.hpp"
+#include "function/lerobot_codec_executor.hpp"
 #include "function/lerobot_schema.hpp"
 #include "function/lerobot_video_writer.hpp"
 
@@ -33,6 +34,8 @@ static const double LEROBOT_DEFAULT_DATA_FILE_SIZE_MB = 100;
 static const double LEROBOT_DEFAULT_VIDEO_FILE_SIZE_MB = 200;
 static const idx_t LEROBOT_DEFAULT_METADATA_BUFFER_SIZE = 10;
 static const idx_t LEROBOT_DEFAULT_MAX_VISUAL_FRAME_BYTES = 64ULL * 1024ULL * 1024ULL;
+static const idx_t LEROBOT_DEFAULT_VIDEO_WORKERS = 4;
+static const idx_t LEROBOT_DEFAULT_ENCODER_THREADS = 4;
 static const idx_t LEROBOT_QUANTILE_BIN_COUNT = 5000;
 static const idx_t LEROBOT_STATS_DIMENSION_BATCH_SIZE = 64;
 static const char *LEROBOT_CODEBASE_VERSION = "v3.0";
@@ -431,7 +434,8 @@ struct LerobotCopyBindData : public FunctionData {
 	double video_file_size_mb = LEROBOT_DEFAULT_VIDEO_FILE_SIZE_MB;
 	idx_t metadata_buffer_size = LEROBOT_DEFAULT_METADATA_BUFFER_SIZE;
 	idx_t max_visual_frame_bytes = LEROBOT_DEFAULT_MAX_VISUAL_FRAME_BYTES;
-	optional_idx encoder_threads;
+	idx_t video_workers = 1;
+	idx_t encoder_threads = 1;
 	string robot_type;
 	bool has_robot_type = false;
 	string features_json;
@@ -454,6 +458,7 @@ struct LerobotCopyBindData : public FunctionData {
 		result->video_file_size_mb = video_file_size_mb;
 		result->metadata_buffer_size = metadata_buffer_size;
 		result->max_visual_frame_bytes = max_visual_frame_bytes;
+		result->video_workers = video_workers;
 		result->encoder_threads = encoder_threads;
 		result->robot_type = robot_type;
 		result->has_robot_type = has_robot_type;
@@ -467,8 +472,9 @@ struct LerobotCopyBindData : public FunctionData {
 		       features_json == other.features_json && chunks_size == other.chunks_size &&
 		       data_file_size_mb == other.data_file_size_mb && video_file_size_mb == other.video_file_size_mb &&
 		       metadata_buffer_size == other.metadata_buffer_size &&
-		       max_visual_frame_bytes == other.max_visual_frame_bytes && encoder_threads == other.encoder_threads &&
-		       has_robot_type == other.has_robot_type && robot_type == other.robot_type;
+		       max_visual_frame_bytes == other.max_visual_frame_bytes && video_workers == other.video_workers &&
+		       encoder_threads == other.encoder_threads && has_robot_type == other.has_robot_type &&
+		       robot_type == other.robot_type;
 	}
 };
 
@@ -498,6 +504,9 @@ unique_ptr<FunctionData> LerobotCopyBind(ClientContext &context, CopyFunctionBin
 		throw InternalException("LeRobot COPY input names/types size mismatch");
 	}
 	auto result = make_uniq<LerobotCopyBindData>();
+	const auto host_threads = MaxValue<idx_t>(1, context.db->NumberOfThreads());
+	result->video_workers = MinValue(LEROBOT_DEFAULT_VIDEO_WORKERS, host_threads);
+	result->encoder_threads = MinValue(LEROBOT_DEFAULT_ENCODER_THREADS, host_threads);
 	for (const auto &name : names) {
 		result->input_names.push_back(name);
 	}
@@ -556,10 +565,20 @@ unique_ptr<FunctionData> LerobotCopyBind(ClientContext &context, CopyFunctionBin
 	const auto &encoder_threads = GetSingleOption(input, "encoder_threads", false);
 	if (!encoder_threads.IsNull()) {
 		auto value = encoder_threads.DefaultCastAs(LogicalType::UBIGINT).GetValue<uint64_t>();
-		if (value == 0 || value >= NumericLimits<idx_t>::Maximum()) {
-			throw BinderException("LeRobot ENCODER_THREADS must be a positive integer");
+		if (value == 0 || value > host_threads) {
+			throw BinderException("LeRobot ENCODER_THREADS must be between 1 and the DuckDB thread limit (%llu)",
+			                      host_threads);
 		}
-		result->encoder_threads = optional_idx(static_cast<idx_t>(value));
+		result->encoder_threads = static_cast<idx_t>(value);
+	}
+	const auto &video_workers = GetSingleOption(input, "video_workers", false);
+	if (!video_workers.IsNull()) {
+		auto value = video_workers.DefaultCastAs(LogicalType::UBIGINT).GetValue<uint64_t>();
+		if (value == 0 || value > host_threads) {
+			throw BinderException("LeRobot VIDEO_WORKERS must be between 1 and the DuckDB thread limit (%llu)",
+			                      host_threads);
+		}
+		result->video_workers = static_cast<idx_t>(value);
 	}
 	const auto &robot_type = GetSingleOption(input, "robot_type", false);
 	if (!robot_type.IsNull()) {
@@ -656,6 +675,7 @@ void LerobotCopyOptions(ClientContext &, CopyOptionsInput &input) {
 	input.options["video_files_size_in_mb"] = CopyOption(LogicalType::DOUBLE, CopyOptionMode::WRITE_ONLY);
 	input.options["metadata_buffer_size"] = CopyOption(LogicalType::UBIGINT, CopyOptionMode::WRITE_ONLY);
 	input.options["max_visual_frame_bytes"] = CopyOption(LogicalType::UBIGINT, CopyOptionMode::WRITE_ONLY);
+	input.options["video_workers"] = CopyOption(LogicalType::UBIGINT, CopyOptionMode::WRITE_ONLY);
 	input.options["encoder_threads"] = CopyOption(LogicalType::UBIGINT, CopyOptionMode::WRITE_ONLY);
 }
 
@@ -1640,6 +1660,8 @@ struct LerobotVideoShardState {
 	idx_t chunk_index = 0;
 	idx_t file_index = 0;
 	double duration = 0;
+	idx_t fragment_bytes = 0;
+	vector<string> fragments;
 };
 
 struct LerobotCopyGlobalData : public GlobalFunctionData {
@@ -1899,7 +1921,96 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 		return fs.JoinPath(FileSystem::GetWorkingDirectory(), path);
 	}
 
+	void ValidateConcatPath(const string &path) {
+		if (path.find('\n') != string::npos || path.find('\r') != string::npos || path.find('\\') != string::npos ||
+		    path.find('\'') != string::npos) {
+			throw InvalidInputException(
+			    "LeRobot video output paths cannot contain newlines, backslashes, or single quotes");
+		}
+	}
+
+	void MaterializeVideoShard(idx_t feature_index) {
+		auto &shard = video_shards[feature_index];
+		if (shard.fragments.empty()) {
+			return;
+		}
+		const auto &feature = bind.features[feature_index];
+		auto shard_path = fs.JoinPath(stage_root, VideoRelativePath(feature.name, shard.chunk_index, shard.file_index));
+		fs.CreateDirectoriesRecursive(StringUtil::GetFilePath(shard_path));
+		if (fs.FileExists(shard_path)) {
+			throw InternalException("LeRobot video shard already exists before materialization: '%s'", shard_path);
+		}
+		if (shard.fragments.size() == 1) {
+			fs.MoveFile(shard.fragments[0], shard_path);
+			shard.fragments.clear();
+			shard.fragment_bytes = 0;
+			return;
+		}
+
+		auto temporary_dir = fs.JoinPath(stage_root, ".tmp/videos/" + std::to_string(feature_index));
+		vector<string> absolute_fragments;
+		absolute_fragments.reserve(shard.fragments.size());
+		string concat_contents = "ffconcat version 1.0\n";
+		for (const auto &fragment : shard.fragments) {
+			auto absolute_fragment = AbsoluteLocalPath(fragment);
+			ValidateConcatPath(absolute_fragment);
+			absolute_fragments.push_back(absolute_fragment);
+			concat_contents += "file '" + absolute_fragment + "'\n";
+		}
+		auto shard_id = std::to_string(shard.chunk_index) + "-" + std::to_string(shard.file_index);
+		auto concat_list = fs.JoinPath(temporary_dir, "shard-" + shard_id + ".ffconcat");
+		auto concat_output = fs.JoinPath(temporary_dir, "shard-" + shard_id + ".mp4");
+		WriteStringFile(fs, concat_list, concat_contents);
+		LerobotVisualWriter::ConcatenateVideos(absolute_fragments, concat_list, concat_output);
+		fs.MoveFile(concat_output, shard_path);
+		for (const auto &fragment : shard.fragments) {
+			fs.RemoveFile(fragment);
+		}
+		fs.RemoveFile(concat_list);
+		shard.fragments.clear();
+		shard.fragment_bytes = 0;
+	}
+
+	void RegisterEncodedVideo(LerobotCodecResult result) {
+		const auto feature_index = result.feature_index;
+		if (feature_index >= bind.features.size() || !bind.features[feature_index].is_video) {
+			throw InternalException("LeRobot codec executor returned an invalid feature index");
+		}
+		if (result.encoded.frame_count != current_episode_frames) {
+			throw InternalException("LeRobot video encoder wrote %llu frames for a %llu-frame episode",
+			                        result.encoded.frame_count, current_episode_frames);
+		}
+		const auto episode_bytes = GetLocalFileSize(result.output_path);
+		auto &shard = video_shards[feature_index];
+		if (!shard.initialized) {
+			shard.initialized = true;
+			shard.chunk_index = 0;
+			shard.file_index = 0;
+			shard.duration = 0;
+		} else if (!shard.fragments.empty()) {
+			const auto projected_size = static_cast<double>(shard.fragment_bytes) + static_cast<double>(episode_bytes);
+			if (projected_size >= bind.video_file_size_mb * 1024.0 * 1024.0) {
+				MaterializeVideoShard(feature_index);
+				AdvanceFileIndex(shard.chunk_index, shard.file_index, bind.chunks_size);
+				shard.duration = 0;
+			}
+		}
+		if (shard.fragment_bytes > NumericLimits<idx_t>::Maximum() - episode_bytes) {
+			throw InvalidInputException("LeRobot pending video shard is too large");
+		}
+		const auto from_timestamp = shard.duration;
+		shard.fragments.push_back(std::move(result.output_path));
+		shard.fragment_bytes += episode_bytes;
+		shard.duration += result.encoded.duration;
+		auto &route = current_video_routes[feature_index];
+		route.chunk_index = shard.chunk_index;
+		route.file_index = shard.file_index;
+		route.from_timestamp = from_timestamp;
+		route.to_timestamp = shard.duration;
+	}
+
 	void EncodeEpisodeVideos() {
+		vector<LerobotCodecJob> jobs;
 		for (idx_t feature_index = 0; feature_index < bind.features.size(); feature_index++) {
 			const auto &feature = bind.features[feature_index];
 			if (!feature.is_video) {
@@ -1915,71 +2026,44 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 			options.width = feature.shape[1];
 			options.height = feature.shape[0];
 			options.fps = bind.fps;
-			options.encoder_threads = bind.encoder_threads;
 			options.raw_type = visual_raw_types[feature_index];
 			const auto &spool = current_visual_spools[feature_index];
 			if (spool.frame_count != current_episode_frames) {
 				throw InternalException("LeRobot video spool has %llu frames for a %llu-frame episode",
 				                        spool.frame_count, current_episode_frames);
 			}
-			auto encoded = LerobotVisualWriter::EncodeVideo(fs, episode_path, spool.path, spool.frame_count, options);
-			if (encoded.frame_count != current_episode_frames) {
-				throw InternalException("LeRobot video encoder wrote %llu frames for a %llu-frame episode",
-				                        encoded.frame_count, current_episode_frames);
+			LerobotCodecJob job;
+			job.feature_index = feature_index;
+			job.output_path = std::move(episode_path);
+			job.raw_frames_path = spool.path;
+			job.frame_count = spool.frame_count;
+			job.options = options;
+			jobs.push_back(std::move(job));
+		}
+		if (jobs.empty()) {
+			return;
+		}
+		if (!codec_executor) {
+			codec_executor = LerobotCodecExecutor::Get(context);
+		}
+		auto results = codec_executor->Execute(context, fs, std::move(jobs), bind.video_workers, bind.encoder_threads);
+		idx_t previous_feature_index = 0;
+		bool has_previous_feature = false;
+		for (auto &result : results) {
+			if (has_previous_feature && result.feature_index <= previous_feature_index) {
+				throw InternalException("LeRobot codec executor changed feature order");
 			}
+			previous_feature_index = result.feature_index;
+			has_previous_feature = true;
+			RegisterEncodedVideo(std::move(result));
+		}
+	}
 
-			auto &shard = video_shards[feature_index];
-			if (!shard.initialized) {
-				shard.initialized = true;
-				shard.chunk_index = 0;
-				shard.file_index = 0;
-				shard.duration = 0;
-			} else {
-				auto current_path =
-				    fs.JoinPath(stage_root, VideoRelativePath(feature.name, shard.chunk_index, shard.file_index));
-				const auto projected_size = static_cast<double>(GetLocalFileSize(current_path)) +
-				                            static_cast<double>(GetLocalFileSize(episode_path));
-				if (projected_size >= bind.video_file_size_mb * 1024.0 * 1024.0) {
-					AdvanceFileIndex(shard.chunk_index, shard.file_index, bind.chunks_size);
-					shard.duration = 0;
-				}
+	void MaterializeVideoShards() {
+		for (idx_t feature_index = 0; feature_index < bind.features.size(); feature_index++) {
+			if (bind.features[feature_index].is_video) {
+				MaterializeVideoShard(feature_index);
 			}
-
-			auto shard_path =
-			    fs.JoinPath(stage_root, VideoRelativePath(feature.name, shard.chunk_index, shard.file_index));
-			fs.CreateDirectoriesRecursive(StringUtil::GetFilePath(shard_path));
-			const auto from_timestamp = shard.duration;
-			if (!fs.FileExists(shard_path)) {
-				fs.MoveFile(episode_path, shard_path);
-			} else {
-				const auto absolute_shard = AbsoluteLocalPath(shard_path);
-				const auto absolute_episode = AbsoluteLocalPath(episode_path);
-				if (absolute_shard.find('\n') != string::npos || absolute_shard.find('\r') != string::npos ||
-				    absolute_shard.find('\\') != string::npos || absolute_shard.find('\'') != string::npos ||
-				    absolute_episode.find('\n') != string::npos || absolute_episode.find('\r') != string::npos ||
-				    absolute_episode.find('\\') != string::npos || absolute_episode.find('\'') != string::npos) {
-					throw InvalidInputException(
-					    "LeRobot video output paths cannot contain newlines, backslashes, or single quotes");
-				}
-				auto concat_list =
-				    fs.JoinPath(temporary_dir, "concat-" + std::to_string(current_episode) + ".ffconcat");
-				auto concat_output =
-				    fs.JoinPath(temporary_dir, "concatenated-" + std::to_string(current_episode) + ".mp4");
-				WriteStringFile(fs, concat_list,
-				                "ffconcat version 1.0\nfile '" + absolute_shard + "'\nfile '" + absolute_episode +
-				                    "'\n");
-				LerobotVisualWriter::ConcatenateVideos({absolute_shard, absolute_episode}, concat_list, concat_output);
-				fs.RemoveFile(shard_path);
-				fs.MoveFile(concat_output, shard_path);
-				fs.RemoveFile(episode_path);
-				fs.RemoveFile(concat_list);
-			}
-			shard.duration += encoded.duration;
-			auto &route = current_video_routes[feature_index];
-			route.chunk_index = shard.chunk_index;
-			route.file_index = shard.file_index;
-			route.from_timestamp = from_timestamp;
-			route.to_timestamp = shard.duration;
 		}
 	}
 
@@ -2313,6 +2397,7 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 
 	void Finalize() {
 		FinishEpisode();
+		MaterializeVideoShards();
 		FlushMetadataBuffer();
 		data_writer.Close(context);
 		episodes_writer.Close(context);
@@ -2334,6 +2419,7 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 	string root;
 	string stage_root;
 	FileSystem &fs;
+	shared_ptr<LerobotCodecExecutor> codec_executor;
 	DelegatedParquetWriter data_writer;
 	DelegatedParquetWriter episodes_writer;
 	DelegatedParquetWriter tasks_writer;
