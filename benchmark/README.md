@@ -2,11 +2,17 @@
 
 `lerobot_ab.py` runs DuckDB, current Daft, and native LeRobot in separate
 Python environments against the same episode/frame/camera contract. Every
-schema-version-3 result records machine details, exact configuration,
-warmup/repeat decode timings, a separate validation time, per-image shape and
-SHA-256, and (for DuckDB) a JSON profile containing decoder opens, cache
-hits/evictions, decoder and AVIO seeks, bytes read, decoded frame count, and RGB
-conversion/fan-out counts.
+schema-version-4 result records machine details, exact selected frame and camera
+inventory, immutable dataset revision, temporal window, reference backend,
+exact configuration, warmup/repeat decode timings, a separate validation time,
+per-image shape and SHA-256, and (for DuckDB) a JSON profile containing decoder
+opens, cache hits/evictions, decoder and AVIO seeks, bytes read, decoded frame
+count, and RGB conversion/fan-out counts.
+
+`compare` rejects results before printing timing ratios when their revision,
+requested or available cameras, actual frame selection, temporal window,
+reference backend, resize/tolerance contract, cache state, or hardware identity
+differs. Schema-version-3 artifacts are intentionally not accepted.
 
 The common cross-engine comparison intentionally uses `delta_timestamps =
 [0.0]`: Daft's public dataset reader does not expose LeRobot temporal-window
@@ -22,9 +28,10 @@ MiB. Download it once, then force offline mode for every measured process:
 
 ```bash
 export BENCH_DATA="$PWD/build/benchmark-data/egodex-test"
+export BENCH_REVISION=9ab66a91daf0d0e73f022adadb59f5c9ad7a6b16
 hf download pepijn223/egodex-test \
   --repo-type dataset \
-  --revision 9ab66a91daf0d0e73f022adadb59f5c9ad7a6b16 \
+  --revision "$BENCH_REVISION" \
   --local-dir "$BENCH_DATA"
 export HF_HUB_OFFLINE=1
 ```
@@ -36,6 +43,7 @@ the Hub when given these local paths. Run one engine per environment:
 python benchmark/lerobot_ab.py run \
   --engine duckdb \
   --dataset "$BENCH_DATA" \
+  --revision "$BENCH_REVISION" \
   --camera observation.image \
   --rows 100 \
   --duckdb-cli build/benchmark/duckdb \
@@ -44,6 +52,7 @@ python benchmark/lerobot_ab.py run \
 python benchmark/lerobot_ab.py run \
   --engine daft \
   --dataset "$BENCH_DATA" \
+  --revision "$BENCH_REVISION" \
   --camera observation.image \
   --rows 100 \
   --output build/benchmark-results/daft.json
@@ -52,7 +61,7 @@ python benchmark/lerobot_ab.py run \
   --engine lerobot \
   --dataset pepijn223/egodex-test \
   --lerobot-root "$BENCH_DATA" \
-  --revision 9ab66a91daf0d0e73f022adadb59f5c9ad7a6b16 \
+  --revision "$BENCH_REVISION" \
   --camera observation.image \
   --rows 100 \
   --video-backend pyav \
@@ -96,6 +105,9 @@ work cannot distort decoder timing:
 2. Timed repeats decode and materialize the selected image columns without
    hashing. DuckDB consumes every produced BLOB with `octet_length`, Daft
    collects a materialized DataFrame, and LeRobot returns uint8 Torch tensors.
+   The native LeRobot adapter strictly projects the timestamp map passed to its
+   video reader, so it decodes only the requested `--camera` keys even when the
+   dataset contains additional cameras.
    Daft creates a fresh lazy DataFrame for every repeat because `collect()`
    materializes the object in place; reusing it would benchmark a cached no-op.
    Each result's `timing_boundary` records the engine-specific boundary.
@@ -107,10 +119,9 @@ work cannot distort decoder timing:
    or pixel-hash difference as a correctness failure.
 
 `decode_durations_seconds`, `decode_median_seconds`, and
-`decode_min_seconds` are the primary performance fields. The old
-`durations_seconds`, `median_seconds`, and `min_seconds` names remain aliases so
-existing result readers continue to work. Do not add `validation_seconds` to
-the decode median: it deliberately replays the workload for correctness.
+`decode_min_seconds` are the performance fields. Do not add
+`validation_seconds` to the decode median: it deliberately replays the workload
+for correctness.
 
 The timed DuckDB query exercises `lerobot_video_targets`. Its profiler pass
 replays the same selection through `lerobot_video_frames`, because DuckDB's
