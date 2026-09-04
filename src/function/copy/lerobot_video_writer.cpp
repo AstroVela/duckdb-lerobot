@@ -172,7 +172,6 @@ uint16_t QuantizeDepth(float depth, bool millimeters) {
 }
 
 void FillDepthFrame(const string &raw, LerobotRawVisualType raw_type, idx_t width, idx_t height, AVFrame &frame) {
-	const auto pixels = width * height;
 	for (idx_t y = 0; y < height; y++) {
 		auto target = reinterpret_cast<uint16_t *>(frame.data[0] + y * frame.linesize[0]);
 		for (idx_t x = 0; x < width; x++) {
@@ -189,7 +188,6 @@ void FillDepthFrame(const string &raw, LerobotRawVisualType raw_type, idx_t widt
 			target[x] = QuantizeDepth(value, millimeters);
 		}
 	}
-	(void)pixels;
 }
 
 void DrainEncoder(AVCodecContext &codec_context, AVFormatContext &format_context, AVStream &stream, AVPacket &packet,

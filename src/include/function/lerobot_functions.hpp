@@ -11,23 +11,17 @@
 
 namespace duckdb {
 
-class ExtensionLoader;
-
 class LerobotFunctions {
 public:
-	static vector<TableFunctionSet> GetTableFunctions(ExtensionLoader &loader);
+	static vector<TableFunctionSet> GetTableFunctions();
 
 private:
-	static TableFunctionSet GetLayoutFunction();
-	static TableFunctionSet GetV3ShardPathsFunction();
-	static TableFunctionSet GetInfoFunction(ExtensionLoader &loader);
-	static TableFunctionSet GetEpisodesFunction(ExtensionLoader &loader);
-	static TableFunctionSet GetTasksFunction(ExtensionLoader &loader);
-	static TableFunctionSet GetFramesFunction(ExtensionLoader &loader);
-	static TableFunctionSet GetMetadataCacheFunction();
-	static TableFunctionSet GetVideoMetadataCacheFunction();
+	static TableFunctionSet GetInfoFunction();
+	static TableFunctionSet GetEpisodesFunction();
+	static TableFunctionSet GetTasksFunction();
+	static TableFunctionSet GetScanFunction();
+	static TableFunctionSet GetCacheInfoFunction();
 	static TableFunctionSet GetVideoRoutesFunction();
-	static TableFunctionSet GetEpisodeFramesFunction();
 	static TableFunctionSet GetTemporalTargetsFunction();
 	static TableFunctionSet GetVideoFramesFunction();
 	static TableFunctionSet GetVideoWindowsFunction();

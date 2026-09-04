@@ -22,8 +22,9 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
-#include "function/lerobot_multi_file_reader.hpp"
 #include "function/lerobot_temporal.hpp"
+#include "function/lerobot_video_options.hpp"
+#include "lerobot_path.hpp"
 #include "storage/lerobot_metadata_cache.hpp"
 
 #include <algorithm>
@@ -53,28 +54,13 @@ namespace duckdb {
 
 namespace {
 
-static const idx_t LEROBOT_DEFAULT_DECODE_BATCH_SIZE = 16;
-static const idx_t LEROBOT_DEFAULT_TARGET_BUFFER_SIZE = 256;
-static const idx_t LEROBOT_DEFAULT_MAX_CACHED_DECODERS = 8;
-static const idx_t LEROBOT_DEFAULT_DECODE_THREADS = 8;
-static const idx_t LEROBOT_DEFAULT_PRODUCER_THREADS = 4;
-static const idx_t LEROBOT_DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
-static const int64_t LEROBOT_DEFAULT_CODEC_THREADS = 1;
-static const idx_t LEROBOT_MAX_TARGET_BUFFER_SIZE = 1024 * 1024;
-static const idx_t LEROBOT_MAX_CACHED_DECODERS = 1024;
-static const idx_t LEROBOT_MAX_DECODE_THREADS = 1024;
-static const idx_t LEROBOT_MAX_PRODUCER_THREADS = 1024;
-static const idx_t LEROBOT_MAX_PENDING_TARGETS = 10 * 1024 * 1024;
 static const idx_t LEROBOT_PRODUCER_ROWS_PER_TASK = 64;
 static const idx_t LEROBOT_MAX_WINDOW_TARGETS = 100000;
 static const idx_t LEROBOT_MAX_CLUSTER_FRAME_SPAN = 20000;
-static const double LEROBOT_DEFAULT_CLUSTER_GAP_SECONDS = 10.0;
 #ifdef LEROBOT_HAVE_FFMPEG
 static const idx_t LEROBOT_DECODE_FRAME_SAFETY_MARGIN = 20000;
 static const uint16_t LEROBOT_DEPTH_QMAX = 4095;
 #endif
-
-enum class LerobotDepthOutputUnit : uint8_t { METERS, MILLIMETERS };
 
 template <typename T>
 T *GetMutableFlatData(Vector &vector) {
@@ -148,40 +134,6 @@ vector<string> GetVideoKeys(TableFunctionBindInput &input, const LerobotVideoMet
 	std::sort(result.begin(), result.end());
 	result.erase(std::unique(result.begin(), result.end()), result.end());
 	return result;
-}
-
-int64_t GetNamedInteger(TableFunctionBindInput &input, const char *name, int64_t default_value) {
-	auto entry = input.named_parameters.find(name);
-	if (entry == input.named_parameters.end()) {
-		return default_value;
-	}
-	if (entry->second.IsNull()) {
-		throw BinderException("lerobot_video_frames %s must not be NULL", name);
-	}
-	return entry->second.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
-}
-
-double GetNamedDouble(TableFunctionBindInput &input, const char *name, double default_value) {
-	auto entry = input.named_parameters.find(name);
-	if (entry == input.named_parameters.end()) {
-		return default_value;
-	}
-	if (entry->second.IsNull()) {
-		throw BinderException("lerobot_video_frames %s must not be NULL", name);
-	}
-	return entry->second.DefaultCastAs(LogicalType::DOUBLE).GetValue<double>();
-}
-
-string GetNamedString(TableFunctionBindInput &input, const char *function_name, const char *name,
-                      const char *default_value) {
-	auto entry = input.named_parameters.find(name);
-	if (entry == input.named_parameters.end()) {
-		return default_value;
-	}
-	if (entry->second.IsNull()) {
-		throw BinderException("%s %s must not be NULL", function_name, name);
-	}
-	return StringValue::Get(entry->second);
 }
 
 string ValueListSQL(const vector<string> &values) {
@@ -266,131 +218,6 @@ enum LerobotVideoTargetColumn {
 	LEROBOT_TARGET_IMAGE = 17,
 	LEROBOT_TARGET_COLUMN_COUNT = 18
 };
-
-struct LerobotVideoOptions {
-	double tolerance;
-	double cluster_gap;
-	int32_t width;
-	int32_t height;
-	idx_t output_batch_size;
-	idx_t target_buffer_size;
-	idx_t max_cached_decoders;
-	idx_t decode_threads;
-	idx_t producer_threads;
-	idx_t max_pending_targets;
-	idx_t max_output_bytes;
-	int32_t codec_threads;
-	LerobotDepthOutputUnit depth_output_unit;
-};
-
-LerobotVideoOptions GetVideoOptions(TableFunctionBindInput &input, const char *function_name) {
-	const auto width_value = GetNamedInteger(input, "width", 0);
-	const auto height_value = GetNamedInteger(input, "height", 0);
-	if ((width_value == 0) != (height_value == 0)) {
-		throw BinderException("%s width and height must either both be zero or both be positive", function_name);
-	}
-	if (width_value < 0 || height_value < 0 || width_value > 32768 || height_value > 32768) {
-		throw BinderException("%s width and height must be between 0 and 32768", function_name);
-	}
-
-	const auto tolerance = GetNamedDouble(input, "tolerance", LEROBOT_DEFAULT_TEMPORAL_TOLERANCE_SECONDS);
-	if (!std::isfinite(tolerance) || tolerance <= 0) {
-		throw BinderException("%s tolerance must be finite and positive", function_name);
-	}
-	const auto cluster_gap = GetNamedDouble(input, "cluster_gap", LEROBOT_DEFAULT_CLUSTER_GAP_SECONDS);
-	if (!std::isfinite(cluster_gap) || cluster_gap < 0) {
-		throw BinderException("%s cluster_gap must be finite and non-negative", function_name);
-	}
-	const auto batch_size_value = GetNamedInteger(input, "batch_size", LEROBOT_DEFAULT_DECODE_BATCH_SIZE);
-	if (batch_size_value <= 0 || batch_size_value > static_cast<int64_t>(STANDARD_VECTOR_SIZE)) {
-		throw BinderException("%s batch_size must be between 1 and %d", function_name, STANDARD_VECTOR_SIZE);
-	}
-	const auto target_buffer_size_value =
-	    GetNamedInteger(input, "target_buffer_size", LEROBOT_DEFAULT_TARGET_BUFFER_SIZE);
-	if (target_buffer_size_value <= 0 ||
-	    target_buffer_size_value > static_cast<int64_t>(LEROBOT_MAX_TARGET_BUFFER_SIZE)) {
-		throw BinderException("%s target_buffer_size must be between 1 and %d", function_name,
-		                      LEROBOT_MAX_TARGET_BUFFER_SIZE);
-	}
-	const auto cached_decoders_entry = input.named_parameters.find("max_cached_decoders");
-	const auto legacy_open_shards_entry = input.named_parameters.find("max_open_shards");
-	const auto max_cached_decoders_value = GetNamedInteger(
-	    input, cached_decoders_entry != input.named_parameters.end() ? "max_cached_decoders" : "max_open_shards",
-	    LEROBOT_DEFAULT_MAX_CACHED_DECODERS);
-	if (cached_decoders_entry != input.named_parameters.end() &&
-	    legacy_open_shards_entry != input.named_parameters.end()) {
-		const auto legacy_value = GetNamedInteger(input, "max_open_shards", LEROBOT_DEFAULT_MAX_CACHED_DECODERS);
-		if (legacy_value != max_cached_decoders_value) {
-			throw BinderException("%s max_cached_decoders and deprecated max_open_shards must match when both are set",
-			                      function_name);
-		}
-	}
-	if (max_cached_decoders_value <= 0 ||
-	    max_cached_decoders_value > static_cast<int64_t>(LEROBOT_MAX_CACHED_DECODERS)) {
-		const auto parameter_name =
-		    cached_decoders_entry != input.named_parameters.end() ? "max_cached_decoders" : "max_open_shards";
-		throw BinderException("%s %s must be between 1 and %d", function_name, parameter_name,
-		                      LEROBOT_MAX_CACHED_DECODERS);
-	}
-	const auto decode_threads_value = GetNamedInteger(input, "decode_threads", LEROBOT_DEFAULT_DECODE_THREADS);
-	if (decode_threads_value <= 0 || decode_threads_value > static_cast<int64_t>(LEROBOT_MAX_DECODE_THREADS)) {
-		throw BinderException("%s decode_threads must be between 1 and %d", function_name, LEROBOT_MAX_DECODE_THREADS);
-	}
-	const auto producer_threads_value = GetNamedInteger(input, "producer_threads", LEROBOT_DEFAULT_PRODUCER_THREADS);
-	if (producer_threads_value <= 0 || producer_threads_value > static_cast<int64_t>(LEROBOT_MAX_PRODUCER_THREADS)) {
-		throw BinderException("%s producer_threads must be between 1 and %d", function_name,
-		                      LEROBOT_MAX_PRODUCER_THREADS);
-	}
-	const auto max_pending_targets_value = GetNamedInteger(input, "max_pending_targets", 0);
-	if (max_pending_targets_value < 0 ||
-	    max_pending_targets_value > static_cast<int64_t>(LEROBOT_MAX_PENDING_TARGETS)) {
-		throw BinderException("%s max_pending_targets must be between 0 and %d", function_name,
-		                      LEROBOT_MAX_PENDING_TARGETS);
-	}
-	idx_t max_pending_targets;
-	if (max_pending_targets_value == 0) {
-		max_pending_targets =
-		    static_cast<idx_t>(target_buffer_size_value) * static_cast<idx_t>(decode_threads_value) * 2;
-		max_pending_targets = std::min<idx_t>(max_pending_targets, LEROBOT_MAX_PENDING_TARGETS);
-	} else {
-		max_pending_targets = static_cast<idx_t>(max_pending_targets_value);
-	}
-
-	const auto max_output_bytes_value =
-	    GetNamedInteger(input, "max_output_bytes", static_cast<int64_t>(LEROBOT_DEFAULT_MAX_OUTPUT_BYTES));
-	if (max_output_bytes_value <= 0) {
-		throw BinderException("%s max_output_bytes must be positive", function_name);
-	}
-	const auto codec_threads_value = GetNamedInteger(input, "codec_threads", LEROBOT_DEFAULT_CODEC_THREADS);
-	if (codec_threads_value < 0 || codec_threads_value > 64) {
-		throw BinderException("%s codec_threads must be between 0 and 64", function_name);
-	}
-	const auto depth_output_unit_value = GetNamedString(input, function_name, "depth_output_unit", "mm");
-	LerobotDepthOutputUnit depth_output_unit;
-	if (depth_output_unit_value == "m") {
-		depth_output_unit = LerobotDepthOutputUnit::METERS;
-	} else if (depth_output_unit_value == "mm") {
-		depth_output_unit = LerobotDepthOutputUnit::MILLIMETERS;
-	} else {
-		throw BinderException("%s depth_output_unit must be 'm' or 'mm'", function_name);
-	}
-
-	LerobotVideoOptions result;
-	result.tolerance = tolerance;
-	result.cluster_gap = cluster_gap;
-	result.width = static_cast<int32_t>(width_value);
-	result.height = static_cast<int32_t>(height_value);
-	result.output_batch_size = static_cast<idx_t>(batch_size_value);
-	result.target_buffer_size = static_cast<idx_t>(target_buffer_size_value);
-	result.max_cached_decoders = static_cast<idx_t>(max_cached_decoders_value);
-	result.decode_threads = static_cast<idx_t>(decode_threads_value);
-	result.producer_threads = static_cast<idx_t>(producer_threads_value);
-	result.max_pending_targets = max_pending_targets;
-	result.max_output_bytes = static_cast<idx_t>(max_output_bytes_value);
-	result.codec_threads = static_cast<int32_t>(codec_threads_value);
-	result.depth_output_unit = depth_output_unit;
-	return result;
-}
 
 struct LerobotDecodeTarget {
 	LerobotDecodeTarget(int64_t episode_index_p, int64_t frame_index_p, double frame_timestamp_p,
@@ -608,11 +435,10 @@ unique_ptr<FunctionData> LerobotVideoFramesBind(ClientContext &context, TableFun
 	auto episode_indices = GetNonNegativeIndices(input.inputs[1], "episode_indices");
 	const auto refresh = GetRefreshParameter(input, "lerobot_video_frames");
 
-	bool cache_hit;
-	auto video_metadata = LerobotVideoMetadata::Get(context, root, refresh, cache_hit);
+	auto video_metadata = LerobotVideoMetadata::Get(context, root, refresh);
 	auto video_keys = GetVideoKeys(input, *video_metadata);
 	auto routes = video_metadata->ResolveRoutes(episode_indices, video_keys);
-	auto options = GetVideoOptions(input, "lerobot_video_frames");
+	auto options = GetLerobotVideoOptions(input, "lerobot_video_frames");
 
 	vector<int64_t> frame_indices;
 	auto frame_filter = input.named_parameters.find("frame_indices");
@@ -629,10 +455,9 @@ unique_ptr<FunctionData> LerobotVideoFramesBind(ClientContext &context, TableFun
 	vector<string> frame_queries;
 	if (!episode_indices.empty() && !routes.empty() &&
 	    (frame_filter == input.named_parameters.end() || !frame_indices.empty())) {
-		bool data_cache_hit;
 		// LerobotVideoMetadata::Get above has already refreshed and validated the
 		// shared base metadata cache when refresh was requested.
-		auto dataset_metadata = LerobotDatasetMetadata::Get(context, root, false, data_cache_hit);
+		auto dataset_metadata = LerobotDatasetMetadata::Get(context, root, false);
 		const auto &data_files = dataset_metadata->GetDataFiles();
 		for (const auto &partition : GroupEpisodesByDataFile(*dataset_metadata, episode_indices)) {
 			D_ASSERT(partition.first < data_files.size());
@@ -772,11 +597,9 @@ unique_ptr<FunctionData> LerobotVideoWindowsBind(ClientContext &context, TableFu
 	auto root = NormalizeLerobotRoot(StringValue::Get(input.inputs[0]));
 	auto requests = GetVideoWindowRequests(input.inputs[1]);
 
-	bool cache_hit;
-	auto video_metadata =
-	    LerobotVideoMetadata::Get(context, root, GetRefreshParameter(input, "lerobot_video_windows"), cache_hit);
+	auto video_metadata = LerobotVideoMetadata::Get(context, root, GetRefreshParameter(input, "lerobot_video_windows"));
 	auto video_keys = GetVideoKeys(input, *video_metadata);
-	auto options = GetVideoOptions(input, "lerobot_video_windows");
+	auto options = GetLerobotVideoOptions(input, "lerobot_video_windows");
 	auto deltas = GetLerobotTemporalDeltas(input, video_metadata->GetFPS(), options.tolerance, "lerobot_video_windows");
 	if (!deltas.empty() && requests.size() > LEROBOT_MAX_WINDOW_TARGETS / deltas.size()) {
 		throw BinderException("lerobot_video_windows expands to more than %d frame targets",
@@ -831,8 +654,7 @@ unique_ptr<FunctionData> LerobotVideoWindowsBind(ClientContext &context, TableFu
 
 	vector<string> frame_queries;
 	if (!requests.empty() && !deltas.empty() && !routes.empty()) {
-		bool data_cache_hit;
-		auto dataset_metadata = LerobotDatasetMetadata::Get(context, root, false, data_cache_hit);
+		auto dataset_metadata = LerobotDatasetMetadata::Get(context, root, false);
 		const auto &data_files = dataset_metadata->GetDataFiles();
 		for (const auto &partition : GroupWindowRequestsByDataFile(*dataset_metadata, requests)) {
 			D_ASSERT(partition.first < data_files.size());
@@ -915,12 +737,9 @@ unique_ptr<FunctionData> LerobotVideoTargetsBind(ClientContext &context, TableFu
 	}
 
 	auto root = NormalizeLerobotRoot(StringValue::Get(input.inputs[0]));
-	bool video_cache_hit;
-	auto metadata =
-	    LerobotVideoMetadata::Get(context, root, GetRefreshParameter(input, "lerobot_video_targets"), video_cache_hit);
-	bool dataset_cache_hit;
-	auto dataset = LerobotDatasetMetadata::Get(context, root, false, dataset_cache_hit);
-	auto options = GetVideoOptions(input, "lerobot_video_targets");
+	auto metadata = LerobotVideoMetadata::Get(context, root, GetRefreshParameter(input, "lerobot_video_targets"));
+	auto dataset = LerobotDatasetMetadata::Get(context, root, false);
+	auto options = GetLerobotVideoOptions(input, "lerobot_video_targets");
 	auto deltas = GetLerobotTemporalDeltas(input, metadata->GetFPS(), options.tolerance, "lerobot_video_targets");
 
 	names = {"request_id",      "target_ordinal",
@@ -3487,28 +3306,7 @@ InsertionOrderPreservingMap<string> LerobotVideoTargetsDynamicToString(TableFunc
 
 void AddVideoDecodeNamedParameters(TableFunction &function, bool include_video_keys = true,
                                    bool source_function = true) {
-	if (include_video_keys) {
-		function.named_parameters["video_keys"] = LogicalType::LIST(LogicalType::VARCHAR);
-	}
-	function.named_parameters["width"] = LogicalType::BIGINT;
-	function.named_parameters["height"] = LogicalType::BIGINT;
-	function.named_parameters["tolerance"] = LogicalType::DOUBLE;
-	function.named_parameters["cluster_gap"] = LogicalType::DOUBLE;
-	function.named_parameters["batch_size"] = LogicalType::BIGINT;
-	function.named_parameters["target_buffer_size"] = LogicalType::BIGINT;
-	function.named_parameters["max_cached_decoders"] = LogicalType::BIGINT;
-	// Compatibility alias retained for queries written before the cache and
-	// worker limits became independently configurable.
-	function.named_parameters["max_open_shards"] = LogicalType::BIGINT;
-	function.named_parameters["decode_threads"] = LogicalType::BIGINT;
-	if (source_function) {
-		function.named_parameters["producer_threads"] = LogicalType::BIGINT;
-	}
-	function.named_parameters["max_pending_targets"] = LogicalType::BIGINT;
-	function.named_parameters["max_output_bytes"] = LogicalType::BIGINT;
-	function.named_parameters["codec_threads"] = LogicalType::BIGINT;
-	function.named_parameters["depth_output_unit"] = LogicalType::VARCHAR;
-	function.named_parameters["refresh"] = LogicalType::BOOLEAN;
+	AddLerobotVideoOptionParameters(function, include_video_keys, source_function);
 	function.projection_pushdown = true;
 	if (source_function) {
 		function.filter_pushdown = true;

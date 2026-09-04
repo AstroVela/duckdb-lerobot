@@ -19,16 +19,17 @@ belong on a separate extension branch rather than in compatibility shims here.
 
 ## Current status
 
-The extension now exposes native dataset-root scans for LeRobot v3 episode,
-task, and frame Parquet files. Metadata and task scans copy DuckDB's registered
-`read_json_auto` or `parquet_scan` function sets and inject only a
-format-specific `MultiFileReader`. `lerobot_frames` resolves the authoritative
+The extension exposes native dataset-root scans for LeRobot v3 episode, task,
+and frame data. `lerobot_info`, `lerobot_episodes`, and `lerobot_tasks` use bind
+replacement to plan native JSON or Parquet scans with a deliberately small
+parameter whitelist. `lerobot_scan` resolves the authoritative
 `info.json.data_path` file list through the route cache and binds that list
-directly to native `parquet_scan`. DuckDB therefore retains its native
+directly to native `read_parquet`. DuckDB therefore retains its native
 projection, filter, dynamic-filter, parallel I/O, footer-cache, and row-group
-pruning paths without assuming a `data/` directory. Native Parquet overloads
-and named scan options are preserved and forwarded; `refresh` remains the one
-LeRobot-owned metadata option.
+pruning paths without assuming a `data/` directory. `lerobot_scan` and
+`lerobot_episodes` expose only the Parquet options `union_by_name`,
+`binary_as_string`, `filename`, and `file_row_number`; `refresh` and
+`episode_indices` remain LeRobot-owned.
 
 Frame scans cache the small LeRobot control plane: `meta/info.json` plus each
 episode's `length` and data-shard mapping from `meta/episodes`. The cache
@@ -38,9 +39,8 @@ deduplicated file list to DuckDB before Parquet binding.
 The current v3 `total_episodes`, `total_frames`, and `total_tasks` fields are
 authoritative. A zero-episode dataset has only its committed `meta/info.json`;
 no synthetic empty Parquet files are written. Metadata caches skip episode
-I/O, while frame, episode, and task scans bind zero-row schemas directly from
-`info.json.features`, including Parquet list types, image structs, video routes,
-and episode statistics.
+I/O, while frame and episode scans derive zero-row schemas from
+`info.json.features`; the task scan publishes the fixed v3 task schema.
 
 Video routing is available as a metadata-only second stage. It resolves each
 requested episode and video feature to its full MP4 path and timestamp range,
@@ -94,16 +94,15 @@ target frame are returned explicitly.
 Python-compatible ties-to-even integer frame-offset conversion,
 episode-boundary clamp, and padding semantics without opening video. Its input
 relation has exactly `request_id`, `episode_index`, `frame_index`, and
-`delta_index`. Join the returned `target_frame_index` to `lerobot_frames` to
+`delta_index`. Join the returned `target_frame_index` to `lerobot_scan` to
 fetch any state, action, or other non-video feature.
 `lerobot_tasks` scans the current v3 `meta/tasks.parquet` contract directly, so
 joining a frame's `task_index` yields its `task` string while retaining native
 Parquet projection and filter pushdown. Legacy task layouts are not inferred.
 
-`lerobot_layout(root)` and `lerobot_v3_shard_paths(...)` expose the canonical
-layout without touching storage. A bare Hugging Face repository ID such as
-`lerobot/droid_1.0.1` is normalized to `hf://datasets/lerobot/droid_1.0.1`.
-Remote `hf://` reads require the host's `httpfs` extension; released DuckDB
+Dataset roots are explicit: relative local paths stay local, and Hugging Face
+datasets must use an `hf://datasets/...` URI. Remote `hf://` reads require the
+host's `httpfs` extension; released DuckDB
 builds can normally auto-install and auto-load it, or it can be loaded
 explicitly before `lerobot`.
 
@@ -111,14 +110,6 @@ explicitly before `lerobot`.
 INSTALL httpfs;
 LOAD httpfs;
 LOAD lerobot;
-
-SELECT * FROM lerobot_layout('hf://datasets/lerobot/droid_1.0.1');
-
-SELECT * FROM lerobot_v3_shard_paths(
-  'hf://datasets/lerobot/droid_1.0.1',
-  'observation.images.wrist',
-  2, 17
-);
 
 -- Read all v3 episode-metadata shards through DuckDB's native Parquet scan.
 SELECT * FROM lerobot_episodes('hf://datasets/lerobot/droid_1.0.1');
@@ -132,13 +123,13 @@ SELECT * FROM lerobot_info('hf://datasets/lerobot/droid_1.0.1');
 
 -- Read all authoritative frame shards while retaining native Parquet pushdown.
 SELECT episode_index, frame_index, timestamp
-FROM lerobot_frames('hf://datasets/lerobot/droid_1.0.1');
+FROM lerobot_scan('hf://datasets/lerobot/droid_1.0.1');
 
 -- Expand only the episode rows selected by an earlier metadata query.
 SELECT *
-FROM lerobot_episode_frames(
+FROM lerobot_scan(
   'hf://datasets/lerobot/droid_1.0.1',
-  [4, 7, 12]
+  episode_indices := [4, 7, 12]
 );
 
 -- Resolve the cameras for those episodes without opening the video files.
@@ -222,25 +213,17 @@ WITH requests AS (
 SELECT targets.request_id, targets.delta_index, targets.is_padding,
        frames."observation.state", frames.action, tasks.task
 FROM targets
-JOIN lerobot_frames('hf://datasets/lerobot/droid_1.0.1') frames
+JOIN lerobot_scan('hf://datasets/lerobot/droid_1.0.1') frames
   ON frames.episode_index = targets.episode_index
  AND frames.frame_index = targets.target_frame_index
 JOIN lerobot_tasks('hf://datasets/lerobot/droid_1.0.1') tasks USING (task_index)
 ORDER BY targets.request_id, targets.delta_index, targets.target_ordinal;
 
--- Inspect the data route cache. Set refresh := true after an in-place
--- metadata update that does not publish a new dataset revision.
+-- Inspect existing route-cache entries without loading or validating either
+-- component as a side effect.
 SELECT *
-FROM lerobot_metadata_cache('hf://datasets/lerobot/droid_1.0.1');
-
--- Materialize and inspect the separate lazy video route cache.
-SELECT *
-FROM lerobot_video_metadata_cache('hf://datasets/lerobot/droid_1.0.1');
+FROM lerobot_cache_info('hf://datasets/lerobot/droid_1.0.1');
 ```
-
-| root | info_path | episodes_path | tasks_path | data_path | videos_path |
-| --- | --- | --- | --- | --- | --- |
-| `hf://datasets/lerobot/droid_1.0.1` | `…/meta/info.json` | `…/meta/episodes` | `…/meta/tasks.parquet` | `…/data` | `…/videos` |
 
 ## Native LeRobot v3 write
 
@@ -347,8 +330,15 @@ The data and video route caches are separate database-instance `ObjectCache`
 entries keyed by normalized dataset root. Entries are immutable and
 memory-accounted, so DuckDB can evict them. A size/mtime/version-tag fingerprint
 of `meta/info.json` invalidates stale entries automatically; `refresh := true`
-forces a rebuild for non-versioned or manually edited datasets. Versioned
-Hugging Face revisions should normally need no explicit refresh.
+invalidates both entries for non-versioned or manually edited datasets, after
+which a cache-consuming query rebuilds only what it needs. Versioned Hugging
+Face revisions should normally need no explicit refresh.
+
+`lerobot_cache_info(root)` always returns one `data` row and one `video` row
+with the stable columns `root`, `component`, `cached`, `entries`, and `bytes`.
+`entries` is zero or one for the corresponding `ObjectCache` entry, and `bytes`
+is its current memory estimate. This is a passive snapshot: it neither reads
+storage nor validates, refreshes, or creates a cache entry.
 
 The data route builder projects only `episode_index`, `length`,
 `data/chunk_index`, and `data/file_index` from episode metadata. The lazy video
@@ -385,8 +375,9 @@ git submodule update --init --recursive
 make
 ```
 
-The metadata and Parquet functions build without FFmpeg. Native visual writing
-and video decoding are enabled automatically when `pkg-config` can find
+The metadata and Parquet functions can be built without FFmpeg by explicitly
+setting `LEROBOT_ENABLE_FFMPEG=OFF`. Native visual writing and video decoding
+are enabled by default, and configuration fails unless `pkg-config` can find
 `libavformat`, `libavcodec`, `libavutil`, and `libswscale`; on Debian/Ubuntu the
 corresponding development packages can be installed with:
 
@@ -404,8 +395,11 @@ LEROBOT_FFMPEG_TESTS=1 make test
 The native CI matrix pins the DuckDB submodule at v1.5.5/C++11 and runs three
 configurations on Ubuntu 24.04: a metadata-only release build, an FFmpeg-enabled
 release build with every visual test enabled, and an FFmpeg-enabled
-ASAN+UBSAN build. CMake options can be reproduced locally without replacing the
-project's standard configure command, for example:
+ASAN+UBSAN build. The metadata-only job also installs the pinned official
+LeRobot release and runs the bidirectional format test documented in
+[`test/conformance/README.md`](test/conformance/README.md). CMake options can be
+reproduced locally without replacing the project's standard configure command,
+for example:
 
 ```bash
 LEROBOT_FFMPEG_TESTS=1 make test \
@@ -413,6 +407,16 @@ LEROBOT_FFMPEG_TESTS=1 make test \
   BUILD_TYPE=RelWithDebInfo \
   EXTRA_CMAKE_ARGS="-DLEROBOT_ENABLE_FFMPEG=ON -DFORCE_ASSERT=ON -DENABLE_SANITIZER=ON -DENABLE_UBSAN=ON"
 ```
+
+FFmpeg support is fail-closed: configuring with its default
+`LEROBOT_ENABLE_FFMPEG=ON` requires all four development libraries. Use
+`-DLEROBOT_ENABLE_FFMPEG=OFF` only when intentionally building the
+metadata-only variant.
+
+A release is blocked unless the complete native matrix and the pinned
+bidirectional conformance job pass, `LICENSE` is present, and every direct
+dependency or fixture is accounted for in `THIRD_PARTY_NOTICES.md`. The pull
+request template records the same checks before merge.
 
 `frame_indices` is the pre-decode sampling control for the low-level frame API;
 training reads should normally use `lerobot_video_windows`. `tolerance`
@@ -433,9 +437,8 @@ tasks by default; set `producer_threads` independently to change that limit.
 producers deschedule at that strict queue bound and consumers reschedule them
 after taking a buffer. A partial shard buffer is published before a producer
 blocks so even a one-target bound can always make progress.
-`max_open_shards` remains a deprecated compatibility alias for
-`max_cached_decoders`. Actual concurrent decoder work cannot exceed either the
-worker or decoder-session limit, but changing one no longer silently rewrites
+Actual concurrent decoder work cannot exceed either the worker or
+`max_cached_decoders` session limit, but changing one does not silently rewrite
 the other.
 `codec_threads` defaults to one FFmpeg thread per decoder to avoid nested
 oversubscription. `depth_output_unit` defaults to `mm` and can be set to `m`;
@@ -459,6 +462,13 @@ gates.
 Vane integration is tested against the matching official DuckDB release; Vane
 fork-specific integration stays in the Vane repository rather than leaking
 into this portable extension.
+
+## License
+
+The extension source is licensed under the
+[Apache License 2.0](LICENSE). Direct dependency licenses, optional FFmpeg codec
+implications, and test-fixture provenance are recorded in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## C++ compatibility
 

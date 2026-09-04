@@ -106,8 +106,12 @@ public:
 	LerobotDatasetMetadata(string root_p, LerobotDatasetInfo info_p, vector<LerobotEpisodeRoute> routes_p,
 	                       vector<string> data_files_p, FileFingerprint info_fingerprint_p);
 
-	static shared_ptr<LerobotDatasetMetadata> Get(ClientContext &context, const string &root, bool refresh,
-	                                              bool &cache_hit);
+	static shared_ptr<LerobotDatasetMetadata> Get(ClientContext &context, const string &root, bool refresh);
+	//! Return an existing cache entry without reading dataset storage or creating
+	//! a new entry.
+	static shared_ptr<LerobotDatasetMetadata> Peek(ClientContext &context, const string &root);
+	//! Remove both data and video routing entries for this dataset root.
+	static void Invalidate(ClientContext &context, const string &root);
 	static string ObjectType();
 
 	string GetObjectType() override;
@@ -115,19 +119,12 @@ public:
 
 	vector<string> ResolveDataFiles(const vector<int64_t> &episode_indices) const;
 	const LerobotEpisodeRoute *FindEpisodeRoute(int64_t episode_index) const;
-	const string &GetSchemaDataFile() const;
 	const vector<string> &GetDataFiles() const {
 		return data_files;
 	}
 
 	const string &GetRoot() const {
 		return root;
-	}
-	const string &GetCodebaseVersion() const {
-		return info.codebase_version;
-	}
-	const string &GetDataPathTemplate() const {
-		return info.data_path_template;
 	}
 	const string &GetVideoPathTemplate() const {
 		return info.video_path_template;
@@ -144,26 +141,11 @@ public:
 	const LerobotScanSchema &GetFrameSchema() const {
 		return info.frame_schema;
 	}
-	const LerobotScanSchema &GetEpisodeSchema() const {
-		return info.episode_schema;
-	}
-	int64_t GetTotalFrames() const {
-		return info.total_frames;
-	}
-	int64_t GetTotalTasks() const {
-		return info.total_tasks;
-	}
 	const FileFingerprint &GetInfoFingerprint() const {
 		return info_fingerprint;
 	}
 	idx_t GetEpisodeCount() const {
 		return static_cast<idx_t>(info.total_episodes);
-	}
-	idx_t GetDataFileCount() const {
-		return data_files.size();
-	}
-	idx_t GetVideoKeyCount() const {
-		return info.video_keys.size();
 	}
 
 private:
@@ -190,8 +172,11 @@ public:
 	                     vector<LerobotVideoRoute> routes_p, vector<string> video_files_p,
 	                     LerobotDatasetMetadata::FileFingerprint info_fingerprint_p);
 
-	static shared_ptr<LerobotVideoMetadata> Get(ClientContext &context, const string &root, bool refresh,
-	                                            bool &cache_hit);
+	static shared_ptr<LerobotVideoMetadata> Get(ClientContext &context, const string &root, bool refresh);
+	//! Return an existing cache entry without reading dataset storage or creating
+	//! a new entry.
+	static shared_ptr<LerobotVideoMetadata> Peek(ClientContext &context, const string &root);
+	static void Invalidate(ClientContext &context, const string &root);
 	static string ObjectType();
 
 	string GetObjectType() override;
@@ -212,23 +197,11 @@ public:
 		return video_feature_metadata[route.video_key_index];
 	}
 
-	const string &GetRoot() const {
-		return root;
-	}
-	const string &GetVideoPathTemplate() const {
-		return video_path_template;
-	}
 	int64_t GetFPS() const {
 		return fps;
 	}
 	const vector<string> &GetVideoKeys() const {
 		return video_keys;
-	}
-	idx_t GetRouteCount() const {
-		return routes.size();
-	}
-	idx_t GetVideoFileCount() const {
-		return video_files.size();
 	}
 
 private:

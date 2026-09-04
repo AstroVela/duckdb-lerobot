@@ -627,15 +627,16 @@ shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Load(ClientContext &c
 	                                               info_fingerprint);
 }
 
-shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Get(ClientContext &context, const string &root, bool refresh,
-                                                               bool &cache_hit) {
+shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Get(ClientContext &context, const string &root,
+                                                               bool refresh) {
 	auto &cache = ObjectCache::GetObjectCache(context);
 	const auto cache_key = CacheKey(root);
-	cache_hit = false;
+	if (refresh) {
+		Invalidate(context, root);
+	}
 	if (!refresh) {
 		auto cached = cache.Get<LerobotDatasetMetadata>(cache_key);
 		if (cached && cached->IsValid(context)) {
-			cache_hit = true;
 			return cached;
 		}
 	}
@@ -651,6 +652,17 @@ shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Get(ClientContext &co
 		}
 	}
 	throw IOException("LeRobot info.json changed while metadata was being loaded for '%s'", root);
+}
+
+shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Peek(ClientContext &context, const string &root) {
+	auto &cache = ObjectCache::GetObjectCache(context);
+	return cache.Get<LerobotDatasetMetadata>(CacheKey(root));
+}
+
+void LerobotDatasetMetadata::Invalidate(ClientContext &context, const string &root) {
+	auto &cache = ObjectCache::GetObjectCache(context);
+	cache.Delete(CacheKey(root));
+	LerobotVideoMetadata::Invalidate(context, root);
 }
 
 vector<string> LerobotDatasetMetadata::ResolveDataFiles(const vector<int64_t> &episode_indices) const {
@@ -680,11 +692,6 @@ const LerobotEpisodeRoute *LerobotDatasetMetadata::FindEpisodeRoute(int64_t epis
 		return nullptr;
 	}
 	return &*route;
-}
-
-const string &LerobotDatasetMetadata::GetSchemaDataFile() const {
-	static const string empty;
-	return data_files.empty() ? empty : data_files[0];
 }
 
 LerobotVideoMetadata::LerobotVideoMetadata(string root_p, string video_path_template_p, int64_t fps_p,
@@ -852,25 +859,20 @@ shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Load(ClientContext &conte
 	                                             std::move(video_files), dataset.GetInfoFingerprint());
 }
 
-shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Get(ClientContext &context, const string &root, bool refresh,
-                                                           bool &cache_hit) {
+shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Get(ClientContext &context, const string &root, bool refresh) {
 	auto &cache = ObjectCache::GetObjectCache(context);
 	const auto cache_key = CacheKey(root);
-	bool dataset_cache_hit;
-	auto dataset = LerobotDatasetMetadata::Get(context, root, refresh, dataset_cache_hit);
-	cache_hit = false;
+	auto dataset = LerobotDatasetMetadata::Get(context, root, refresh);
 	if (!refresh) {
 		auto cached = cache.Get<LerobotVideoMetadata>(cache_key);
 		if (cached && cached->IsValid(*dataset)) {
-			cache_hit = true;
 			return cached;
 		}
 	}
 
 	for (idx_t attempt = 0; attempt < 2; attempt++) {
 		auto loaded = Load(context, *dataset);
-		bool current_cache_hit;
-		auto current = LerobotDatasetMetadata::Get(context, root, false, current_cache_hit);
+		auto current = LerobotDatasetMetadata::Get(context, root, false);
 		if (loaded->IsValid(*current)) {
 			cache.Put(cache_key, loaded);
 			return loaded;
@@ -878,6 +880,16 @@ shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Get(ClientContext &contex
 		dataset = std::move(current);
 	}
 	throw IOException("LeRobot info.json changed while video metadata was being loaded for '%s'", root);
+}
+
+shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Peek(ClientContext &context, const string &root) {
+	auto &cache = ObjectCache::GetObjectCache(context);
+	return cache.Get<LerobotVideoMetadata>(CacheKey(root));
+}
+
+void LerobotVideoMetadata::Invalidate(ClientContext &context, const string &root) {
+	auto &cache = ObjectCache::GetObjectCache(context);
+	cache.Delete(CacheKey(root));
 }
 
 vector<LerobotVideoRoute> LerobotVideoMetadata::ResolveRoutes(const vector<int64_t> &episode_indices,

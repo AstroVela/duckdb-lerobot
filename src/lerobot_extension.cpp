@@ -21,7 +21,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		throw MissingExtensionException("The lerobot extension requires the json extension to be loaded");
 	}
 
-	for (auto &function : LerobotFunctions::GetTableFunctions(loader)) {
+	for (auto &function : LerobotFunctions::GetTableFunctions()) {
 		loader.RegisterFunction(std::move(function));
 	}
 	loader.RegisterFunction(LerobotCopyFunction::Create());

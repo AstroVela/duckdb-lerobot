@@ -68,7 +68,7 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ccache ninja-build pkg-config
+          sudo apt-get install -y -qq ccache ninja-build pkg-config python3-venv
 
       - name: Install FFmpeg development packages
         if: matrix.ffmpeg
@@ -135,6 +135,33 @@ jobs:
             grep -q -- '-fsanitize=address' "${BUILD_DIR}/compile_commands.json"
             grep -q -- '-fsanitize=undefined' "${BUILD_DIR}/compile_commands.json"
           fi
+
+      - name: Verify release-gate inputs
+        if: matrix.id == 'release-no-ffmpeg'
+        run: |
+          test -s LICENSE
+          test -s THIRD_PARTY_NOTICES.md
+          test -s test/conformance/test_bidirectional.py
+          grep -Fxq 'numpy==2.2.6' test/conformance/requirements.txt
+          grep -Fxq 'torchcodec==0.5' test/conformance/requirements.txt
+          grep -Fxq 'lerobot[dataset]==0.6.1' test/conformance/requirements.txt
+
+      - name: Run pinned LeRobot bidirectional conformance
+        if: matrix.id == 'release-no-ffmpeg'
+        env:
+          BUILD_DIR: build/${{ matrix.id }}
+        run: |
+          python3 -m venv "${BUILD_DIR}/conformance-venv"
+          "${BUILD_DIR}/conformance-venv/bin/python" -m pip install --upgrade pip
+          "${BUILD_DIR}/conformance-venv/bin/python" -m pip install \
+            torch==2.7.1 torchvision==0.22.1 torchcodec==0.5 \
+            --index-url https://download.pytorch.org/whl/cpu
+          "${BUILD_DIR}/conformance-venv/bin/python" -m pip install \
+            -r test/conformance/requirements.txt
+          "${BUILD_DIR}/conformance-venv/bin/python" \
+            test/conformance/test_bidirectional.py \
+            --duckdb "${BUILD_DIR}/duckdb" \
+            --extension "${BUILD_DIR}/extension/lerobot/src/lerobot.duckdb_extension"
 
       - name: Reject generated or build files outside ignored paths
         run: |

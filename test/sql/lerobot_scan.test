@@ -72,8 +72,8 @@ COPY (
 ) TO '{TEST_DIR}/lerobot_scan/meta/tasks.parquet' (FORMAT PARQUET);
 
 # Besides creating frames/chunk-00, this leaves an incompatible, unreferenced
-# Parquet file beneath the same tree. Both metadata-resolved frame scans must
-# ignore it.
+# Parquet file beneath the same tree. Metadata-resolved frame scans must ignore
+# it in both full and episode-pruned modes.
 statement ok
 COPY (
     SELECT 0 AS bootstrap, 'not a frame shard' AS poison
@@ -105,9 +105,27 @@ COPY (
 # The base scan resolves the complete authoritative file list through
 # info.json.data_path and the episode routes. The projected/filter query must
 # therefore read the custom frames/ layout while ignoring both poison files.
+query TIII
+SELECT component, cached, entries, bytes = 0
+FROM lerobot_cache_info('{TEST_DIR}/lerobot_scan')
+ORDER BY component;
+----
+data	false	0	true
+video	false	0	true
+
+# Repeating the diagnostic proves that its first invocation did not populate
+# either route cache, especially the lazy video component.
+query TIII
+SELECT component, cached, entries, bytes = 0
+FROM lerobot_cache_info('{TEST_DIR}/lerobot_scan')
+ORDER BY component;
+----
+data	false	0	true
+video	false	0	true
+
 query II
 SELECT episode_index, frame_index
-FROM lerobot_frames('{TEST_DIR}/lerobot_scan')
+FROM lerobot_scan('{TEST_DIR}/lerobot_scan')
 WHERE episode_index >= 1
 ORDER BY frame_index;
 ----
@@ -116,14 +134,13 @@ ORDER BY frame_index;
 2	4
 2	5
 
-# The native Parquet overloads and named parameters survive metadata-first
-# replacement. union_by_name exposes the later shard's evolved column,
-# filename proves native options reach the replacement scan, and refresh must
-# remain extension-owned rather than being passed to parquet_scan.
+# The public Parquet option whitelist survives bind replacement.
+# union_by_name exposes the later shard's evolved column and filename proves
+# the option reaches the replacement scan.
 query ITT
 SELECT frame_index, coalesce(shard_marker, 'missing'), filename
-FROM lerobot_frames(
-    ['{TEST_DIR}/lerobot_scan'],
+FROM lerobot_scan(
+    '{TEST_DIR}/lerobot_scan',
     refresh := true,
     union_by_name := true,
     filename := true
@@ -149,6 +166,23 @@ ORDER BY episode_index;
 1	2	0
 2	2	1
 
+query IIII
+SELECT count(*), count(DISTINCT source_file), min(file_row_number), max(file_row_number)
+FROM lerobot_episodes(
+    '{TEST_DIR}/lerobot_scan',
+    union_by_name := true,
+    filename := 'source_file',
+    file_row_number := true
+);
+----
+3	1	0	2
+
+statement error
+SELECT *
+FROM lerobot_episodes('{TEST_DIR}/lerobot_scan', hive_partitioning := true);
+----
+Invalid named parameter "hive_partitioning"
+
 query IT
 SELECT task_index, task
 FROM lerobot_tasks('{TEST_DIR}/lerobot_scan')
@@ -156,9 +190,19 @@ WHERE task_index = 1;
 ----
 1	place the cube
 
+statement error
+SELECT * FROM lerobot_tasks('{TEST_DIR}/lerobot_scan', filename := true);
+----
+Invalid named parameter "filename"
+
+statement error
+SELECT * FROM lerobot_info('{TEST_DIR}/lerobot_scan', format := 'newline_delimited');
+----
+Invalid named parameter "format"
+
 query II
 SELECT episode_index, frame_index
-FROM lerobot_episode_frames('{TEST_DIR}/lerobot_scan', [2, 1, 1])
+FROM lerobot_scan('{TEST_DIR}/lerobot_scan', episode_indices := [2, 1, 1])
 ORDER BY frame_index;
 ----
 1	2
@@ -166,17 +210,28 @@ ORDER BY frame_index;
 2	4
 2	5
 
-query TTTIII
-SELECT root, codebase_version, data_path, episode_count, data_file_count, cache_hit
-FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_scan');
+# Parquet output options are also forwarded through the episode-pruned
+# replacement relation, not only the full-scan form.
+query ITTI
+SELECT frame_index, shard_marker, source_file, file_row_number
+FROM lerobot_scan(
+    '{TEST_DIR}/lerobot_scan',
+    episode_indices := [2],
+    filename := 'source_file',
+    file_row_number := true
+)
+ORDER BY frame_index;
 ----
-{TEST_DIR}/lerobot_scan	v3.0	frames/chunk-{chunk_index:02d}/part-{file_index:04d}.parquet	3	2	true
+4	schema-v2	{TEST_DIR}/lerobot_scan/frames/chunk-00/part-0001.parquet	0
+5	schema-v2	{TEST_DIR}/lerobot_scan/frames/chunk-00/part-0001.parquet	1
 
 query TIII
-SELECT video_path, fps, video_key_count, cache_hit
-FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_scan');
+SELECT component, cached, entries, bytes > 0
+FROM lerobot_cache_info('{TEST_DIR}/lerobot_scan')
+ORDER BY component;
 ----
-media/{video_key}/chunk-{chunk_index:02d}/clip-{file_index:04d}.mp4	30	2	true
+data	true	1	true
+video	false	0	false
 
 query ITTIIRRI
 SELECT episode_index, video_key, video_path, chunk_index, file_index,
@@ -196,17 +251,19 @@ ORDER BY episode_index, video_key;
 1	observation.images.wrist	{TEST_DIR}/lerobot_scan/media/observation.images.wrist/chunk-00/clip-0005.mp4	0	5	1.1	1.166666	30
 2	observation.images.front	{TEST_DIR}/lerobot_scan/media/observation.images.front/chunk-00/clip-0001.mp4	0	1	0.2	0.266666	30
 
-query TIIIII
-SELECT video_path, fps, video_key_count, route_count, video_file_count, cache_hit
-FROM lerobot_video_metadata_cache('{TEST_DIR}/lerobot_scan');
+query TIII
+SELECT component, cached, entries, bytes > 0
+FROM lerobot_cache_info('{TEST_DIR}/lerobot_scan')
+ORDER BY component;
 ----
-media/{video_key}/chunk-{chunk_index:02d}/clip-{file_index:04d}.mp4	30	2	5	3	true
+data	true	1	true
+video	true	1	true
 
 query I
-SELECT cache_hit
-FROM lerobot_video_metadata_cache('{TEST_DIR}/lerobot_scan', refresh := true);
+SELECT count(*)
+FROM lerobot_video_routes('{TEST_DIR}/lerobot_scan', [0], refresh := true);
 ----
-false
+2
 
 query I
 SELECT count(*)
@@ -235,18 +292,35 @@ FROM lerobot_video_routes(
 Unknown LeRobot video key 'observation.images.missing'
 
 query I
-SELECT cache_hit
-FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_scan', refresh := true);
+SELECT count(*)
+FROM lerobot_info('{TEST_DIR}/lerobot_scan', refresh := true);
 ----
-false
+1
 
-# Changing the info.json commit marker invalidates the route cache without an
-# explicit refresh. The extra field also changes the file size deterministically.
+# Metadata bind replacement invalidates the routing caches on refresh without
+# repopulating either cache as a side effect.
+query TIII
+SELECT component, cached, entries, bytes = 0
+FROM lerobot_cache_info('{TEST_DIR}/lerobot_scan')
+ORDER BY component;
+----
+data	false	0	true
+video	false	0	true
+
+# Rebuild both components, then change the info.json commit marker. The changed
+# path length makes the fingerprint change deterministic even on coarse-mtime
+# filesystems.
+query I
+SELECT count(*)
+FROM lerobot_video_routes('{TEST_DIR}/lerobot_scan', [0]);
+----
+2
+
 statement ok
 COPY (
     SELECT 'v3.0' AS codebase_version,
            'frames/chunk-{chunk_index:02d}/part-{file_index:04d}.parquet' AS data_path,
-           'media/{video_key}/chunk-{chunk_index:02d}/clip-{file_index:04d}.mp4' AS video_path,
+           'media-updated/{video_key}/chunk-{chunk_index:02d}/clip-{file_index:04d}.mp4' AS video_path,
            30 AS fps,
            3 AS total_episodes,
            6 AS total_frames,
@@ -259,33 +333,40 @@ COPY (
 ) TO '{TEST_DIR}/lerobot_scan/meta/info.json'
   (FORMAT JSON, ARRAY false, OVERWRITE_OR_IGNORE);
 
-query I
-SELECT cache_hit
-FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_scan');
+# No explicit refresh: both stale components must be replaced from the new
+# info.json fingerprint before video routes are resolved.
+query T
+SELECT video_path
+FROM lerobot_video_routes(
+    '{TEST_DIR}/lerobot_scan',
+    [0],
+    video_keys := ['observation.images.front']
+);
 ----
-false
-
-query I
-SELECT cache_hit
-FROM lerobot_video_metadata_cache('{TEST_DIR}/lerobot_scan');
-----
-false
+{TEST_DIR}/lerobot_scan/media-updated/observation.images.front/chunk-00/clip-0000.mp4
 
 query I
 SELECT count(*)
-FROM lerobot_episode_frames('{TEST_DIR}/lerobot_scan', []);
+FROM lerobot_scan('{TEST_DIR}/lerobot_scan', episode_indices := []);
 ----
 0
 
 query I
 SELECT count(*)
-FROM lerobot_episode_frames('{TEST_DIR}/lerobot_scan', [999]);
+FROM (DESCRIBE SELECT *
+      FROM lerobot_scan('{TEST_DIR}/lerobot_scan', episode_indices := []));
+----
+3
+
+query I
+SELECT count(*)
+FROM lerobot_scan('{TEST_DIR}/lerobot_scan', episode_indices := [999]);
 ----
 0
 
 statement error
 SELECT *
-FROM lerobot_episode_frames('{TEST_DIR}/lerobot_scan', [-1]);
+FROM lerobot_scan('{TEST_DIR}/lerobot_scan', episode_indices := [-1]);
 ----
 LeRobot episode indices must be non-negative
 
@@ -326,17 +407,11 @@ COPY (
            0 AS metadata_chunk
 ) TO '{TEST_DIR}/lerobot_no_video/meta/episodes' (FORMAT PARQUET, PARTITION_BY (metadata_chunk));
 
-query III
-SELECT fps, video_key_count, episode_count
-FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_no_video');
+query IIT
+SELECT fps, total_episodes, features.action.dtype
+FROM lerobot_info('{TEST_DIR}/lerobot_no_video');
 ----
-30	0	1
-
-query IIII
-SELECT video_key_count, route_count, video_file_count, cache_hit
-FROM lerobot_video_metadata_cache('{TEST_DIR}/lerobot_no_video');
-----
-0	0	0	false
+30	1	float32
 
 query I
 SELECT count(*)
@@ -376,7 +451,7 @@ COPY (
 
 statement error
 SELECT *
-FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_incomplete_depth');
+FROM lerobot_scan('{TEST_DIR}/lerobot_incomplete_depth');
 ----
 requires video.depth_min, video.depth_max, video.shift, video.use_log, video.pix_fmt, and a channel dimension
 
@@ -410,7 +485,7 @@ COPY (
 
 statement error
 SELECT *
-FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_incomplete_depth', refresh := true);
+FROM lerobot_scan('{TEST_DIR}/lerobot_incomplete_depth', refresh := true);
 ----
 uses depth-only metadata but info.is_depth_map is not true
 
@@ -436,7 +511,7 @@ COPY (
 
 statement error
 SELECT *
-FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_incomplete_depth', refresh := true);
+FROM lerobot_scan('{TEST_DIR}/lerobot_incomplete_depth', refresh := true);
 ----
 uses a legacy depth marker; use info.is_depth_map instead
 
@@ -466,6 +541,6 @@ COPY (
 
 statement error
 SELECT *
-FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_duplicate_video_key');
+FROM lerobot_scan('{TEST_DIR}/lerobot_duplicate_video_key');
 ----
 Duplicate LeRobot video feature key 'observation.images.front' in info.json

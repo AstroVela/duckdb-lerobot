@@ -33,9 +33,10 @@ record. Callers filter episode metadata before the
 extension expands frame Parquet rows. This prevents a query that selects a
 small set of episodes from eagerly scanning or decoding the entire dataset.
 
-The initial SQL interface for that second phase is:
+The SQL interface for that second phase is:
 
-    SELECT * FROM lerobot_episode_frames(root, [episode_index, ...]);
+    SELECT *
+    FROM lerobot_scan(root, episode_indices := [episode_index, ...]);
 
 The ordered training interface is:
 
@@ -88,7 +89,7 @@ Non-video temporal features use the corresponding relation operator:
     )
     SELECT targets.*, frames."observation.state", frames.action, tasks.task
     FROM targets
-    JOIN lerobot_frames(root) frames
+    JOIN lerobot_scan(root) frames
       ON frames.episode_index = targets.episode_index
      AND frames.frame_index = targets.target_frame_index
     JOIN lerobot_tasks(root) tasks USING (task_index);
@@ -120,39 +121,32 @@ MP4 path, chunk/file indices, episode-local `from_timestamp` and
 episode is skipped; a partially NULL route is rejected as corrupt metadata.
 The function does not open the MP4.
 
-`lerobot_info`, `lerobot_episodes`, and `lerobot_tasks` are native C++ table
-functions. Following DuckDB Iceberg's implementation pattern, each clones a
-registered DuckDB scan function set and replaces only its `MultiFileReader`.
-The LeRobot reader normalizes the dataset root and expands it to the fixed v3
-metadata path. It reads the authoritative totals before expanding Parquet
-files. When the relevant total is zero, its custom bind publishes the strict
-v3 schema without opening a file; a positive total with no matching file is an
-error. As with DuckDB Iceberg's custom root reader, scans that remain on this
-reader explicitly do not support plan serialization rather than delegating to
-the native serializer, which would persist expanded files and lose
-dataset-root metadata semantics.
+`lerobot_info`, `lerobot_episodes`, and `lerobot_tasks` are bind-replacement
+table functions. Each resolves an explicit dataset root to a native
+`read_json_auto` or `read_parquet` relation and exposes only its documented
+parameters. The wrapper disappears from the bound plan, so native plan
+serialization and scan behavior are retained. For a zero-episode dataset,
+`lerobot_episodes` emits a typed zero-row relation derived from
+`info.json.features`, while `lerobot_tasks` emits its fixed two-column schema;
+neither attempts to open a nonexistent Parquet file. `lerobot_info` continues
+to scan the one committed `info.json` record.
 
-`lerobot_frames` is a bind-replacement table function. It loads the immutable
+`lerobot_scan` is a bind-replacement table function. It loads the immutable
 base route cache, takes its deduplicated file list resolved from the
 authoritative `info.json.data_path` template and episode chunk/file indices,
-and binds that list directly as a native `parquet_scan`. No `data/` glob or
+and binds that list directly as a native `read_parquet`. No `data/` glob or
 alternate-layout fallback exists. The resulting scan remains DuckDB's own
 logical get, preserving schema inference, parallel reads, projection and filter
 pushdown, join dynamic filters, footer caching, and row-group pruning. Its
-function set retains the native Parquet overloads and named parameters; the
-bind replacement forwards those parameters after consuming only `refresh`.
-For a zero-frame dataset, the replacement falls through to the same LeRobot
-`MultiFileReader` empty bind and derives the frame schema from
-`info.json.features`.
-
-`lerobot_episode_frames` is a bind-replacement table function. It constructs a
-relational `episode_index IN (...)` predicate over a native `parquet_scan`.
-Before constructing that relation it resolves the selected episode indices
-through the cached v3 metadata route table, so the Parquet scan receives only
-the distinct data shards that can contain those episodes. The optimizer still
-pushes the row predicate into those files. An empty or unknown episode set uses
-one known shard only to bind the output schema, then produces no rows; negative
-or NULL indices are rejected during binding.
+public Parquet parameter whitelist is `union_by_name`, `binary_as_string`,
+`filename`, and `file_row_number`. If `episode_indices` is supplied, the
+replacement resolves only the distinct data shards that can contain those
+episodes and constructs a relational `episode_index IN (...)` predicate. The
+optimizer still pushes the predicate into those files. A zero-frame dataset or
+an empty/unknown episode set returns no rows. The former derives its schema
+from `info.json.features`; the latter binds one authoritative shard so its
+schema remains the native Parquet schema. Negative or NULL indices are rejected
+during binding.
 
 The base route cache stores the authoritative `codebase_version`, `data_path`,
 `video_path`, `fps`, total counts, empty-dataset schemas, and sorted video
@@ -163,18 +157,20 @@ timestamps, and one copy of each resolved MP4 path. Keeping the caches separate
 means ordinary frame scans never materialize the larger episode-by-camera
 table. Both database-instance `ObjectCache` entries are memory-accounted and
 immutable. `info.json` size, modification time, and version tag form the
-invalidation marker; callers can also pass `refresh := true` to route or cache
-functions.
+invalidation marker; callers can also pass `refresh := true` to data and
+metadata functions. Refresh invalidates both route-cache components before
+rebuilding whichever component the query actually needs.
 
 This is intentionally above the Parquet layer. DuckDB continues to own footer
 metadata, row-group statistics, the optional `parquet_metadata_cache`, and the
 external file/block cache. The extension neither parses nor duplicates those
 caches. On a base route-cache miss, its metadata query projects only the four
 episode length/data route columns through DuckDB's native Parquet reader. The
-video cache is
-not populated until `lerobot_video_routes` or
-`lerobot_video_metadata_cache` is bound; that query projects only four columns
-per video key plus `episode_index` and episode `length`.
+video cache is not populated until a video route or decode function needs it;
+that query projects only four columns per video key plus `episode_index` and
+episode `length`. `lerobot_cache_info` only reports whether the data and video
+entries already exist and their estimated bytes; it never validates or creates
+either entry.
 
 Control-plane cache construction itself is synchronous at bind: it executes
 the `info.json` and projected `meta/episodes` reads through an internal DuckDB

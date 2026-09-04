@@ -416,12 +416,14 @@ def find_profile_metrics(value: Any, output: dict[str, int]) -> None:
 
 
 def selection_query(args: argparse.Namespace, root: str) -> str:
-    episode_filter = (
-        "" if args.all_episodes else f"WHERE episode_index = {args.episode}"
+    scan = (
+        f"lerobot_scan({root})"
+        if args.all_episodes
+        else f"lerobot_scan({root}, episode_indices := [{args.episode}])"
     )
     return (
         "SELECT episode_index, frame_index "
-        f"FROM lerobot_frames({root}) {episode_filter} "
+        f"FROM {scan} "
         "ORDER BY episode_index, frame_index "
         f"LIMIT {args.rows}"
     )
@@ -711,7 +713,7 @@ def run_duckdb_python(
         "available_cameras": available_cameras,
         "camera_inventory_query": camera_inventory_query,
         "selection_seconds": selection_seconds,
-        "selection_strategy": "metadata-only lerobot_frames query",
+        "selection_strategy": "native lerobot_scan frame query",
         "timed_query": timed_query.strip(),
         "validation_query": validation_query.strip(),
         "timing_boundary": (
@@ -827,7 +829,7 @@ def run_duckdb_cli(
         "available_cameras": available_cameras,
         "camera_inventory_query": camera_inventory_query,
         "selection_seconds": selection_seconds,
-        "selection_strategy": "metadata-only lerobot_frames query",
+        "selection_strategy": "native lerobot_scan frame query",
         "timed_query": timed_query.strip(),
         "validation_query": validation_query.strip(),
         "timing_boundary": (

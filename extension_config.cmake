@@ -1,5 +1,5 @@
-# LeRobot scan functions copy the native JSON and Parquet function sets at
-# extension load time, so register those dependencies first for linked builds.
+# LeRobot bind replacement targets the native JSON and Parquet functions, so
+# register those dependencies first for linked builds.
 duckdb_extension_load(parquet)
 duckdb_extension_load(json)
 

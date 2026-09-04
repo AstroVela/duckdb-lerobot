@@ -29,7 +29,7 @@ COPY (
 query ITI
 SELECT frame_index, ("observation.images.front").path,
 	       octet_length(("observation.images.front").bytes) > 0
-FROM lerobot_frames('{TEST_DIR}/lerobot_copy_image')
+FROM lerobot_scan('{TEST_DIR}/lerobot_copy_image')
 ORDER BY frame_index;
 ----
 0	frame-000000.png	true
@@ -37,7 +37,7 @@ ORDER BY frame_index;
 
 query IT
 SELECT frame_index, left(hex(("observation.images.front").bytes), 16)
-FROM lerobot_frames('{TEST_DIR}/lerobot_copy_image')
+FROM lerobot_scan('{TEST_DIR}/lerobot_copy_image')
 ORDER BY frame_index;
 ----
 0	89504E470D0A1A0A
