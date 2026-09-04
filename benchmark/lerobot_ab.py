@@ -1082,7 +1082,9 @@ def comparison_contract(result: dict[str, Any]) -> dict[str, Any]:
     if result["available_camera_count"] != len(available_cameras):
         raise ValueError("available_camera_count does not match available_cameras")
     validate_requested_cameras(cameras)
-    validate_camera_inventory(result["engine"], cameras, available_cameras)
+    available_cameras = validate_camera_inventory(
+        result["engine"], cameras, available_cameras
+    )
     expected_decoded_images = result["requested_frame_rows"] * len(cameras)
     validated_selected_frames = selected_frames_from_rows(
         result["rows"], cameras, result["requested_frame_rows"]
@@ -1123,6 +1125,8 @@ def comparison_contract(result: dict[str, Any]) -> dict[str, Any]:
         "width": configuration["width"],
         "height": configuration["height"],
         "cache_state": result["cache_state"],
+        "warmups": result["warmups"],
+        "repeats": result["repeats"],
         "hardware_identity": expected_hardware,
     }
 

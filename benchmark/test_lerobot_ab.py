@@ -100,6 +100,8 @@ def synthetic_result(engine: str) -> dict:
         "decoded_images": 4,
         "timed_summary": {"frame_rows": 2, "decoded_images": 4},
         "cache_state": "warm-process",
+        "warmups": 1,
+        "repeats": 3,
         "decode_median_seconds": {"duckdb": 1.0, "daft": 2.0, "lerobot": 3.0}[engine],
         "validation_seconds": 0.1,
         "configuration": {
@@ -475,6 +477,8 @@ class LeRobotBenchmarkTest(TestCase):
             ),
             "available_cameras": different_available_cameras,
             "hardware_identity": different_hardware,
+            "warmups": lambda result: result.update(warmups=0),
+            "repeats": lambda result: result.update(repeats=5),
         }
 
         with TemporaryDirectory() as directory:
@@ -513,6 +517,23 @@ class LeRobotBenchmarkTest(TestCase):
                 )
         self.assertEqual(status, 1)
         self.assertIn("PIXEL MISMATCH", stderr.getvalue())
+
+    def test_compare_normalizes_available_camera_inventory_order(self) -> None:
+        baseline = synthetic_result("duckdb")
+        candidate = synthetic_result("lerobot")
+        candidate["available_cameras"].reverse()
+
+        with TemporaryDirectory() as directory:
+            baseline_path = Path(directory) / "baseline.json"
+            candidate_path = Path(directory) / "candidate.json"
+            baseline_path.write_text(json.dumps(baseline))
+            candidate_path.write_text(json.dumps(candidate))
+            with redirect_stdout(io.StringIO()):
+                status = lerobot_ab.compare_command(
+                    SimpleNamespace(results=[str(baseline_path), str(candidate_path)])
+                )
+
+        self.assertEqual(status, 0)
 
     def test_compare_rejects_incomplete_timed_workload(self) -> None:
         baseline = synthetic_result("duckdb")

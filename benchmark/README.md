@@ -12,7 +12,9 @@ count, and RGB conversion/fan-out counts.
 `compare` rejects results before printing timing ratios when their revision,
 requested or available cameras, actual frame selection, temporal window,
 reference backend, resize/tolerance contract, cache state, or hardware identity
-differs. Schema-version-3 artifacts are intentionally not accepted.
+differs. Warmup and repeat counts must also match so cache preparation and
+median sample sizes stay comparable. Schema-version-3 artifacts are
+intentionally not accepted.
 
 The common cross-engine comparison intentionally uses `delta_timestamps =
 [0.0]`: Daft's public dataset reader does not expose LeRobot temporal-window
