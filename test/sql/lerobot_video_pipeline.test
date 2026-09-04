@@ -1,6 +1,6 @@
 # name: test/sql/lerobot_video_pipeline.test
 # description: Bounded parallel timestamp producers feed LeRobot video source consumers
-# group: [lerobot]
+# group: [sql]
 
 require parquet
 

@@ -17,6 +17,7 @@ AllowAllParametersOfDeclarationOnNextLine: true
 AlignAfterOpenBracket: Align
 SpaceBeforeCpp11BracedList: true
 SpaceBeforeCtorInitializerColon: true
+SpaceBeforeInheritanceColon: true
 SpacesInAngles: false
 SpacesInCStyleCastParentheses: false
 SpacesInConditionalStatement: false

@@ -1,6 +1,6 @@
 # name: test/sql/lerobot_video_projection.test
 # description: Metadata-only video projections do not require FFmpeg or open MP4 files
-# group: [lerobot]
+# group: [sql]
 
 require parquet
 

@@ -27,7 +27,9 @@ jobs:
         include:
           - id: release-no-ffmpeg
             name: Release / FFmpeg disabled
-            build_type: Release
+            build_target: release
+            test_target: test_release
+            build_dir: build/release
             ffmpeg: false
             sanitizers: false
             cmake_options: >-
@@ -35,28 +37,36 @@ jobs:
               -DENABLE_SANITIZER=OFF
               -DENABLE_UBSAN=OFF
           - id: release-ffmpeg
-            name: Release / FFmpeg enabled
-            build_type: Release
+            name: Release / FFmpeg + libaom
+            build_target: release
+            test_target: test_release
+            build_dir: build/release
             ffmpeg: true
             sanitizers: false
             cmake_options: >-
               -DLEROBOT_ENABLE_FFMPEG=ON
+              -DLEROBOT_REQUIRE_FFMPEG=ON
+              -DLEROBOT_AV1_ENCODER=libaom
               -DENABLE_SANITIZER=OFF
               -DENABLE_UBSAN=OFF
           - id: sanitize-ffmpeg
-            name: ASAN + UBSAN / FFmpeg enabled
-            build_type: RelWithDebInfo
+            name: ASAN + UBSAN / FFmpeg + SVT
+            build_target: reldebug
+            test_target: test_reldebug
+            build_dir: build/reldebug
             ffmpeg: true
             sanitizers: true
             cmake_options: >-
               -DLEROBOT_ENABLE_FFMPEG=ON
+              -DLEROBOT_REQUIRE_FFMPEG=ON
+              -DLEROBOT_AV1_ENCODER=svt
               -DFORCE_ASSERT=ON
               -DENABLE_SANITIZER=ON
               -DENABLE_UBSAN=ON
 
     env:
-      CMAKE_GENERATOR: Ninja
-      JOBS: 4
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      GEN: ninja
 
     steps:
       - name: Check out the pinned DuckDB source
@@ -75,6 +85,7 @@ jobs:
         run: |
           sudo apt-get install -y -qq \
             ffmpeg \
+            libaom-dev \
             libavcodec-dev \
             libavformat-dev \
             libavutil-dev \
@@ -94,9 +105,7 @@ jobs:
 
       - name: Build and run the complete extension suite
         env:
-          BUILD_DIR: build/${{ matrix.id }}
-          BUILD_TYPE: ${{ matrix.build_type }}
-          EXTRA_CMAKE_ARGS: >-
+          EXT_FLAGS: >-
             ${{ matrix.cmake_options }}
             -DCMAKE_C_COMPILER_LAUNCHER=ccache
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
@@ -111,16 +120,13 @@ jobs:
             export ASAN_OPTIONS='detect_leaks=0:halt_on_error=1'
             export UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1'
           fi
-          make test \
-            BUILD_DIR="${BUILD_DIR}" \
-            BUILD_TYPE="${BUILD_TYPE}" \
-            JOBS="${JOBS}" \
-            EXTRA_CMAKE_ARGS="${EXTRA_CMAKE_ARGS}"
+          make "${{ matrix.build_target }}" GEN="${GEN}" EXT_FLAGS="${EXT_FLAGS}"
+          make "${{ matrix.test_target }}"
           ccache --show-stats
 
       - name: Verify pinned build configuration
         env:
-          BUILD_DIR: build/${{ matrix.id }}
+          BUILD_DIR: ${{ matrix.build_dir }}
         run: |
           expected_duckdb_commit="$(git ls-tree HEAD duckdb | awk '{print $3}')"
           test "${expected_duckdb_commit}" = 'd8cdaa33fda8df955cc76ef58a280f68f4cd43fa'
@@ -128,6 +134,14 @@ jobs:
           grep -Fxq 'CMAKE_CXX_STANDARD:STRING=11' "${BUILD_DIR}/CMakeCache.txt"
           if [[ "${{ matrix.ffmpeg }}" == "true" ]]; then
             grep -q -- '-DLEROBOT_HAVE_FFMPEG=1' "${BUILD_DIR}/compile_commands.json"
+            ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'libx265'
+            if [[ "${{ matrix.id }}" == "release-ffmpeg" ]]; then
+              grep -q -- '-DLEROBOT_AV1_ENCODER_LIBAOM=1' "${BUILD_DIR}/compile_commands.json"
+              ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'libaom-av1'
+            else
+              grep -q -- '-DLEROBOT_AV1_ENCODER_SVT=1' "${BUILD_DIR}/compile_commands.json"
+              ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'libsvtav1'
+            fi
           else
             ! grep -q -- '-DLEROBOT_HAVE_FFMPEG=1' "${BUILD_DIR}/compile_commands.json"
           fi

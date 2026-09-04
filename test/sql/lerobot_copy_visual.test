@@ -1,6 +1,6 @@
 # name: test/sql/lerobot_copy_visual.test
 # description: Native COPY embeds images and writes concatenated RGB and depth video shards
-# group: [lerobot]
+# group: [sql]
 
 require-env LEROBOT_FFMPEG_TESTS
 

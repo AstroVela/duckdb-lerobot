@@ -1,6 +1,6 @@
 # name: test/sql/lerobot_scan.test
 # description: LeRobot native scans reuse DuckDB JSON and Parquet readers
-# group: [lerobot]
+# group: [sql]
 
 require parquet
 

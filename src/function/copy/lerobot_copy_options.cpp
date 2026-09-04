@@ -84,9 +84,9 @@ void ParseLerobotCopyOptionalConfig(ClientContext &context, const CopyFunctionBi
 	auto codec = GetSingleOption(input, "rgb_codec", false);
 	if (!codec.IsNull()) {
 		encoding.rgb_codec = StringValue::Get(codec.DefaultCastAs(LogicalType::VARCHAR));
-	}
-	if (encoding.rgb_codec != "libsvtav1" && encoding.rgb_codec != "libaom-av1") {
-		throw BinderException("LeRobot RGB_CODEC must be 'libsvtav1' or 'libaom-av1'");
+		if (encoding.rgb_codec != "libsvtav1" && encoding.rgb_codec != "libaom-av1") {
+			throw BinderException("LeRobot RGB_CODEC must be 'libsvtav1' or 'libaom-av1'");
+		}
 	}
 	auto crf = GetNumericOption<double>(input, "rgb_crf", 30);
 	auto gop = GetNumericOption<double>(input, "rgb_gop", 2);

@@ -1,0 +1,24 @@
+{
+  "name": "x265",
+  "version": "4.1",
+  "port-version": 2,
+  "description": "x265 H.265/HEVC encoder with an opt-in Main12 build for LeRobot depth videos",
+  "homepage": "https://bitbucket.org/multicoreware/x265_git/",
+  "license": "GPL-2.0-or-later",
+  "supports": "!uwp & !xbox",
+  "dependencies": [
+    {
+      "name": "vcpkg-cmake",
+      "host": true
+    }
+  ],
+  "features": {
+    "main12": {
+      "description": "Build the x265 API for 12-bit input"
+    },
+    "tool": {
+      "description": "Build the command line tool",
+      "supports": "!uwp"
+    }
+  }
+}

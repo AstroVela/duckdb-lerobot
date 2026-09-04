@@ -1,6 +1,6 @@
 # name: test/sql/lerobot_temporal_targets.test
 # description: LeRobot temporal targets align state and action windows without video decode
-# group: [lerobot]
+# group: [sql]
 
 require parquet
 

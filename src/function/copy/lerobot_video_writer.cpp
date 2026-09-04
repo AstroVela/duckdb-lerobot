@@ -374,12 +374,33 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 	}
 
 	const auto is_depth = options.raw_type != LerobotRawVisualType::RGB24;
-	const auto codec_name = is_depth ? "libx265" : options.encoding.rgb_codec.c_str();
-	const auto is_svt = !is_depth && options.encoding.rgb_codec == "libsvtav1";
-	const AVCodec *codec = avcodec_find_encoder_by_name(codec_name);
-	if (!codec) {
-		throw MissingExtensionException("FFmpeg has no %s encoder required by FORMAT lerobot", codec_name);
+	const AVCodec *codec = nullptr;
+	const char *required_encoder = "libx265";
+	if (is_depth) {
+		codec = avcodec_find_encoder_by_name("libx265");
+	} else if (!options.encoding.rgb_codec.empty()) {
+		// Explicit SQL selections never fall back to another encoder.
+		required_encoder = options.encoding.rgb_codec.c_str();
+		codec = avcodec_find_encoder_by_name(required_encoder);
+	} else {
+#if defined(LEROBOT_AV1_ENCODER_SVT)
+		required_encoder = "libsvtav1";
+		codec = avcodec_find_encoder_by_name(required_encoder);
+#elif defined(LEROBOT_AV1_ENCODER_LIBAOM)
+		required_encoder = "libaom-av1";
+		codec = avcodec_find_encoder_by_name(required_encoder);
+#else
+		codec = avcodec_find_encoder_by_name("libsvtav1");
+		if (!codec) {
+			codec = avcodec_find_encoder_by_name("libaom-av1");
+		}
+		required_encoder = "libsvtav1 or libaom-av1";
+#endif
 	}
+	if (!codec) {
+		throw MissingExtensionException("FFmpeg has no %s encoder required by FORMAT lerobot", required_encoder);
+	}
+	const auto is_svt = !is_depth && strcmp(codec->name, "libsvtav1") == 0;
 
 	AVFormatContext *raw_output = nullptr;
 	ThrowOnFFmpegError(avformat_alloc_output_context2(&raw_output, nullptr, "mp4", path.c_str()),
@@ -513,6 +534,7 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 	ThrowOnFFmpegError(av_write_trailer(output.get()), "write the MP4 trailer for", path);
 
 	LerobotEncodedVideoInfo result;
+	result.encoder = codec->name;
 	result.codec = avcodec_get_name(stream->codecpar->codec_id);
 	const auto pixel_format = av_get_pix_fmt_name(static_cast<AVPixelFormat>(stream->codecpar->format));
 	if (!pixel_format) {
