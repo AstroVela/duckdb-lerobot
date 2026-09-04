@@ -407,7 +407,9 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 	if (is_depth) {
 		string x265_parameters = "lossless=1";
 		if (options.encoder_threads.IsValid()) {
-			x265_parameters += ":pools=" + std::to_string(options.encoder_threads.GetIndex()) + ":frame-threads=1";
+			const auto encoder_threads = options.encoder_threads.GetIndex();
+			x265_parameters += encoder_threads == 1 ? ":pools=none" : ":pools=" + std::to_string(encoder_threads - 1);
+			x265_parameters += ":frame-threads=1";
 		}
 		av_dict_set(&raw_codec_options, "x265-params", x265_parameters.c_str(), 0);
 	} else {
