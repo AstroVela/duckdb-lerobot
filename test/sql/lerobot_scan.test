@@ -151,6 +151,17 @@ ORDER BY frame_index;
 1	missing	{TEST_DIR}/lerobot_scan/frames/chunk-00/part-0000.parquet
 4	schema-v2	{TEST_DIR}/lerobot_scan/frames/chunk-00/part-0001.parquet
 
+# ANY-typed filename values must still conform to its documented BOOLEAN or
+# VARCHAR forms, including when native Parquet binding has real shards.
+statement error
+SELECT *
+FROM lerobot_scan(
+    '{TEST_DIR}/lerobot_scan',
+    filename := struct_pack(enabled := true)
+);
+----
+Unimplemented type for cast
+
 query TTI
 SELECT codebase_version, data_path, fps
 FROM lerobot_info('{TEST_DIR}/lerobot_scan');

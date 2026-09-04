@@ -21,6 +21,10 @@ LerobotCreateTableFunctionRef(const char *name, Value argument,
 
 Value LerobotCreatePathList(const vector<string> &paths);
 
+//! Validate the whitelisted Parquet options whose native ANY-typed bind
+//! handling would otherwise silently ignore an unsupported value.
+void LerobotValidateParquetOptions(const named_parameter_map_t &parameters);
+
 //! Produce a typed zero-row relation and mirror the documented Parquet output
 //! options that affect an empty scan's schema.
 unique_ptr<TableRef>

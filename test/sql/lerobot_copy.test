@@ -474,6 +474,15 @@ FROM lerobot_scan('{TEST_DIR}/lerobot_copy_empty', union_by_name := NULL);
 ----
 union_by_name must not be NULL
 
+statement error
+SELECT *
+FROM lerobot_scan(
+    '{TEST_DIR}/lerobot_copy_empty',
+    filename := struct_pack(enabled := true)
+);
+----
+Unimplemented type for cast
+
 # Parameters outside the documented Parquet whitelist are rejected before
 # native binding, including the former implementation-level schema fallback.
 statement error

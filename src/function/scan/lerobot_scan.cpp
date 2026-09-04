@@ -67,6 +67,7 @@ named_parameter_map_t GetParquetParameters(TableFunctionBindInput &input) {
 	auto parameters = input.named_parameters;
 	parameters.erase("episode_indices");
 	parameters.erase("refresh");
+	LerobotValidateParquetOptions(parameters);
 	return parameters;
 }
 

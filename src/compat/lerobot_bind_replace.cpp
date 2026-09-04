@@ -51,6 +51,22 @@ bool GetBooleanOption(const named_parameter_map_t &parameters, const char *name)
 	return BooleanValue::Get(entry->second);
 }
 
+void ValidateFilenameOption(const named_parameter_map_t &parameters) {
+	auto filename = parameters.find("filename");
+	if (filename == parameters.end()) {
+		return;
+	}
+	if (filename->second.IsNull()) {
+		throw BinderException("filename must not be NULL");
+	}
+	if (filename->second.type() != LogicalType::VARCHAR) {
+		// MultiFileReader accepts ANY for filename. Reject values that cannot be
+		// interpreted as its documented BOOLEAN alternative instead of silently
+		// treating them as false.
+		filename->second.DefaultCastAs(LogicalType::BOOLEAN);
+	}
+}
+
 void AddEmptyParquetOptionColumns(ClientContext &context, const named_parameter_map_t &parameters,
                                   vector<string> &names, vector<LogicalType> &types) {
 	// This option has no effect without files, but native read_parquet still
@@ -75,20 +91,13 @@ void AddEmptyParquetOptionColumns(ClientContext &context, const named_parameter_
 
 	auto filename = parameters.find("filename");
 	if (filename != parameters.end()) {
-		if (filename->second.IsNull()) {
-			throw BinderException("filename must not be NULL");
-		}
 		bool enabled = false;
 		string column_name = "filename";
 		if (filename->second.type() == LogicalType::VARCHAR) {
 			enabled = true;
 			column_name = StringValue::Get(filename->second);
 		} else {
-			Value boolean_value;
-			string error;
-			if (filename->second.DefaultTryCastAs(LogicalType::BOOLEAN, boolean_value, &error)) {
-				enabled = BooleanValue::Get(boolean_value);
-			}
+			enabled = BooleanValue::Get(filename->second.DefaultCastAs(LogicalType::BOOLEAN));
 		}
 		if (enabled) {
 			if (std::find(names.begin(), names.end(), column_name) != names.end()) {
@@ -133,12 +142,17 @@ Value LerobotCreatePathList(const vector<string> &paths) {
 	return Value::LIST(LogicalType::VARCHAR, std::move(values));
 }
 
+void LerobotValidateParquetOptions(const named_parameter_map_t &parameters) {
+	ValidateFilenameOption(parameters);
+}
+
 unique_ptr<TableRef> LerobotCreateEmptyParquetRelation(ClientContext &context, vector<string> names,
                                                        vector<LogicalType> types,
                                                        const named_parameter_map_t &parameters) {
 	if (names.size() != types.size()) {
 		throw InternalException("LeRobot empty Parquet schema names/types size mismatch");
 	}
+	LerobotValidateParquetOptions(parameters);
 	AddEmptyParquetOptionColumns(context, parameters, names, types);
 	auto select = make_uniq<SelectNode>();
 	for (idx_t column = 0; column < names.size(); column++) {
