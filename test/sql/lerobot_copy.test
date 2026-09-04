@@ -55,7 +55,7 @@ query IIIIIRRI
 SELECT episode_index, frame_index, "index", task_index,
 	       CAST("observation.state"[1] AS INTEGER), round(action, 1), round(timestamp, 1),
 	       length(CAST("observation.state" AS VARCHAR)) > 0
-FROM lerobot_frames('{TEST_DIR}/lerobot_copy')
+FROM lerobot_scan('{TEST_DIR}/lerobot_copy')
 ORDER BY "index";
 ----
 0	0	0	0	0	0.0	0.0	true
@@ -360,7 +360,8 @@ WHERE decode(key) = 'huggingface'
 
 # Native LeRobot publishes info.json but no Parquet metadata or data files when
 # a newly created dataset has no episodes. FORMAT lerobot keeps that layout,
-# and every reader derives its empty schema from the committed info.json.
+# frame and episode readers derive empty schemas from the committed info.json,
+# while the task reader publishes its fixed v3 schema.
 statement ok
 COPY (
     SELECT 0::BIGINT AS episode_index,
@@ -383,20 +384,16 @@ FROM lerobot_info('{TEST_DIR}/lerobot_copy_empty');
 ----
 0	0	0
 
-query IIII
-SELECT episode_count, data_file_count, video_key_count, fps = 30
-FROM lerobot_metadata_cache('{TEST_DIR}/lerobot_copy_empty');
+query TIII
+SELECT component, cached, entries, bytes = 0
+FROM lerobot_cache_info('{TEST_DIR}/lerobot_copy_empty')
+ORDER BY component;
 ----
-0	0	2	true
-
-query IIII
-SELECT video_key_count, route_count, video_file_count, fps = 30
-FROM lerobot_video_metadata_cache('{TEST_DIR}/lerobot_copy_empty');
-----
-2	0	0	true
+data	false	0	true
+video	false	0	true
 
 query III
-SELECT (SELECT count(*) FROM lerobot_frames('{TEST_DIR}/lerobot_copy_empty')),
+SELECT (SELECT count(*) FROM lerobot_scan('{TEST_DIR}/lerobot_copy_empty')),
        (SELECT count(*) FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_empty')),
        (SELECT count(*) FROM lerobot_tasks('{TEST_DIR}/lerobot_copy_empty'));
 ----
@@ -408,13 +405,13 @@ SELECT count(*) = 8,
        count_if(column_name = 'action' AND column_type = 'BIGINT') = 1,
        count_if(column_name = 'observation.images.image' AND contains(column_type, 'bytes BLOB')) = 1,
        count_if(column_name = 'timestamp' AND column_type = 'FLOAT') = 1
-FROM (DESCRIBE SELECT * FROM lerobot_frames('{TEST_DIR}/lerobot_copy_empty'));
+FROM (DESCRIBE SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_copy_empty'));
 ----
 true	true	true	true	true
 
 query I
 SELECT count_if(column_name = 'observation.images.image' AND contains(column_type, 'bytes VARCHAR')) = 1
-FROM (DESCRIBE SELECT * FROM lerobot_frames(
+FROM (DESCRIBE SELECT * FROM lerobot_scan(
     '{TEST_DIR}/lerobot_copy_empty', binary_as_string := true
 ));
 ----
@@ -428,7 +425,7 @@ SET binary_as_string = true;
 query II
 SELECT count_if(column_name = 'observation.images.image' AND contains(column_type, 'bytes BLOB')) = 1,
        count_if(column_name = 'observation.images.image' AND contains(column_type, 'bytes VARCHAR')) = 0
-FROM (DESCRIBE SELECT * FROM lerobot_frames(
+FROM (DESCRIBE SELECT * FROM lerobot_scan(
     '{TEST_DIR}/lerobot_copy_empty', binary_as_string := false
 ));
 ----
@@ -436,7 +433,7 @@ true	true
 
 query I
 SELECT count_if(column_name = 'observation.images.image' AND contains(column_type, 'bytes VARCHAR')) = 1
-FROM (DESCRIBE SELECT * FROM lerobot_frames('{TEST_DIR}/lerobot_copy_empty'));
+FROM (DESCRIBE SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_copy_empty'));
 ----
 true
 
@@ -465,40 +462,41 @@ true	true	true
 query II
 SELECT count_if(column_name = 'filename' AND column_type = 'VARCHAR') = 1,
        count_if(column_name = 'file_row_number' AND column_type = 'BIGINT') = 1
-FROM (DESCRIBE SELECT * FROM lerobot_frames(
+FROM (DESCRIBE SELECT * FROM lerobot_scan(
     '{TEST_DIR}/lerobot_copy_empty', filename := true, file_row_number := true
 ));
 ----
 true	true
 
-# Native Parquet explicit-schema binding remains available without a footer.
-query I
-SELECT count(*)
-FROM lerobot_frames(
+statement error
+SELECT *
+FROM lerobot_scan('{TEST_DIR}/lerobot_copy_empty', union_by_name := NULL);
+----
+union_by_name must not be NULL
+
+statement error
+SELECT *
+FROM lerobot_scan(
     '{TEST_DIR}/lerobot_copy_empty',
-    schema := map {0: {name: 'sample', type: 'INTEGER', default_value: NULL}},
-    filename := true,
-    file_row_number := true
+    filename := struct_pack(enabled := true)
 );
 ----
-0
+Unimplemented type for cast
 
-query III
-SELECT count(*) = 3,
-       count_if(column_name = 'sample' AND column_type = 'INTEGER') = 1,
-       count_if(column_name IN ('filename', 'file_row_number')) = 2
-FROM (DESCRIBE SELECT * FROM lerobot_frames(
+# Parameters outside the documented Parquet whitelist are rejected before
+# native binding, including the former implementation-level schema fallback.
+statement error
+SELECT *
+FROM lerobot_scan(
     '{TEST_DIR}/lerobot_copy_empty',
-    schema := map {0: {name: 'sample', type: 'INTEGER', default_value: NULL}},
-    filename := true,
-    file_row_number := true
-));
+    schema := map {0: {name: 'sample', type: 'INTEGER', default_value: NULL}}
+);
 ----
-true	true	true
+Invalid named parameter "schema"
 
 query I
 SELECT count(*)
-FROM lerobot_episode_frames('{TEST_DIR}/lerobot_copy_empty', []);
+FROM lerobot_scan('{TEST_DIR}/lerobot_copy_empty', episode_indices := []);
 ----
 0
 

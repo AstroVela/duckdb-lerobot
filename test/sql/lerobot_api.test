@@ -1,0 +1,95 @@
+# name: test/sql/lerobot_api.test
+# description: LeRobot exposes only its pre-release SQL data surface
+# group: [lerobot]
+
+require parquet
+
+require json
+
+require lerobot
+
+query T
+SELECT DISTINCT function_name
+FROM duckdb_functions()
+WHERE function_name LIKE 'lerobot_%'
+ORDER BY function_name;
+----
+lerobot_cache_info
+lerobot_episodes
+lerobot_info
+lerobot_scan
+lerobot_tasks
+lerobot_temporal_targets
+lerobot_video_frames
+lerobot_video_routes
+lerobot_video_targets
+lerobot_video_windows
+
+query I
+SELECT count(*)
+FROM duckdb_functions()
+WHERE function_name IN (
+    'lerobot_episode_frames',
+    'lerobot_frames',
+    'lerobot_layout',
+    'lerobot_metadata_cache',
+    'lerobot_v3_shard_paths',
+    'lerobot_video_metadata_cache'
+);
+----
+0
+
+# Diagnostics are storage-passive: even a nonexistent root produces only the
+# two absent-cache rows and does not try to read info or episode metadata.
+query TTIII
+SELECT root, component, cached, entries, bytes
+FROM lerobot_cache_info('{TEST_DIR}/missing-cache-root')
+ORDER BY component;
+----
+{TEST_DIR}/missing-cache-root	data	false	0	0
+{TEST_DIR}/missing-cache-root	video	false	0	0
+
+# Argument validation happens before route metadata I/O.
+statement error
+SELECT *
+FROM lerobot_scan('{TEST_DIR}/missing-cache-root', episode_indices := NULL);
+----
+lerobot_scan episode_indices must not be NULL
+
+# Build a local dataset root whose spelling also looks like a Hugging Face
+# repo ID. file_search_path lets the test keep that exact one-slash spelling.
+statement ok
+COPY (SELECT 0 AS bootstrap, 0 AS payload)
+TO '{TEST_DIR}/owner' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (SELECT 0 AS bootstrap, 0 AS payload)
+TO '{TEST_DIR}/owner/dataset' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (SELECT 0 AS bootstrap, 0 AS payload)
+TO '{TEST_DIR}/owner/dataset/meta' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (SELECT 'local-root' AS marker)
+TO '{TEST_DIR}/owner/dataset/meta/info.json' (FORMAT JSON, ARRAY false);
+
+statement ok
+SET file_search_path = '{TEST_DIR}';
+
+# A relative path containing one slash remains local. An implicit hf://
+# rewrite would miss this fixture (and attempt network access) instead.
+query T
+SELECT marker FROM lerobot_info('owner/dataset');
+----
+local-root
+
+# Shared root normalization still removes a trailing slash without changing
+# the explicit local-path interpretation.
+query T
+SELECT marker FROM lerobot_info('owner/dataset/');
+----
+local-root
+
+statement ok
+SET file_search_path = '';

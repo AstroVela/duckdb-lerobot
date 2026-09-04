@@ -104,7 +104,7 @@ COPY (
 
 query II
 SELECT frame_index, state
-FROM lerobot_episode_frames('{TEST_DIR}/lerobot_temporal', [2])
+FROM lerobot_scan('{TEST_DIR}/lerobot_temporal', episode_indices := [2])
 ORDER BY frame_index;
 ----
 0	20
@@ -191,7 +191,7 @@ WITH targets AS (
 SELECT targets.request_id, targets.delta_index, CAST(targets.is_padding AS INTEGER),
        frames.state, frames.action, frames.task_index, tasks.task
 FROM targets
-JOIN lerobot_frames('{TEST_DIR}/lerobot_temporal') frames
+JOIN lerobot_scan('{TEST_DIR}/lerobot_temporal') frames
   ON frames.episode_index = targets.episode_index
  AND frames.frame_index = targets.target_frame_index
 JOIN lerobot_tasks('{TEST_DIR}/lerobot_temporal') tasks USING (task_index)

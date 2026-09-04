@@ -122,6 +122,17 @@ def synthetic_result(engine: str) -> dict:
 
 
 class LeRobotBenchmarkTest(TestCase):
+    def test_selection_query_uses_episode_route_pruning(self) -> None:
+        args = benchmark_args()
+        args.episode = 7
+        query = lerobot_ab.selection_query(args, "'/dataset'")
+        self.assertIn("episode_indices := [7]", query)
+        self.assertNotIn("WHERE episode_index", query)
+
+        args.all_episodes = True
+        query = lerobot_ab.selection_query(args, "'/dataset'")
+        self.assertNotIn("episode_indices", query)
+
     def test_timing_uses_small_materialization_summary(self) -> None:
         calls = 0
 
@@ -294,7 +305,7 @@ class LeRobotBenchmarkTest(TestCase):
                 return ("v1.5.0", "source-id")
 
             def fetchall(self):
-                if "FROM lerobot_frames" in self.last_sql:
+                if "FROM lerobot_scan" in self.last_sql:
                     return [(0, 0), (0, 1)]
                 if "SELECT DISTINCT video_key" in self.last_sql:
                     return [("camera.other",)]
@@ -326,7 +337,7 @@ class LeRobotBenchmarkTest(TestCase):
             def execute(self, sql):
                 if sql == "PRAGMA version":
                     return [{"library_version": "v1.5.0", "source_id": "source-id"}]
-                if "FROM lerobot_frames" in sql:
+                if "FROM lerobot_scan" in sql:
                     return [
                         {"episode_index": 0, "frame_index": 0},
                         {"episode_index": 0, "frame_index": 1},

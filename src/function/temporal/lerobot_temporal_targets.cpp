@@ -6,8 +6,8 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 
-#include "function/lerobot_multi_file_reader.hpp"
 #include "function/lerobot_temporal.hpp"
+#include "lerobot_path.hpp"
 #include "storage/lerobot_metadata_cache.hpp"
 
 #include <atomic>
@@ -174,8 +174,7 @@ unique_ptr<FunctionData> LerobotTemporalTargetsBind(ClientContext &context, Tabl
 	}
 
 	auto root = NormalizeLerobotRoot(StringValue::Get(input.inputs[0]));
-	bool cache_hit;
-	auto metadata = LerobotDatasetMetadata::Get(context, root, GetRefreshParameter(input), cache_hit);
+	auto metadata = LerobotDatasetMetadata::Get(context, root, GetRefreshParameter(input));
 	auto deltas =
 	    GetLerobotTemporalDeltas(input, metadata->GetFPS(), GetToleranceParameter(input), "lerobot_temporal_targets");
 
