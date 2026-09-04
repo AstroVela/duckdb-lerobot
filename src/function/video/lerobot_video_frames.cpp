@@ -2295,6 +2295,7 @@ public:
 
 	void Fail(std::exception_ptr exception) {
 		vector<shared_ptr<Connection>> connections;
+		vector<shared_ptr<Task>> producers_to_wake;
 		{
 			lock_guard<mutex> guard(lock);
 			if (!error) {
@@ -2302,20 +2303,25 @@ public:
 			}
 			stop_requested.store(true, std::memory_order_release);
 			GetLiveConnections(connections);
+			TakeBlockedProducers(producers_to_wake);
 		}
 		state_changed.notify_all();
 		InterruptConnections(connections);
+		RescheduleProducers(producers_to_wake);
 	}
 
 	void RequestStop() {
 		vector<shared_ptr<Connection>> connections;
+		vector<shared_ptr<Task>> producers_to_wake;
 		{
 			lock_guard<mutex> guard(lock);
 			stop_requested.store(true, std::memory_order_release);
 			GetLiveConnections(connections);
+			TakeBlockedProducers(producers_to_wake);
 		}
 		state_changed.notify_all();
 		InterruptConnections(connections);
+		RescheduleProducers(producers_to_wake);
 	}
 
 	LerobotBufferClaimResult ClaimBuffer(unique_ptr<LerobotDecodeBuffer> &result) {
