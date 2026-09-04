@@ -2,9 +2,10 @@
 
 `lerobot_ab.py` runs DuckDB, current Daft, and native LeRobot in separate
 Python environments against the same episode/frame/camera contract. Every
-schema-version-4 result records machine details, the requested and resolved
-dataset sources, exact selected frame and camera inventory, immutable dataset
-revision, temporal window, reference backend, exact configuration,
+schema-version-1 result records machine details, the requested, resolved, and
+effective dataset sources plus their local/remote mode, exact selected frame
+and camera inventory, immutable dataset revision, temporal window, reference
+backend, exact configuration,
 warmup/repeat decode timings, a separate validation time, per-image shape and
 SHA-256, and (for DuckDB) a JSON profile containing decoder opens, cache
 hits/evictions, decoder and AVIO seeks, bytes read, decoded frame count, and RGB
@@ -13,9 +14,10 @@ conversion/fan-out counts.
 `compare` rejects results before printing timing ratios when their revision,
 requested or available cameras, actual frame selection, temporal window,
 reference backend, resize/tolerance contract, cache state, or hardware identity
-differs. Warmup and repeat counts must also match so cache preparation and
-median sample sizes stay comparable. Schema-version-3 artifacts are
-intentionally not accepted.
+differs. Source mode and normalized effective source must match, so local and
+remote I/O measurements cannot be mixed. Warmup and repeat counts must also
+match so cache preparation and median sample sizes stay comparable.
+Artifacts with another schema version are intentionally not accepted.
 
 The common cross-engine comparison intentionally uses `delta_timestamps =
 [0.0]`: Daft's public dataset reader does not expose LeRobot temporal-window
@@ -40,7 +42,11 @@ export HF_HUB_OFFLINE=1
 ```
 
 `hf download` resumes partial downloads. The benchmark itself does not contact
-the Hub when given these local paths. Run one engine per environment:
+the Hub when given a local path, and it does not scan or hash the snapshot
+before timing. The caller is responsible for preparing the same immutable
+snapshot for every local run. Dataset paths with leading or trailing whitespace
+are rejected because DuckDB and Daft normalize them before opening files. Run
+one engine per environment:
 
 ```bash
 python benchmark/lerobot_ab.py run \
@@ -78,10 +84,15 @@ python benchmark/lerobot_ab.py compare \
 
 For DuckDB and Daft, a remote Hugging Face repo ID or unpinned `hf://datasets/`
 root is canonicalized to `hf://datasets/<repo>@<revision>` using the required
-commit SHA. An already pinned URI must name the same commit. Other remote
-schemes are rejected because the benchmark cannot prove their snapshot
-identity; download those sources locally first. Native LeRobot receives the
-same SHA through its `revision` argument.
+commit SHA. An already pinned URI must name the same commit. Every other URI
+scheme is rejected; download those sources with
+`hf download --revision ... --local-dir ...` first. Native LeRobot receives the
+same SHA through its `revision` argument. Local paths are resolved to their
+absolute canonical path. Native LeRobot records `dataset.root`, including its
+resolved Hub cache path when `--lerobot-root` is omitted, because its default v3
+reader decodes from that local snapshot. Native LeRobot therefore cannot be
+compared with a DuckDB/Daft run that decodes directly from a remote Hugging Face
+URI.
 
 The official DuckDB shell is useful when the Python environment contains a
 different DuckDB ABI. Build a benchmark-only shell with both `httpfs` and this

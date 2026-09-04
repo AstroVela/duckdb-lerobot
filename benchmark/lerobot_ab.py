@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-BENCHMARK_SCHEMA_VERSION = 4
+BENCHMARK_SCHEMA_VERSION = 1
 DELTA_TIMESTAMPS = [0.0]
 HARDWARE_IDENTITY_FIELDS = (
     "hostname",
@@ -40,7 +40,8 @@ SHA256_HEX_LENGTH = 64
 GIT_COMMIT_HEX_LENGTH = 40
 HF_DATASET_URI_PREFIX = "hf://datasets/"
 HF_REPO_ID_PATTERN = re.compile(r"[\w.-]+/[\w.-]+")
-REMOTE_DATASET_PREFIXES = ("hf://", "http://", "https://", "s3://")
+URI_SCHEME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
+WINDOWS_DRIVE_PATH_PATTERN = re.compile(r"[A-Za-z]:(?!//)")
 
 
 def sql_string(value: str) -> str:
@@ -148,14 +149,25 @@ def validate_dataset_revision(revision: str) -> str:
     return normalized
 
 
+def has_uri_scheme(value: str) -> bool:
+    return (
+        WINDOWS_DRIVE_PATH_PATTERN.match(value) is None
+        and URI_SCHEME_PATTERN.match(value) is not None
+    )
+
+
 def resolve_dataset_source(engine: str, dataset: str, revision: str) -> str:
     """Pin DuckDB and Daft Hugging Face reads to the declared commit."""
-    if engine == "lerobot" or Path(dataset).exists():
-        return dataset
-
+    if dataset != dataset.strip():
+        raise ValueError("--dataset must not have leading or trailing whitespace")
     root = dataset.rstrip("/")
-    if HF_REPO_ID_PATTERN.fullmatch(root):
-        return f"{HF_DATASET_URI_PREFIX}{root}@{revision}"
+    if engine == "lerobot":
+        if has_uri_scheme(root):
+            raise ValueError(
+                "the native LeRobot benchmark requires a repository ID and a local "
+                "--lerobot-root, not a dataset URI"
+            )
+        return dataset
 
     if root.startswith(HF_DATASET_URI_PREFIX):
         repository, separator, source_revision = root[
@@ -172,13 +184,67 @@ def resolve_dataset_source(engine: str, dataset: str, revision: str) -> str:
             )
         return f"{HF_DATASET_URI_PREFIX}{repository}@{revision}"
 
-    if root.startswith(REMOTE_DATASET_PREFIXES):
+    if has_uri_scheme(root):
         raise ValueError(
             "remote DuckDB/Daft benchmarks require a Hugging Face dataset root "
             "that can be pinned to --revision; download other remote sources "
             "to a local snapshot first"
         )
-    return dataset
+    if Path(dataset).exists():
+        return str(Path(dataset).resolve())
+    if HF_REPO_ID_PATTERN.fullmatch(root):
+        return f"{HF_DATASET_URI_PREFIX}{root}@{revision}"
+    raise ValueError("local --dataset must be an existing directory")
+
+
+def dataset_source_identity(
+    engine: str,
+    resolved_dataset: str,
+    revision: str,
+    lerobot_root: str | None = None,
+) -> dict[str, str]:
+    """Return the normalized source whose I/O is included in the benchmark."""
+    if engine not in ("duckdb", "daft", "lerobot"):
+        raise ValueError(f"unknown benchmark engine {engine!r}")
+    if not isinstance(resolved_dataset, str) or not resolved_dataset:
+        raise ValueError("resolved_dataset must contain the source used by the engine")
+    if resolved_dataset != resolved_dataset.strip():
+        raise ValueError(
+            "resolved_dataset must not have leading or trailing whitespace"
+        )
+
+    if engine == "lerobot":
+        if not isinstance(lerobot_root, str) or not lerobot_root:
+            raise ValueError(
+                "LeRobot artifacts must record the resolved local dataset root"
+            )
+        if lerobot_root != lerobot_root.strip():
+            raise ValueError(
+                "lerobot_root must not have leading or trailing whitespace"
+            )
+        return {
+            "mode": "local",
+            "effective_source": str(Path(lerobot_root).resolve()),
+        }
+
+    root = resolved_dataset.rstrip("/")
+    if root.startswith(HF_DATASET_URI_PREFIX):
+        return {
+            "mode": "remote",
+            "effective_source": resolve_dataset_source("duckdb", root, revision),
+        }
+    if HF_REPO_ID_PATTERN.fullmatch(root):
+        raise ValueError(
+            "DuckDB and Daft resolved_dataset must be a revision-pinned hf:// URI"
+        )
+    if has_uri_scheme(root):
+        raise ValueError(
+            "remote benchmark sources must be revision-pinned Hugging Face datasets"
+        )
+    return {
+        "mode": "local",
+        "effective_source": str(Path(resolved_dataset).resolve()),
+    }
 
 
 def validate_camera_inventory(
@@ -564,7 +630,7 @@ def configure_duckdb_connection(
     args: argparse.Namespace, execute: Callable[[str], Any]
 ) -> None:
     extensions = list(args.duckdb_load)
-    if args.dataset.startswith(("hf://", "http://", "https://", "s3://")):
+    if has_uri_scheme(args.dataset):
         if "httpfs" not in extensions:
             extensions.insert(0, "httpfs")
     for extension in extensions:
@@ -919,6 +985,9 @@ def run_lerobot(
 ]:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+    if args.lerobot_root and has_uri_scheme(str(args.lerobot_root)):
+        raise ValueError("the native LeRobot benchmark requires a local --lerobot-root")
+
     started = time.perf_counter()
     dataset_kwargs: dict[str, Any] = {
         "tolerance_s": args.tolerance,
@@ -980,7 +1049,8 @@ def run_lerobot(
         {
             "available_cameras": available_cameras,
             "lerobot_version": lerobot_version,
-            "lerobot_root": (
+            "lerobot_root": str(Path(dataset.root).resolve()),
+            "requested_lerobot_root": (
                 str(Path(args.lerobot_root).resolve()) if args.lerobot_root else None
             ),
             "selection_seconds": 0.0,
@@ -1007,12 +1077,34 @@ def run_command(args: argparse.Namespace) -> int:
     adapter_args.dataset = resolve_dataset_source(
         args.engine, args.dataset, args.revision
     )
+    expected_source_identity = None
+    if args.engine != "lerobot" or args.lerobot_root:
+        expected_source_identity = dataset_source_identity(
+            args.engine,
+            adapter_args.dataset,
+            args.revision,
+            args.lerobot_root,
+        )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     setup_seconds, execute, validate, extra = adapters[args.engine](adapter_args)
     collect_profile = extra.pop("collect_profile", None)
     close = extra.pop("close", None)
     try:
+        actual_source_identity = dataset_source_identity(
+            args.engine,
+            adapter_args.dataset,
+            args.revision,
+            extra.get("lerobot_root"),
+        )
+        if (
+            expected_source_identity is not None
+            and expected_source_identity != actual_source_identity
+        ):
+            raise RuntimeError(
+                "engine resolved a different dataset root than requested"
+            )
+        source_identity = actual_source_identity
         durations, timed_summary = time_callable(execute, args.warmups, args.repeats)
         validation_started = time.perf_counter()
         rows = canonical_rows(validate())
@@ -1049,6 +1141,8 @@ def run_command(args: argparse.Namespace) -> int:
         "engine": args.engine,
         "dataset": args.dataset,
         "resolved_dataset": adapter_args.dataset,
+        "dataset_source_mode": source_identity["mode"],
+        "effective_dataset_source": source_identity["effective_source"],
         "revision": args.revision,
         "episode": None if args.all_episodes else args.episode,
         "all_episodes": args.all_episodes,
@@ -1107,30 +1201,45 @@ def run_command(args: argparse.Namespace) -> int:
 
 
 def comparison_contract(result: dict[str, Any]) -> dict[str, Any]:
-    if result.get("schema_version") != BENCHMARK_SCHEMA_VERSION:
+    schema_version = result.get("schema_version")
+    if type(schema_version) is not int or schema_version != BENCHMARK_SCHEMA_VERSION:
         raise ValueError(
             f"expected schema_version {BENCHMARK_SCHEMA_VERSION}, "
-            f"received {result.get('schema_version')!r}"
+            f"received {schema_version!r}"
         )
     revision = result.get("revision")
     if not isinstance(revision, str):
         raise ValueError("revision must contain an immutable dataset revision")
     revision = validate_dataset_revision(revision)
+    engine = result["engine"]
     resolved_dataset = result["resolved_dataset"]
-    if not isinstance(resolved_dataset, str) or not resolved_dataset:
-        raise ValueError("resolved_dataset must contain the source used by the engine")
-    if result["engine"] != "lerobot" and resolved_dataset.startswith(
-        REMOTE_DATASET_PREFIXES
-    ):
-        if (
-            resolve_dataset_source(result["engine"], resolved_dataset, revision)
-            != resolved_dataset
-        ):
-            raise ValueError("resolved_dataset is not pinned to revision")
-    elif resolved_dataset != result["dataset"]:
+    source_identity = dataset_source_identity(
+        engine,
+        resolved_dataset,
+        revision,
+        result.get("lerobot_root"),
+    )
+    recorded_source_identity = {
+        "mode": result["dataset_source_mode"],
+        "effective_source": result["effective_dataset_source"],
+    }
+    if recorded_source_identity != source_identity:
         raise ValueError(
-            "resolved_dataset does not match the source used by the engine"
+            "dataset source identity does not match the source used by the engine"
         )
+    if source_identity["mode"] == "remote":
+        if resolved_dataset != source_identity["effective_source"]:
+            raise ValueError("resolved_dataset is not pinned to revision")
+    elif engine == "lerobot":
+        if resolved_dataset != result["dataset"]:
+            raise ValueError(
+                "resolved_dataset does not match the source used by the engine"
+            )
+        if result["lerobot_root"] != source_identity["effective_source"]:
+            raise ValueError("lerobot_root is not a normalized local path")
+    else:
+        if resolved_dataset != source_identity["effective_source"]:
+            raise ValueError("resolved_dataset is not a normalized local path")
 
     cameras = result["cameras"]
     available_cameras = result["available_cameras"]
@@ -1170,6 +1279,8 @@ def comparison_contract(result: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "revision": revision,
+        "dataset_source_mode": source_identity["mode"],
+        "effective_dataset_source": source_identity["effective_source"],
         "episode": result["episode"],
         "all_episodes": result["all_episodes"],
         "requested_frame_rows": result["requested_frame_rows"],

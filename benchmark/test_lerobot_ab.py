@@ -89,6 +89,9 @@ def synthetic_result(engine: str) -> dict:
         "engine": engine,
         "dataset": "/tmp/multicamera",
         "resolved_dataset": "/tmp/multicamera",
+        "dataset_source_mode": "local",
+        "effective_dataset_source": "/tmp/multicamera",
+        "lerobot_root": "/tmp/multicamera" if engine == "lerobot" else None,
         "revision": DATASET_REVISION,
         "episode": 0,
         "all_episodes": False,
@@ -230,6 +233,13 @@ class LeRobotBenchmarkTest(TestCase):
             ),
             "owner/dataset",
         )
+        with TemporaryDirectory() as directory:
+            self.assertEqual(
+                lerobot_ab.resolve_dataset_source(
+                    "duckdb", directory, DATASET_REVISION
+                ),
+                str(Path(directory).resolve()),
+            )
         with self.assertRaisesRegex(ValueError, "does not match --revision"):
             lerobot_ab.resolve_dataset_source(
                 "daft",
@@ -240,6 +250,32 @@ class LeRobotBenchmarkTest(TestCase):
             lerobot_ab.resolve_dataset_source(
                 "duckdb", "s3://bucket/dataset", DATASET_REVISION
             )
+        for source in (
+            "gs://bucket/dataset",
+            "gcs://bucket/dataset",
+            "az://container/dataset",
+            "urn:example:dataset",
+        ):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(ValueError, "local snapshot"):
+                    lerobot_ab.resolve_dataset_source("daft", source, DATASET_REVISION)
+        with self.assertRaisesRegex(ValueError, "not a dataset URI"):
+            lerobot_ab.resolve_dataset_source(
+                "lerobot", "s3://bucket/dataset", DATASET_REVISION
+            )
+        with patch.object(lerobot_ab.Path, "exists", return_value=True):
+            with self.assertRaisesRegex(ValueError, "local snapshot"):
+                lerobot_ab.resolve_dataset_source(
+                    "duckdb", "s3://existing/dataset", DATASET_REVISION
+                )
+        with self.assertRaisesRegex(ValueError, "trailing whitespace"):
+            lerobot_ab.resolve_dataset_source(
+                "duckdb", "/tmp/dataset ", DATASET_REVISION
+            )
+        self.assertFalse(lerobot_ab.has_uri_scheme("C:/datasets/lerobot"))
+        self.assertFalse(lerobot_ab.has_uri_scheme(r"C:\datasets\lerobot"))
+        self.assertFalse(lerobot_ab.has_uri_scheme("C:datasets/lerobot"))
+        self.assertTrue(lerobot_ab.has_uri_scheme("x://host/dataset"))
 
     def test_duckdb_setup_closes_connections_on_camera_validation_error(self) -> None:
         args = benchmark_args()
@@ -333,6 +369,7 @@ class LeRobotBenchmarkTest(TestCase):
         class FakeDataset:
             def __init__(self, repo_id, **kwargs):
                 del repo_id, kwargs
+                self.root = Path("/tmp/multicamera")
                 self.meta = SimpleNamespace(
                     video_keys=["camera.left", "camera.overhead", "camera.right"]
                 )
@@ -396,6 +433,7 @@ class LeRobotBenchmarkTest(TestCase):
             extra["available_cameras"],
             ["camera.left", "camera.overhead", "camera.right"],
         )
+        self.assertEqual(extra["lerobot_root"], "/tmp/multicamera")
         self.assertEqual(len(decode_calls), 4)
         self.assertTrue(
             all(call == ("camera.right", "camera.left") for call in decode_calls)
@@ -409,21 +447,27 @@ class LeRobotBenchmarkTest(TestCase):
             "lerobot": "run_lerobot",
         }
         with TemporaryDirectory() as directory:
+            dataset_root = Path(directory) / "dataset"
+            dataset_root.mkdir()
             paths = []
             results = []
             for engine, adapter_name in adapter_names.items():
                 args = benchmark_args()
                 args.engine = engine
                 args.camera = list(source["cameras"])
+                args.dataset = str(dataset_root)
                 path = Path(directory) / f"{engine}.json"
                 args.output = str(path)
 
                 def fake_adapter(_args):
+                    extra = {"available_cameras": source["available_cameras"]}
+                    if engine == "lerobot":
+                        extra["lerobot_root"] = str(dataset_root.resolve())
                     return (
                         0.25,
                         lambda: {"frame_rows": 2, "decoded_images": 4},
                         lambda: deepcopy(source["rows"]),
-                        {"available_cameras": source["available_cameras"]},
+                        extra,
                     )
 
                 with (
@@ -484,6 +528,8 @@ class LeRobotBenchmarkTest(TestCase):
             result["resolved_dataset"],
             f"hf://datasets/owner/dataset@{DATASET_REVISION}",
         )
+        self.assertEqual(result["dataset_source_mode"], "remote")
+        self.assertEqual(result["effective_dataset_source"], result["resolved_dataset"])
         self.assertEqual(adapter_sources, [result["resolved_dataset"]])
         self.assertEqual(result["selected_camera_count"], 2)
         self.assertEqual(result["available_camera_count"], 3)
@@ -520,6 +566,19 @@ class LeRobotBenchmarkTest(TestCase):
             result["resolved_dataset"] = (
                 f"hf://datasets/owner/dataset@{OTHER_DATASET_REVISION}"
             )
+            result["dataset_source_mode"] = "remote"
+            result["effective_dataset_source"] = result["resolved_dataset"]
+            result["lerobot_root"] = None
+
+        def remote_source(result):
+            result["engine"] = "daft"
+            result["dataset"] = "owner/dataset"
+            result["resolved_dataset"] = (
+                f"hf://datasets/owner/dataset@{DATASET_REVISION}"
+            )
+            result["dataset_source_mode"] = "remote"
+            result["effective_dataset_source"] = result["resolved_dataset"]
+            result["lerobot_root"] = None
 
         changes = {
             "revision": lambda result: result.update(revision=OTHER_DATASET_REVISION),
@@ -527,6 +586,7 @@ class LeRobotBenchmarkTest(TestCase):
             "native_resolved_dataset": lambda result: result.update(
                 resolved_dataset=f"hf://datasets/owner/dataset@{DATASET_REVISION}"
             ),
+            "dataset_source_mode": remote_source,
             "cameras": lambda result: result["cameras"].reverse(),
             "selected_frames": different_rows,
             "delta_timestamps": lambda result: result["configuration"].update(
@@ -548,6 +608,13 @@ class LeRobotBenchmarkTest(TestCase):
                 with self.subTest(field=field):
                     candidate = deepcopy(synthetic_result("lerobot"))
                     change(candidate)
+                    if field == "dataset_source_mode":
+                        self.assertEqual(
+                            lerobot_ab.comparison_contract(candidate)[
+                                "dataset_source_mode"
+                            ],
+                            "remote",
+                        )
                     candidate_path = Path(directory) / f"{field}.json"
                     candidate_path.write_text(json.dumps(candidate))
                     stderr = io.StringIO()
@@ -559,6 +626,61 @@ class LeRobotBenchmarkTest(TestCase):
                         )
                     self.assertEqual(status, 2)
                     self.assertIn("INCOMPARABLE", stderr.getvalue())
+                    if field == "dataset_source_mode":
+                        self.assertIn("dataset_source_mode", stderr.getvalue())
+
+    def test_compare_rejects_distinct_sources_within_the_same_mode(self) -> None:
+        local_baseline = synthetic_result("duckdb")
+        local_candidate = synthetic_result("lerobot")
+        local_candidate.update(
+            dataset="/tmp/other-dataset",
+            resolved_dataset="/tmp/other-dataset",
+            effective_dataset_source="/tmp/other-dataset",
+            lerobot_root="/tmp/other-dataset",
+        )
+
+        remote_baseline = synthetic_result("duckdb")
+        remote_candidate = synthetic_result("daft")
+        for result, repository in (
+            (remote_baseline, "owner/dataset"),
+            (remote_candidate, "owner/other-dataset"),
+        ):
+            resolved_dataset = f"hf://datasets/{repository}@{DATASET_REVISION}"
+            result.update(
+                dataset=repository,
+                resolved_dataset=resolved_dataset,
+                dataset_source_mode="remote",
+                effective_dataset_source=resolved_dataset,
+                lerobot_root=None,
+            )
+
+        with TemporaryDirectory() as directory:
+            for mode, baseline, candidate in (
+                ("local", local_baseline, local_candidate),
+                ("remote", remote_baseline, remote_candidate),
+            ):
+                with self.subTest(mode=mode):
+                    baseline_path = Path(directory) / f"{mode}-baseline.json"
+                    candidate_path = Path(directory) / f"{mode}-candidate.json"
+                    baseline_path.write_text(json.dumps(baseline))
+                    candidate_path.write_text(json.dumps(candidate))
+                    stderr = io.StringIO()
+                    with redirect_stderr(stderr):
+                        status = lerobot_ab.compare_command(
+                            SimpleNamespace(
+                                results=[str(baseline_path), str(candidate_path)]
+                            )
+                        )
+                    self.assertEqual(status, 2)
+                    self.assertIn("effective_dataset_source", stderr.getvalue())
+
+    def test_comparison_contract_rejects_non_integer_schema_version(self) -> None:
+        for schema_version in (True, 1.0, "1", None):
+            with self.subTest(schema_version=schema_version):
+                result = synthetic_result("duckdb")
+                result["schema_version"] = schema_version
+                with self.assertRaisesRegex(ValueError, "expected schema_version 1"):
+                    lerobot_ab.comparison_contract(result)
 
     def test_compare_reports_pixel_mismatch_after_contract_validation(self) -> None:
         baseline = synthetic_result("duckdb")
