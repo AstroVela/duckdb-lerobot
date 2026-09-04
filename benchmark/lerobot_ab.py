@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import statistics
 import subprocess
 import sys
@@ -21,6 +22,26 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+
+
+BENCHMARK_SCHEMA_VERSION = 1
+DELTA_TIMESTAMPS = [0.0]
+HARDWARE_IDENTITY_FIELDS = (
+    "hostname",
+    "platform",
+    "machine",
+    "processor",
+    "cpu_count",
+    "cpu_model",
+    "physical_cpu_count",
+    "memory_total_bytes",
+)
+SHA256_HEX_LENGTH = 64
+GIT_COMMIT_HEX_LENGTH = 40
+HF_DATASET_URI_PREFIX = "hf://datasets/"
+HF_REPO_ID_PATTERN = re.compile(r"[\w.-]+/[\w.-]+")
+URI_SCHEME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
+WINDOWS_DRIVE_PATH_PATTERN = re.compile(r"[A-Za-z]:(?!//)")
 
 
 def sql_string(value: str) -> str:
@@ -109,6 +130,254 @@ def canonical_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         rows,
         key=lambda row: (row["episode_index"], row["frame_index"], row["video_key"]),
     )
+
+
+def validate_requested_cameras(cameras: list[str]) -> None:
+    if not cameras or any(not camera for camera in cameras):
+        raise ValueError("at least one non-empty --camera is required")
+    duplicates = sorted(camera for camera in set(cameras) if cameras.count(camera) > 1)
+    if duplicates:
+        raise ValueError(f"duplicate --camera values are not allowed: {duplicates}")
+
+
+def validate_dataset_revision(revision: str) -> str:
+    normalized = revision.lower()
+    if len(normalized) != GIT_COMMIT_HEX_LENGTH or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        raise ValueError("--revision must be a full 40-character commit SHA")
+    return normalized
+
+
+def has_uri_scheme(value: str) -> bool:
+    return (
+        WINDOWS_DRIVE_PATH_PATTERN.match(value) is None
+        and URI_SCHEME_PATTERN.match(value) is not None
+    )
+
+
+def resolve_dataset_source(engine: str, dataset: str, revision: str) -> str:
+    """Pin DuckDB and Daft Hugging Face reads to the declared commit."""
+    if dataset != dataset.strip():
+        raise ValueError("--dataset must not have leading or trailing whitespace")
+    root = dataset.rstrip("/")
+    if engine == "lerobot":
+        if has_uri_scheme(root):
+            raise ValueError(
+                "the native LeRobot benchmark requires a repository ID and a local "
+                "--lerobot-root, not a dataset URI"
+            )
+        return dataset
+
+    if root.startswith(HF_DATASET_URI_PREFIX):
+        repository, separator, source_revision = root[
+            len(HF_DATASET_URI_PREFIX) :
+        ].partition("@")
+        if not HF_REPO_ID_PATTERN.fullmatch(repository):
+            raise ValueError(
+                "remote --dataset must be a Hugging Face dataset repository root"
+            )
+        if separator and source_revision.lower() != revision:
+            raise ValueError(
+                f"remote --dataset revision {source_revision!r} does not match "
+                f"--revision {revision!r}"
+            )
+        return f"{HF_DATASET_URI_PREFIX}{repository}@{revision}"
+
+    if has_uri_scheme(root):
+        raise ValueError(
+            "remote DuckDB/Daft benchmarks require a Hugging Face dataset root "
+            "that can be pinned to --revision; download other remote sources "
+            "to a local snapshot first"
+        )
+    if Path(dataset).exists():
+        return str(Path(dataset).resolve())
+    if HF_REPO_ID_PATTERN.fullmatch(root):
+        return f"{HF_DATASET_URI_PREFIX}{root}@{revision}"
+    raise ValueError("local --dataset must be an existing directory")
+
+
+def dataset_source_identity(
+    engine: str,
+    resolved_dataset: str,
+    revision: str,
+    lerobot_root: str | None = None,
+) -> dict[str, str]:
+    """Return the normalized source whose I/O is included in the benchmark."""
+    if engine not in ("duckdb", "daft", "lerobot"):
+        raise ValueError(f"unknown benchmark engine {engine!r}")
+    if not isinstance(resolved_dataset, str) or not resolved_dataset:
+        raise ValueError("resolved_dataset must contain the source used by the engine")
+    if resolved_dataset != resolved_dataset.strip():
+        raise ValueError(
+            "resolved_dataset must not have leading or trailing whitespace"
+        )
+
+    if engine == "lerobot":
+        if not isinstance(lerobot_root, str) or not lerobot_root:
+            raise ValueError(
+                "LeRobot artifacts must record the resolved local dataset root"
+            )
+        if lerobot_root != lerobot_root.strip():
+            raise ValueError(
+                "lerobot_root must not have leading or trailing whitespace"
+            )
+        return {
+            "mode": "local",
+            "effective_source": str(Path(lerobot_root).resolve()),
+        }
+
+    root = resolved_dataset.rstrip("/")
+    if root.startswith(HF_DATASET_URI_PREFIX):
+        return {
+            "mode": "remote",
+            "effective_source": resolve_dataset_source("duckdb", root, revision),
+        }
+    if HF_REPO_ID_PATTERN.fullmatch(root):
+        raise ValueError(
+            "DuckDB and Daft resolved_dataset must be a revision-pinned hf:// URI"
+        )
+    if has_uri_scheme(root):
+        raise ValueError(
+            "remote benchmark sources must be revision-pinned Hugging Face datasets"
+        )
+    return {
+        "mode": "local",
+        "effective_source": str(Path(resolved_dataset).resolve()),
+    }
+
+
+def validate_camera_inventory(
+    engine: str, requested: list[str], available: list[str]
+) -> list[str]:
+    inventory = sorted(available)
+    if len(inventory) != len(set(inventory)):
+        raise RuntimeError(f"{engine} reported duplicate available camera keys")
+    missing = [camera for camera in requested if camera not in inventory]
+    if missing:
+        raise RuntimeError(
+            f"{engine} cannot decode requested camera keys {missing}; "
+            f"available camera keys are {inventory}"
+        )
+    return inventory
+
+
+def daft_available_cameras(column_names: list[str]) -> list[str]:
+    prefix = "videos/"
+    suffix = "/video"
+    return sorted(
+        column_name[len(prefix) : -len(suffix)]
+        for column_name in column_names
+        if column_name.startswith(prefix) and column_name.endswith(suffix)
+    )
+
+
+def duckdb_available_cameras_query(
+    args: argparse.Namespace, selected_rows: list[dict[str, Any]]
+) -> str:
+    episodes = sorted({int(row["episode_index"]) for row in selected_rows})
+    episode_sql = ", ".join(str(episode) for episode in episodes)
+    return (
+        "SELECT DISTINCT video_key "
+        f"FROM lerobot_video_routes({sql_string(args.dataset)}, [{episode_sql}]) "
+        "ORDER BY video_key"
+    )
+
+
+def project_lerobot_cameras(dataset: Any, requested: list[str]) -> list[str]:
+    available = validate_camera_inventory(
+        "lerobot", requested, list(dataset.meta.video_keys)
+    )
+    reader = dataset.reader
+    query_videos = getattr(reader, "_query_videos", None)
+    if not callable(query_videos):
+        raise RuntimeError(
+            "native LeRobot reader does not expose the required strict camera "
+            "projection hook _query_videos"
+        )
+
+    requested_order = tuple(requested)
+
+    def query_projected_videos(
+        query_timestamps: dict[str, list[float]], episode_index: int
+    ) -> dict[str, Any]:
+        missing = [key for key in requested_order if key not in query_timestamps]
+        if missing:
+            raise RuntimeError(
+                f"native LeRobot did not create timestamps for requested cameras {missing}"
+            )
+        projected = {key: query_timestamps[key] for key in requested_order}
+        decoded = query_videos(projected, episode_index)
+        if set(decoded) != set(requested_order):
+            raise RuntimeError(
+                "native LeRobot camera projection returned unexpected keys: "
+                f"expected {list(requested_order)}, received {sorted(decoded)}"
+            )
+        return decoded
+
+    reader._query_videos = query_projected_videos
+    return available
+
+
+def selected_frames_from_rows(
+    rows: list[dict[str, Any]], cameras: list[str], expected_frame_count: int
+) -> list[dict[str, int]]:
+    expected_cameras = set(cameras)
+    frame_cameras: dict[tuple[int, int], set[str]] = {}
+    seen: set[tuple[int, int, str]] = set()
+    for row in rows:
+        episode_index = int(row["episode_index"])
+        frame_index = int(row["frame_index"])
+        video_key = str(row["video_key"])
+        digest = row.get("sha256")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != SHA256_HEX_LENGTH
+            or any(character not in "0123456789abcdef" for character in digest.lower())
+        ):
+            raise RuntimeError(
+                f"decoded row ({episode_index}, {frame_index}, {video_key}) "
+                "does not contain a SHA-256 digest"
+            )
+        identity = (episode_index, frame_index, video_key)
+        if identity in seen:
+            raise RuntimeError(f"duplicate decoded row {identity}")
+        seen.add(identity)
+        frame_cameras.setdefault((episode_index, frame_index), set()).add(video_key)
+
+    selected_frames = sorted(frame_cameras)
+    if len(selected_frames) != expected_frame_count:
+        raise RuntimeError(
+            f"validation decoded {len(selected_frames)} distinct frame rows, "
+            f"expected {expected_frame_count}"
+        )
+    for frame in selected_frames:
+        if frame_cameras[frame] != expected_cameras:
+            raise RuntimeError(
+                f"decoded frame {frame} has camera keys {sorted(frame_cameras[frame])}, "
+                f"expected {cameras}"
+            )
+    return [
+        {"episode_index": episode_index, "frame_index": frame_index}
+        for episode_index, frame_index in selected_frames
+    ]
+
+
+def hardware_identity(machine: dict[str, Any]) -> dict[str, Any]:
+    return {key: machine.get(key) for key in HARDWARE_IDENTITY_FIELDS}
+
+
+def validate_lerobot_items(
+    items: list[dict[str, Any]], requested: list[str], available: list[str]
+) -> None:
+    expected = set(requested)
+    for index, item in enumerate(items):
+        returned = {camera for camera in available if camera in item}
+        if returned != expected:
+            raise RuntimeError(
+                f"native LeRobot item {index} returned video keys {sorted(returned)}, "
+                f"expected {requested}"
+            )
 
 
 def time_callable(
@@ -361,7 +630,7 @@ def configure_duckdb_connection(
     args: argparse.Namespace, execute: Callable[[str], Any]
 ) -> None:
     extensions = list(args.duckdb_load)
-    if args.dataset.startswith(("hf://", "http://", "https://", "s3://")):
+    if has_uri_scheme(args.dataset):
         if "httpfs" not in extensions:
             extensions.insert(0, "httpfs")
     for extension in extensions:
@@ -384,23 +653,34 @@ def run_duckdb_python(
 
     started = time.perf_counter()
     connection = duckdb.connect()
-    configure_duckdb_connection(args, connection.execute)
-    version_row = connection.execute("PRAGMA version").fetchone()
-    root = sql_string(args.dataset)
-    selection_started = time.perf_counter()
-    selected = connection.execute(selection_query(args, root)).fetchall()
-    selection_seconds = time.perf_counter() - selection_started
-    selected_rows = [
-        {"episode_index": int(row[0]), "frame_index": int(row[1])} for row in selected
-    ]
-    if len(selected_rows) != args.rows:
-        raise RuntimeError(
-            f"requested {args.rows} frame rows, but selected {len(selected_rows)}"
+    try:
+        configure_duckdb_connection(args, connection.execute)
+        version_row = connection.execute("PRAGMA version").fetchone()
+        root = sql_string(args.dataset)
+        selection_started = time.perf_counter()
+        selected = connection.execute(selection_query(args, root)).fetchall()
+        selection_seconds = time.perf_counter() - selection_started
+        selected_rows = [
+            {"episode_index": int(row[0]), "frame_index": int(row[1])}
+            for row in selected
+        ]
+        if len(selected_rows) != args.rows:
+            raise RuntimeError(
+                f"requested {args.rows} frame rows, but selected {len(selected_rows)}"
+            )
+        camera_inventory_query = duckdb_available_cameras_query(args, selected_rows)
+        available_cameras = validate_camera_inventory(
+            "duckdb",
+            args.camera,
+            [row[0] for row in connection.execute(camera_inventory_query).fetchall()],
         )
-    timed_query = duckdb_timed_query(args, selected_rows)
-    validation_query = duckdb_decode_query(
-        args, selected_rows, hash_images=True, order_output=True
-    )
+        timed_query = duckdb_timed_query(args, selected_rows)
+        validation_query = duckdb_decode_query(
+            args, selected_rows, hash_images=True, order_output=True
+        )
+    except Exception:
+        connection.close()
+        raise
     setup_seconds = time.perf_counter() - started
 
     def execute() -> dict[str, int]:
@@ -428,6 +708,8 @@ def run_duckdb_python(
         "duckdb_version": str(version_row[0]),
         "duckdb_source_id": str(version_row[1]),
         "duckdb_python_version": duckdb.__version__,
+        "available_cameras": available_cameras,
+        "camera_inventory_query": camera_inventory_query,
         "selection_seconds": selection_seconds,
         "selection_strategy": "metadata-only lerobot_frames query",
         "timed_query": timed_query.strip(),
@@ -483,27 +765,37 @@ def run_duckdb_cli(
     connection = DuckDBCLIConnection(
         args.duckdb_cli, allow_unsigned=bool(args.extension)
     )
-    configure_duckdb_connection(args, connection.execute)
-    version_rows = connection.execute("PRAGMA version")
-    root = sql_string(args.dataset)
-    selection_started = time.perf_counter()
-    selected_rows = connection.execute(selection_query(args, root))
-    selection_seconds = time.perf_counter() - selection_started
-    selected_rows = [
-        {
-            "episode_index": int(row["episode_index"]),
-            "frame_index": int(row["frame_index"]),
-        }
-        for row in selected_rows
-    ]
-    if len(selected_rows) != args.rows:
-        raise RuntimeError(
-            f"requested {args.rows} frame rows, but selected {len(selected_rows)}"
+    try:
+        configure_duckdb_connection(args, connection.execute)
+        version_rows = connection.execute("PRAGMA version")
+        root = sql_string(args.dataset)
+        selection_started = time.perf_counter()
+        selected_rows = connection.execute(selection_query(args, root))
+        selection_seconds = time.perf_counter() - selection_started
+        selected_rows = [
+            {
+                "episode_index": int(row["episode_index"]),
+                "frame_index": int(row["frame_index"]),
+            }
+            for row in selected_rows
+        ]
+        if len(selected_rows) != args.rows:
+            raise RuntimeError(
+                f"requested {args.rows} frame rows, but selected {len(selected_rows)}"
+            )
+        camera_inventory_query = duckdb_available_cameras_query(args, selected_rows)
+        available_cameras = validate_camera_inventory(
+            "duckdb",
+            args.camera,
+            [row["video_key"] for row in connection.execute(camera_inventory_query)],
         )
-    timed_query = duckdb_timed_query(args, selected_rows)
-    validation_query = duckdb_decode_query(
-        args, selected_rows, hash_images=True, order_output=True
-    )
+        timed_query = duckdb_timed_query(args, selected_rows)
+        validation_query = duckdb_decode_query(
+            args, selected_rows, hash_images=True, order_output=True
+        )
+    except Exception:
+        connection.close()
+        raise
     setup_seconds = time.perf_counter() - started
 
     def execute() -> dict[str, int]:
@@ -532,6 +824,8 @@ def run_duckdb_cli(
         "duckdb_version": version_rows[0]["library_version"],
         "duckdb_source_id": version_rows[0]["source_id"],
         "duckdb_cli": connection.executable,
+        "available_cameras": available_cameras,
+        "camera_inventory_query": camera_inventory_query,
         "selection_seconds": selection_seconds,
         "selection_strategy": "metadata-only lerobot_frames query",
         "timed_query": timed_query.strip(),
@@ -602,6 +896,9 @@ def run_daft(
     started = time.perf_counter()
     selection_started = time.perf_counter()
     metadata = lerobot.read(args.dataset, load_video_frames=False)
+    available_cameras = validate_camera_inventory(
+        "daft", args.camera, daft_available_cameras(metadata.column_names)
+    )
     if not args.all_episodes:
         metadata = metadata.where(daft.col("episode_index") == args.episode)
     selected = (
@@ -657,6 +954,7 @@ def run_daft(
         validate,
         {
             "daft_version": getattr(daft, "__version__", "unknown"),
+            "available_cameras": available_cameras,
             "selection_seconds": selection_seconds,
             "selection_strategy": (
                 "metadata-only sorted selection followed by an index filter "
@@ -687,19 +985,22 @@ def run_lerobot(
 ]:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+    if args.lerobot_root and has_uri_scheme(str(args.lerobot_root)):
+        raise ValueError("the native LeRobot benchmark requires a local --lerobot-root")
+
     started = time.perf_counter()
     dataset_kwargs: dict[str, Any] = {
         "tolerance_s": args.tolerance,
         "video_backend": args.video_backend,
         "return_uint8": True,
+        "revision": args.revision,
     }
     if not args.all_episodes:
         dataset_kwargs["episodes"] = [args.episode]
     if args.lerobot_root:
         dataset_kwargs["root"] = args.lerobot_root
-    if args.revision:
-        dataset_kwargs["revision"] = args.revision
     dataset = LeRobotDataset(args.dataset, **dataset_kwargs)
+    available_cameras = project_lerobot_cameras(dataset, args.camera)
     count = min(args.rows, len(dataset))
     if count != args.rows:
         raise RuntimeError(f"requested {args.rows} frame rows, but selected {count}")
@@ -709,9 +1010,9 @@ def run_lerobot(
         return int(value.item()) if hasattr(value, "item") else int(value)
 
     def load_items() -> list[dict[str, Any]]:
-        if hasattr(dataset, "__getitems__"):
-            return dataset.__getitems__(list(range(count)))
-        return [dataset[index] for index in range(count)]
+        items = dataset.__getitems__(list(range(count)))
+        validate_lerobot_items(items, args.camera, available_cameras)
+        return items
 
     def execute() -> dict[str, int]:
         items = load_items()
@@ -746,9 +1047,10 @@ def run_lerobot(
         execute,
         validate,
         {
-            "video_backend": args.video_backend,
+            "available_cameras": available_cameras,
             "lerobot_version": lerobot_version,
-            "lerobot_root": (
+            "lerobot_root": str(Path(dataset.root).resolve()),
+            "requested_lerobot_root": (
                 str(Path(args.lerobot_root).resolve()) if args.lerobot_root else None
             ),
             "selection_seconds": 0.0,
@@ -768,13 +1070,41 @@ def run_lerobot(
 
 
 def run_command(args: argparse.Namespace) -> int:
+    validate_requested_cameras(args.camera)
+    args.revision = validate_dataset_revision(args.revision)
     adapters = {"duckdb": run_duckdb, "daft": run_daft, "lerobot": run_lerobot}
+    adapter_args = argparse.Namespace(**vars(args))
+    adapter_args.dataset = resolve_dataset_source(
+        args.engine, args.dataset, args.revision
+    )
+    expected_source_identity = None
+    if args.engine != "lerobot" or args.lerobot_root:
+        expected_source_identity = dataset_source_identity(
+            args.engine,
+            adapter_args.dataset,
+            args.revision,
+            args.lerobot_root,
+        )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    setup_seconds, execute, validate, extra = adapters[args.engine](args)
+    setup_seconds, execute, validate, extra = adapters[args.engine](adapter_args)
     collect_profile = extra.pop("collect_profile", None)
     close = extra.pop("close", None)
     try:
+        actual_source_identity = dataset_source_identity(
+            args.engine,
+            adapter_args.dataset,
+            args.revision,
+            extra.get("lerobot_root"),
+        )
+        if (
+            expected_source_identity is not None
+            and expected_source_identity != actual_source_identity
+        ):
+            raise RuntimeError(
+                "engine resolved a different dataset root than requested"
+            )
+        source_identity = actual_source_identity
         durations, timed_summary = time_callable(execute, args.warmups, args.repeats)
         validation_started = time.perf_counter()
         rows = canonical_rows(validate())
@@ -799,17 +1129,29 @@ def run_command(args: argparse.Namespace) -> int:
             "timed execution materialized "
             f"{timed_summary.get('decoded_images')} images, expected {expected_rows}"
         )
+    selected_frames = selected_frames_from_rows(rows, args.camera, args.rows)
+    available_cameras = validate_camera_inventory(
+        args.engine, args.camera, extra.pop("available_cameras")
+    )
     decode_median = statistics.median(durations)
+    machine = machine_info()
     result = {
-        "schema_version": 3,
+        "schema_version": BENCHMARK_SCHEMA_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "engine": args.engine,
         "dataset": args.dataset,
+        "resolved_dataset": adapter_args.dataset,
+        "dataset_source_mode": source_identity["mode"],
+        "effective_dataset_source": source_identity["effective_source"],
         "revision": args.revision,
         "episode": None if args.all_episodes else args.episode,
         "all_episodes": args.all_episodes,
         "requested_frame_rows": args.rows,
+        "selected_frames": selected_frames,
         "cameras": args.camera,
+        "selected_camera_count": len(args.camera),
+        "available_cameras": available_cameras,
+        "available_camera_count": len(available_cameras),
         "decoded_images": len(rows),
         "warmups": args.warmups,
         "repeats": args.repeats,
@@ -828,11 +1170,9 @@ def run_command(args: argparse.Namespace) -> int:
             "one additional decode/materialization pass, canonical ordering, and "
             "per-image SHA-256; see validation_boundary for engine-specific work"
         ),
-        # Backward-compatible aliases used by existing result consumers.
-        "durations_seconds": durations,
-        "median_seconds": decode_median,
-        "min_seconds": min(durations),
         "configuration": {
+            "delta_timestamps": DELTA_TIMESTAMPS,
+            "video_backend": args.video_backend,
             "tolerance": args.tolerance,
             "cluster_gap": args.cluster_gap,
             "batch_size": args.batch_size,
@@ -846,7 +1186,8 @@ def run_command(args: argparse.Namespace) -> int:
             "width": args.width,
             "height": args.height,
         },
-        "machine": machine_info(),
+        "machine": machine,
+        "hardware_identity": hardware_identity(machine),
         "rows": rows,
         **extra,
     }
@@ -859,9 +1200,144 @@ def run_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def comparison_contract(result: dict[str, Any]) -> dict[str, Any]:
+    schema_version = result.get("schema_version")
+    if type(schema_version) is not int or schema_version != BENCHMARK_SCHEMA_VERSION:
+        raise ValueError(
+            f"expected schema_version {BENCHMARK_SCHEMA_VERSION}, "
+            f"received {schema_version!r}"
+        )
+    revision = result.get("revision")
+    if not isinstance(revision, str):
+        raise ValueError("revision must contain an immutable dataset revision")
+    revision = validate_dataset_revision(revision)
+    engine = result["engine"]
+    resolved_dataset = result["resolved_dataset"]
+    source_identity = dataset_source_identity(
+        engine,
+        resolved_dataset,
+        revision,
+        result.get("lerobot_root"),
+    )
+    recorded_source_identity = {
+        "mode": result["dataset_source_mode"],
+        "effective_source": result["effective_dataset_source"],
+    }
+    if recorded_source_identity != source_identity:
+        raise ValueError(
+            "dataset source identity does not match the source used by the engine"
+        )
+    if source_identity["mode"] == "remote":
+        if resolved_dataset != source_identity["effective_source"]:
+            raise ValueError("resolved_dataset is not pinned to revision")
+    elif engine == "lerobot":
+        if resolved_dataset != result["dataset"]:
+            raise ValueError(
+                "resolved_dataset does not match the source used by the engine"
+            )
+        if result["lerobot_root"] != source_identity["effective_source"]:
+            raise ValueError("lerobot_root is not a normalized local path")
+    else:
+        if resolved_dataset != source_identity["effective_source"]:
+            raise ValueError("resolved_dataset is not a normalized local path")
+
+    cameras = result["cameras"]
+    available_cameras = result["available_cameras"]
+    if result["selected_camera_count"] != len(cameras):
+        raise ValueError("selected_camera_count does not match cameras")
+    if result["available_camera_count"] != len(available_cameras):
+        raise ValueError("available_camera_count does not match available_cameras")
+    validate_requested_cameras(cameras)
+    available_cameras = validate_camera_inventory(
+        result["engine"], cameras, available_cameras
+    )
+    expected_decoded_images = result["requested_frame_rows"] * len(cameras)
+    validated_selected_frames = selected_frames_from_rows(
+        result["rows"], cameras, result["requested_frame_rows"]
+    )
+    if result["selected_frames"] != validated_selected_frames:
+        raise ValueError("selected_frames does not match the validated rows")
+    if result["decoded_images"] != len(result["rows"]):
+        raise ValueError("decoded_images does not match the validated rows")
+    if result["decoded_images"] != expected_decoded_images:
+        raise ValueError("decoded_images does not match the requested workload")
+    timed_summary = result["timed_summary"]
+    if timed_summary.get("frame_rows") != result["requested_frame_rows"]:
+        raise ValueError(
+            "timed_summary frame_rows does not match the requested workload"
+        )
+    if timed_summary.get("decoded_images") != expected_decoded_images:
+        raise ValueError(
+            "timed_summary decoded_images does not match the requested workload"
+        )
+
+    configuration = result["configuration"]
+    machine = result["machine"]
+    expected_hardware = hardware_identity(machine)
+    if result["hardware_identity"] != expected_hardware:
+        raise ValueError("hardware_identity does not match machine metadata")
+
+    return {
+        "revision": revision,
+        "dataset_source_mode": source_identity["mode"],
+        "effective_dataset_source": source_identity["effective_source"],
+        "episode": result["episode"],
+        "all_episodes": result["all_episodes"],
+        "requested_frame_rows": result["requested_frame_rows"],
+        "selected_frames": result["selected_frames"],
+        "cameras": cameras,
+        "available_cameras": available_cameras,
+        "delta_timestamps": configuration["delta_timestamps"],
+        "video_backend": configuration["video_backend"],
+        "tolerance": configuration["tolerance"],
+        "width": configuration["width"],
+        "height": configuration["height"],
+        "cache_state": result["cache_state"],
+        "warmups": result["warmups"],
+        "repeats": result["repeats"],
+        "hardware_identity": expected_hardware,
+    }
+
+
 def compare_command(args: argparse.Namespace) -> int:
-    results = [json.loads(Path(path).read_text()) for path in args.results]
+    if len(args.results) < 2:
+        print(
+            "INCOMPARABLE: at least two result artifacts are required", file=sys.stderr
+        )
+        return 2
+    results = []
+    contracts = []
+    invalid = False
+    for path in args.results:
+        result = json.loads(Path(path).read_text())
+        results.append(result)
+        try:
+            contracts.append(comparison_contract(result))
+        except (KeyError, TypeError, ValueError, RuntimeError) as error:
+            invalid = True
+            print(f"INCOMPARABLE: {path}: {error}", file=sys.stderr)
+    if invalid:
+        return 2
+
     baseline = results[0]
+    baseline_contract = contracts[0]
+    incompatible = False
+    for result, contract in zip(results[1:], contracts[1:]):
+        differences = [
+            key
+            for key, baseline_value in baseline_contract.items()
+            if contract[key] != baseline_value
+        ]
+        if differences:
+            incompatible = True
+            print(
+                f"INCOMPARABLE: {baseline['engine']} vs {result['engine']} differ in "
+                + ", ".join(differences),
+                file=sys.stderr,
+            )
+    if incompatible:
+        return 2
+
     baseline_rows = baseline["rows"]
     mismatch = False
     for result in results[1:]:
@@ -882,10 +1358,7 @@ def compare_command(args: argparse.Namespace) -> int:
                 f"PIXEL MISMATCH: {baseline['engine']} vs {result['engine']}: {different} rows",
                 file=sys.stderr,
             )
-    medians = [
-        result.get("decode_median_seconds", result["median_seconds"])
-        for result in results
-    ]
+    medians = [result["decode_median_seconds"] for result in results]
     fastest = min(medians)
     for result, median in zip(results, medians):
         print(
@@ -905,14 +1378,19 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--dataset",
         required=True,
-        help="local root, hf:// URI, or Hugging Face repo ID",
+        help="local root, hf:// dataset root, or Hugging Face dataset repo ID",
     )
     run.add_argument(
         "--lerobot-root",
         help="local root passed to LeRobotDataset while --dataset remains its repo ID",
     )
     run.add_argument(
-        "--revision", help="immutable Hugging Face revision passed to native LeRobot"
+        "--revision",
+        required=True,
+        help=(
+            "full dataset commit SHA used to pin every remote engine and passed "
+            "to native LeRobot"
+        ),
     )
     run.add_argument(
         "--camera",

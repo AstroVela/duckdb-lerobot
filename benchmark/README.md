@@ -2,11 +2,22 @@
 
 `lerobot_ab.py` runs DuckDB, current Daft, and native LeRobot in separate
 Python environments against the same episode/frame/camera contract. Every
-schema-version-3 result records machine details, exact configuration,
+schema-version-1 result records machine details, the requested, resolved, and
+effective dataset sources plus their local/remote mode, exact selected frame
+and camera inventory, immutable dataset revision, temporal window, reference
+backend, exact configuration,
 warmup/repeat decode timings, a separate validation time, per-image shape and
 SHA-256, and (for DuckDB) a JSON profile containing decoder opens, cache
 hits/evictions, decoder and AVIO seeks, bytes read, decoded frame count, and RGB
 conversion/fan-out counts.
+
+`compare` rejects results before printing timing ratios when their revision,
+requested or available cameras, actual frame selection, temporal window,
+reference backend, resize/tolerance contract, cache state, or hardware identity
+differs. Source mode and normalized effective source must match, so local and
+remote I/O measurements cannot be mixed. Warmup and repeat counts must also
+match so cache preparation and median sample sizes stay comparable.
+Artifacts with another schema version are intentionally not accepted.
 
 The common cross-engine comparison intentionally uses `delta_timestamps =
 [0.0]`: Daft's public dataset reader does not expose LeRobot temporal-window
@@ -22,20 +33,26 @@ MiB. Download it once, then force offline mode for every measured process:
 
 ```bash
 export BENCH_DATA="$PWD/build/benchmark-data/egodex-test"
+export BENCH_REVISION=9ab66a91daf0d0e73f022adadb59f5c9ad7a6b16
 hf download pepijn223/egodex-test \
   --repo-type dataset \
-  --revision 9ab66a91daf0d0e73f022adadb59f5c9ad7a6b16 \
+  --revision "$BENCH_REVISION" \
   --local-dir "$BENCH_DATA"
 export HF_HUB_OFFLINE=1
 ```
 
 `hf download` resumes partial downloads. The benchmark itself does not contact
-the Hub when given these local paths. Run one engine per environment:
+the Hub when given a local path, and it does not scan or hash the snapshot
+before timing. The caller is responsible for preparing the same immutable
+snapshot for every local run. Dataset paths with leading or trailing whitespace
+are rejected because DuckDB and Daft normalize them before opening files. Run
+one engine per environment:
 
 ```bash
 python benchmark/lerobot_ab.py run \
   --engine duckdb \
   --dataset "$BENCH_DATA" \
+  --revision "$BENCH_REVISION" \
   --camera observation.image \
   --rows 100 \
   --duckdb-cli build/benchmark/duckdb \
@@ -44,6 +61,7 @@ python benchmark/lerobot_ab.py run \
 python benchmark/lerobot_ab.py run \
   --engine daft \
   --dataset "$BENCH_DATA" \
+  --revision "$BENCH_REVISION" \
   --camera observation.image \
   --rows 100 \
   --output build/benchmark-results/daft.json
@@ -52,7 +70,7 @@ python benchmark/lerobot_ab.py run \
   --engine lerobot \
   --dataset pepijn223/egodex-test \
   --lerobot-root "$BENCH_DATA" \
-  --revision 9ab66a91daf0d0e73f022adadb59f5c9ad7a6b16 \
+  --revision "$BENCH_REVISION" \
   --camera observation.image \
   --rows 100 \
   --video-backend pyav \
@@ -63,6 +81,18 @@ python benchmark/lerobot_ab.py compare \
   build/benchmark-results/daft.json \
   build/benchmark-results/lerobot.json
 ```
+
+For DuckDB and Daft, a remote Hugging Face repo ID or unpinned `hf://datasets/`
+root is canonicalized to `hf://datasets/<repo>@<revision>` using the required
+commit SHA. An already pinned URI must name the same commit. Every other URI
+scheme is rejected; download those sources with
+`hf download --revision ... --local-dir ...` first. Native LeRobot receives the
+same SHA through its `revision` argument. Local paths are resolved to their
+absolute canonical path. Native LeRobot records `dataset.root`, including its
+resolved Hub cache path when `--lerobot-root` is omitted, because its default v3
+reader decodes from that local snapshot. Native LeRobot therefore cannot be
+compared with a DuckDB/Daft run that decodes directly from a remote Hugging Face
+URI.
 
 The official DuckDB shell is useful when the Python environment contains a
 different DuckDB ABI. Build a benchmark-only shell with both `httpfs` and this
@@ -81,9 +111,9 @@ warmed-process measurements with `--cache-state cold-process --warmups 0` and
 the caller remains responsible for OS and remote-object cache control.
 
 Use the same immutable dataset revision and machine for all runs. A local
-snapshot is preferred when measuring decoder CPU; an `hf://` URI is useful when
-measuring remote open/seek/read amplification. The setup phase is reported
-separately.
+snapshot is preferred when measuring decoder CPU; the automatically
+revision-pinned `hf://` URI is useful when measuring remote open/seek/read
+amplification. The setup phase is reported separately.
 
 The benchmark has three explicit phases so target selection and correctness
 work cannot distort decoder timing:
@@ -96,6 +126,9 @@ work cannot distort decoder timing:
 2. Timed repeats decode and materialize the selected image columns without
    hashing. DuckDB consumes every produced BLOB with `octet_length`, Daft
    collects a materialized DataFrame, and LeRobot returns uint8 Torch tensors.
+   The native LeRobot adapter strictly projects the timestamp map passed to its
+   video reader, so it decodes only the requested `--camera` keys even when the
+   dataset contains additional cameras.
    Daft creates a fresh lazy DataFrame for every repeat because `collect()`
    materializes the object in place; reusing it would benchmark a cached no-op.
    Each result's `timing_boundary` records the engine-specific boundary.
@@ -107,10 +140,9 @@ work cannot distort decoder timing:
    or pixel-hash difference as a correctness failure.
 
 `decode_durations_seconds`, `decode_median_seconds`, and
-`decode_min_seconds` are the primary performance fields. The old
-`durations_seconds`, `median_seconds`, and `min_seconds` names remain aliases so
-existing result readers continue to work. Do not add `validation_seconds` to
-the decode median: it deliberately replays the workload for correctness.
+`decode_min_seconds` are the performance fields. Do not add
+`validation_seconds` to the decode median: it deliberately replays the workload
+for correctness.
 
 The timed DuckDB query exercises `lerobot_video_targets`. Its profiler pass
 replays the same selection through `lerobot_video_frames`, because DuckDB's
