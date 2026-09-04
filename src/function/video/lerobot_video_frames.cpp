@@ -2140,7 +2140,7 @@ public:
 	}
 
 	bool GetQuery(idx_t query_index, string &query) const {
-		if (stop_requested.load(std::memory_order_relaxed) || query_index >= config.frame_queries.size()) {
+		if (stop_requested.load(std::memory_order_acquire) || query_index >= config.frame_queries.size()) {
 			return false;
 		}
 		query = config.frame_queries[query_index];
@@ -2160,7 +2160,7 @@ public:
 		{
 			lock_guard<mutex> guard(lock);
 			producer_connections.push_back(connection);
-			interrupt = stop_requested.load(std::memory_order_relaxed);
+			interrupt = stop_requested.load(std::memory_order_acquire);
 		}
 		if (interrupt) {
 			connection->Interrupt();
