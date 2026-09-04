@@ -191,18 +191,21 @@ SET debug_physical_table_scan_execution_strategy = 'default';
 # LIMIT must cancel/deschedule producers without poisoning the next query on
 # the same connection.
 query I
-SELECT episode_index
-FROM lerobot_video_frames(
-    '{TEST_DIR}/lerobot_video_pipeline',
-    [0, 1],
-    video_keys := ['observation.images.front'],
-    producer_threads := 2,
-    target_buffer_size := 1,
-    max_pending_targets := 1
-)
-LIMIT 1;
+SELECT count(*)
+FROM (
+    SELECT episode_index
+    FROM lerobot_video_frames(
+        '{TEST_DIR}/lerobot_video_pipeline',
+        [0, 1],
+        video_keys := ['observation.images.front'],
+        producer_threads := 2,
+        target_buffer_size := 1,
+        max_pending_targets := 1
+    )
+    LIMIT 1
+);
 ----
-0
+1
 
 query I
 SELECT count(*)
@@ -249,3 +252,34 @@ FROM lerobot_video_frames(
 );
 ----
 Failed to read LeRobot frame timestamps
+
+# With partial task scheduling, a producer yields after 64 source rows. An
+# async consumer waiter must help run the yielded producer when there is only
+# one DuckDB worker instead of occupying that worker indefinitely.
+statement ok
+COPY (
+    SELECT 0::BIGINT AS episode_index,
+           (range % 2)::BIGINT AS frame_index,
+           ((range % 2) * 0.5)::DOUBLE AS timestamp
+    FROM range(128)
+) TO '{TEST_DIR}/lerobot_video_pipeline/data-000.parquet'
+  (FORMAT PARQUET, OVERWRITE_OR_IGNORE TRUE);
+
+statement ok
+SET scheduler_process_partial = true;
+
+query I
+SELECT count(*)
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_pipeline',
+    [0],
+    video_keys := ['observation.images.front'],
+    producer_threads := 1,
+    target_buffer_size := 256,
+    max_pending_targets := 512
+);
+----
+128
+
+statement ok
+SET scheduler_process_partial = false;

@@ -2347,12 +2347,32 @@ public:
 
 	void WaitForConsumer(const weak_ptr<ClientContext> &context) {
 		RecordConsumerWait();
-		unique_lock<mutex> guard(lock);
-		while (!ConsumerCanProgress()) {
-			state_changed.wait_for(guard, std::chrono::milliseconds(10));
+		while (true) {
+			{
+				lock_guard<mutex> guard(lock);
+				if (ConsumerCanProgress()) {
+					return;
+				}
+			}
+
 			auto client = context.lock();
-			if (!client || client->IsInterrupted()) {
+			if (!client) {
+				RequestStop();
 				return;
+			}
+			if (client->IsInterrupted()) {
+				RequestStop();
+				return;
+			}
+
+			// AsyncTask::Execute runs on the same scheduler as the producers.
+			// Help one queued task before sleeping so an async waiter cannot
+			// starve a yielded producer when DuckDB has only one worker.
+			TaskScheduler::GetScheduler(*client).ExecuteTasks(1);
+
+			unique_lock<mutex> guard(lock);
+			if (!ConsumerCanProgress()) {
+				state_changed.wait_for(guard, std::chrono::milliseconds(10));
 			}
 		}
 	}
@@ -2567,8 +2587,10 @@ public:
 						return TaskExecutionResult::TASK_FINISHED;
 					}
 					next_query += query_stride;
-					frame_connection = make_shared_ptr<Connection>(*database);
-					state->RegisterConnection(frame_connection);
+					if (!frame_connection) {
+						frame_connection = make_shared_ptr<Connection>(*database);
+						state->RegisterConnection(frame_connection);
+					}
 					frame_result = frame_connection->SendQuery(query);
 					if (frame_result->HasError()) {
 						throw InvalidInputException("Failed to read LeRobot frame timestamps: %s",
@@ -2585,7 +2607,6 @@ public:
 							                            frame_result->GetError());
 						}
 						frame_result.reset();
-						frame_connection.reset();
 						current_formats.clear();
 						continue;
 					}
@@ -2731,7 +2752,11 @@ struct LerobotVideoFramesGlobalState final : public GlobalTableFunctionState {
 	void WaitForBuffer(ClientContext &context) {
 		producer_state->RecordConsumerWait();
 		auto &scheduler = TaskScheduler::GetScheduler(context);
-		while (!producer_state->CanConsumerProgress() && !context.IsInterrupted()) {
+		while (!producer_state->CanConsumerProgress()) {
+			if (context.IsInterrupted()) {
+				producer_state->RequestStop();
+				throw InterruptException();
+			}
 			// Synchronous table scans cannot surface BLOCKED. With one DuckDB
 			// thread, actively execute a queued producer instead of waiting for a
 			// background worker that does not exist.
