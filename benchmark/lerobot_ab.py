@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import statistics
 import subprocess
 import sys
@@ -37,6 +38,9 @@ HARDWARE_IDENTITY_FIELDS = (
 )
 SHA256_HEX_LENGTH = 64
 GIT_COMMIT_HEX_LENGTH = 40
+HF_DATASET_URI_PREFIX = "hf://datasets/"
+HF_REPO_ID_PATTERN = re.compile(r"[\w.-]+/[\w.-]+")
+REMOTE_DATASET_PREFIXES = ("hf://", "http://", "https://", "s3://")
 
 
 def sql_string(value: str) -> str:
@@ -142,6 +146,39 @@ def validate_dataset_revision(revision: str) -> str:
     ):
         raise ValueError("--revision must be a full 40-character commit SHA")
     return normalized
+
+
+def resolve_dataset_source(engine: str, dataset: str, revision: str) -> str:
+    """Pin DuckDB and Daft Hugging Face reads to the declared commit."""
+    if engine == "lerobot" or Path(dataset).exists():
+        return dataset
+
+    root = dataset.rstrip("/")
+    if HF_REPO_ID_PATTERN.fullmatch(root):
+        return f"{HF_DATASET_URI_PREFIX}{root}@{revision}"
+
+    if root.startswith(HF_DATASET_URI_PREFIX):
+        repository, separator, source_revision = root[
+            len(HF_DATASET_URI_PREFIX) :
+        ].partition("@")
+        if not HF_REPO_ID_PATTERN.fullmatch(repository):
+            raise ValueError(
+                "remote --dataset must be a Hugging Face dataset repository root"
+            )
+        if separator and source_revision.lower() != revision:
+            raise ValueError(
+                f"remote --dataset revision {source_revision!r} does not match "
+                f"--revision {revision!r}"
+            )
+        return f"{HF_DATASET_URI_PREFIX}{repository}@{revision}"
+
+    if root.startswith(REMOTE_DATASET_PREFIXES):
+        raise ValueError(
+            "remote DuckDB/Daft benchmarks require a Hugging Face dataset root "
+            "that can be pinned to --revision; download other remote sources "
+            "to a local snapshot first"
+        )
+    return dataset
 
 
 def validate_camera_inventory(
@@ -966,9 +1003,13 @@ def run_command(args: argparse.Namespace) -> int:
     validate_requested_cameras(args.camera)
     args.revision = validate_dataset_revision(args.revision)
     adapters = {"duckdb": run_duckdb, "daft": run_daft, "lerobot": run_lerobot}
+    adapter_args = argparse.Namespace(**vars(args))
+    adapter_args.dataset = resolve_dataset_source(
+        args.engine, args.dataset, args.revision
+    )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    setup_seconds, execute, validate, extra = adapters[args.engine](args)
+    setup_seconds, execute, validate, extra = adapters[args.engine](adapter_args)
     collect_profile = extra.pop("collect_profile", None)
     close = extra.pop("close", None)
     try:
@@ -1007,6 +1048,7 @@ def run_command(args: argparse.Namespace) -> int:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "engine": args.engine,
         "dataset": args.dataset,
+        "resolved_dataset": adapter_args.dataset,
         "revision": args.revision,
         "episode": None if args.all_episodes else args.episode,
         "all_episodes": args.all_episodes,
@@ -1074,6 +1116,21 @@ def comparison_contract(result: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(revision, str):
         raise ValueError("revision must contain an immutable dataset revision")
     revision = validate_dataset_revision(revision)
+    resolved_dataset = result["resolved_dataset"]
+    if not isinstance(resolved_dataset, str) or not resolved_dataset:
+        raise ValueError("resolved_dataset must contain the source used by the engine")
+    if result["engine"] != "lerobot" and resolved_dataset.startswith(
+        REMOTE_DATASET_PREFIXES
+    ):
+        if (
+            resolve_dataset_source(result["engine"], resolved_dataset, revision)
+            != resolved_dataset
+        ):
+            raise ValueError("resolved_dataset is not pinned to revision")
+    elif resolved_dataset != result["dataset"]:
+        raise ValueError(
+            "resolved_dataset does not match the source used by the engine"
+        )
 
     cameras = result["cameras"]
     available_cameras = result["available_cameras"]
@@ -1210,7 +1267,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--dataset",
         required=True,
-        help="local root, hf:// URI, or Hugging Face repo ID",
+        help="local root, hf:// dataset root, or Hugging Face dataset repo ID",
     )
     run.add_argument(
         "--lerobot-root",
@@ -1220,8 +1277,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--revision",
         required=True,
         help=(
-            "immutable dataset revision recorded by every engine and passed to "
-            "native LeRobot"
+            "full dataset commit SHA used to pin every remote engine and passed "
+            "to native LeRobot"
         ),
     )
     run.add_argument(

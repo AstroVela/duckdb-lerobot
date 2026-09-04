@@ -88,6 +88,7 @@ def synthetic_result(engine: str) -> dict:
         "schema_version": lerobot_ab.BENCHMARK_SCHEMA_VERSION,
         "engine": engine,
         "dataset": "/tmp/multicamera",
+        "resolved_dataset": "/tmp/multicamera",
         "revision": DATASET_REVISION,
         "episode": 0,
         "all_episodes": False,
@@ -198,6 +199,46 @@ class LeRobotBenchmarkTest(TestCase):
                 [{"camera.left": b"left", "camera.right": b"right"}],
                 ["camera.left"],
                 ["camera.left", "camera.right"],
+            )
+
+    def test_remote_dataset_sources_are_revision_pinned(self) -> None:
+        pinned = f"hf://datasets/owner/dataset@{DATASET_REVISION}"
+        for engine in ("duckdb", "daft"):
+            with self.subTest(engine=engine, source="repo-id"):
+                self.assertEqual(
+                    lerobot_ab.resolve_dataset_source(
+                        engine, "owner/dataset", DATASET_REVISION
+                    ),
+                    pinned,
+                )
+            with self.subTest(engine=engine, source="hf-root"):
+                self.assertEqual(
+                    lerobot_ab.resolve_dataset_source(
+                        engine, "hf://datasets/owner/dataset", DATASET_REVISION
+                    ),
+                    pinned,
+                )
+            with self.subTest(engine=engine, source="already-pinned"):
+                self.assertEqual(
+                    lerobot_ab.resolve_dataset_source(engine, pinned, DATASET_REVISION),
+                    pinned,
+                )
+
+        self.assertEqual(
+            lerobot_ab.resolve_dataset_source(
+                "lerobot", "owner/dataset", DATASET_REVISION
+            ),
+            "owner/dataset",
+        )
+        with self.assertRaisesRegex(ValueError, "does not match --revision"):
+            lerobot_ab.resolve_dataset_source(
+                "daft",
+                f"hf://datasets/owner/dataset@{OTHER_DATASET_REVISION}",
+                DATASET_REVISION,
+            )
+        with self.assertRaisesRegex(ValueError, "local snapshot"):
+            lerobot_ab.resolve_dataset_source(
+                "duckdb", "s3://bucket/dataset", DATASET_REVISION
             )
 
     def test_duckdb_setup_closes_connections_on_camera_validation_error(self) -> None:
@@ -413,9 +454,10 @@ class LeRobotBenchmarkTest(TestCase):
     def test_run_command_records_strict_multicamera_contract(self) -> None:
         source = synthetic_result("duckdb")
         machine = source["machine"]
+        adapter_sources = []
 
         def fake_adapter(args):
-            del args
+            adapter_sources.append(args.dataset)
             return (
                 0.25,
                 lambda: {"frame_rows": 2, "decoded_images": 4},
@@ -425,6 +467,7 @@ class LeRobotBenchmarkTest(TestCase):
 
         args = benchmark_args()
         args.camera = list(source["cameras"])
+        args.dataset = "owner/dataset"
         with TemporaryDirectory() as directory:
             args.output = str(Path(directory) / "duckdb.json")
             with (
@@ -436,6 +479,12 @@ class LeRobotBenchmarkTest(TestCase):
             result = json.loads(Path(args.output).read_text())
 
         self.assertEqual(result["schema_version"], lerobot_ab.BENCHMARK_SCHEMA_VERSION)
+        self.assertEqual(result["dataset"], "owner/dataset")
+        self.assertEqual(
+            result["resolved_dataset"],
+            f"hf://datasets/owner/dataset@{DATASET_REVISION}",
+        )
+        self.assertEqual(adapter_sources, [result["resolved_dataset"]])
         self.assertEqual(result["selected_camera_count"], 2)
         self.assertEqual(result["available_camera_count"], 3)
         self.assertEqual(result["selected_frames"], source["selected_frames"])
@@ -465,8 +514,19 @@ class LeRobotBenchmarkTest(TestCase):
             result["available_cameras"].append("camera.wrist")
             result["available_camera_count"] = 4
 
+        def different_remote_revision(result):
+            result["engine"] = "daft"
+            result["dataset"] = "owner/dataset"
+            result["resolved_dataset"] = (
+                f"hf://datasets/owner/dataset@{OTHER_DATASET_REVISION}"
+            )
+
         changes = {
             "revision": lambda result: result.update(revision=OTHER_DATASET_REVISION),
+            "resolved_dataset_revision": different_remote_revision,
+            "native_resolved_dataset": lambda result: result.update(
+                resolved_dataset=f"hf://datasets/owner/dataset@{DATASET_REVISION}"
+            ),
             "cameras": lambda result: result["cameras"].reverse(),
             "selected_frames": different_rows,
             "delta_timestamps": lambda result: result["configuration"].update(

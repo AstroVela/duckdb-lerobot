@@ -2,12 +2,13 @@
 
 `lerobot_ab.py` runs DuckDB, current Daft, and native LeRobot in separate
 Python environments against the same episode/frame/camera contract. Every
-schema-version-4 result records machine details, exact selected frame and camera
-inventory, immutable dataset revision, temporal window, reference backend,
-exact configuration, warmup/repeat decode timings, a separate validation time,
-per-image shape and SHA-256, and (for DuckDB) a JSON profile containing decoder
-opens, cache hits/evictions, decoder and AVIO seeks, bytes read, decoded frame
-count, and RGB conversion/fan-out counts.
+schema-version-4 result records machine details, the requested and resolved
+dataset sources, exact selected frame and camera inventory, immutable dataset
+revision, temporal window, reference backend, exact configuration,
+warmup/repeat decode timings, a separate validation time, per-image shape and
+SHA-256, and (for DuckDB) a JSON profile containing decoder opens, cache
+hits/evictions, decoder and AVIO seeks, bytes read, decoded frame count, and RGB
+conversion/fan-out counts.
 
 `compare` rejects results before printing timing ratios when their revision,
 requested or available cameras, actual frame selection, temporal window,
@@ -75,6 +76,13 @@ python benchmark/lerobot_ab.py compare \
   build/benchmark-results/lerobot.json
 ```
 
+For DuckDB and Daft, a remote Hugging Face repo ID or unpinned `hf://datasets/`
+root is canonicalized to `hf://datasets/<repo>@<revision>` using the required
+commit SHA. An already pinned URI must name the same commit. Other remote
+schemes are rejected because the benchmark cannot prove their snapshot
+identity; download those sources locally first. Native LeRobot receives the
+same SHA through its `revision` argument.
+
 The official DuckDB shell is useful when the Python environment contains a
 different DuckDB ABI. Build a benchmark-only shell with both `httpfs` and this
 extension statically linked:
@@ -92,9 +100,9 @@ warmed-process measurements with `--cache-state cold-process --warmups 0` and
 the caller remains responsible for OS and remote-object cache control.
 
 Use the same immutable dataset revision and machine for all runs. A local
-snapshot is preferred when measuring decoder CPU; an `hf://` URI is useful when
-measuring remote open/seek/read amplification. The setup phase is reported
-separately.
+snapshot is preferred when measuring decoder CPU; the automatically
+revision-pinned `hf://` URI is useful when measuring remote open/seek/read
+amplification. The setup phase is reported separately.
 
 The benchmark has three explicit phases so target selection and correctness
 work cannot distort decoder timing:
