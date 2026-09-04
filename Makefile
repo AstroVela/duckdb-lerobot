@@ -4,3 +4,11 @@ EXT_NAME=lerobot
 EXT_CONFIG=$(PROJ_DIR)extension_config.cmake
 
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
+
+.PHONY: install_ci_dependencies
+configure_ci: install_ci_dependencies
+
+install_ci_dependencies:
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		brew install nasm; \
+	fi
