@@ -173,7 +173,7 @@ jobs:
           "${BUILD_DIR}/conformance-venv/bin/python" \
             test/conformance/test_bidirectional.py \
             --duckdb "${BUILD_DIR}/duckdb" \
-            --extension "${BUILD_DIR}/extension/lerobot/src/lerobot.duckdb_extension"
+            --extension "${BUILD_DIR}/extension/lerobot/lerobot.duckdb_extension"
 
       - name: Run pinned LeRobot visual conformance
         if: matrix.id == 'release-ffmpeg'

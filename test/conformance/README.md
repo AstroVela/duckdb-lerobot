@@ -26,7 +26,7 @@ build/conformance-venv/bin/python -m pip install \
   -r test/conformance/requirements.txt
 build/conformance-venv/bin/python test/conformance/test_bidirectional.py \
   --duckdb build/release/duckdb \
-  --extension build/release/extension/lerobot/src/lerobot.duckdb_extension
+  --extension build/release/extension/lerobot/lerobot.duckdb_extension
 ```
 
 An FFmpeg-enabled build additionally runs `test_visual.py` with the same CLI
