@@ -198,22 +198,30 @@ is then located by:
     absolute_timestamp = videos/{key}/from_timestamp + frame.timestamp
 
 It must never be addressed by `frame_index` alone. `lerobot_video_frames`
-uses a streaming DuckDB query for the three alignment columns from only the
-routed data shards, then expands the requested camera routes one target at a
-time. A global scheduler logically partitions those targets by MP4 shard while
-placing them into fixed-size buffers. Each buffer is sorted independently, and
-a gap greater than 10 seconds starts a new seek cluster. A cluster also ends
-before its timestamp span, multiplied by dataset FPS and including both endpoint
-frames, would exceed 20,000 estimated frames. This bounds sparse targets whose
-adjacent gaps are exactly 10 seconds without shortening the supported video.
+builds one alignment query per routed Parquet file and runs those queries on
+query-owned background producer tasks. Each task owns its own DuckDB
+connection/result and a fixed round-robin set of file partitions, so one eager
+task cannot consume all source work before the others are scheduled. Producers
+expand requested camera routes one target at a time into a shared queue. A
+global scheduler then partitions those targets by MP4 shard while placing them
+into fixed-size buffers. Each buffer is sorted independently, and a gap greater
+than 10 seconds starts a new seek cluster. A cluster also ends before its
+timestamp span, multiplied by dataset FPS and including both endpoint frames,
+would exceed 20,000 estimated frames. This bounds sparse targets whose adjacent
+gaps are exactly 10 seconds without shortening the supported video.
 
 The number of queued targets is bounded as well as the size of an individual
-shard buffer. If many shards each have a partial buffer, the scheduler flushes
-the least-recently-touched partial buffer before reading more Parquet rows. The
-source scheduler leases one decoder per shard at a time. Relation pipelines may
-hold separate sessions for the same shard when DuckDB runs independent input
-chunks concurrently; no FFmpeg object itself is shared. Decode runs in parallel
-up to the smaller of `decode_threads` and `max_cached_decoders`.
+shard buffer. At the bound, a producer returns `TASK_BLOCKED` and is genuinely
+descheduled; a consumer pop reschedules blocked producers. If only partial
+buffers exist, the least-recently-touched one is published before blocking so
+the queue cannot deadlock. An empty source consumer reports DuckDB `BLOCKED`
+through `AsyncResult` and is awakened by data, EOF, cancellation, or error;
+`NEED_MORE_INPUT` is not used because it means an in/out operator consumed its
+current input chunk, not that a source should be retried. The source scheduler
+leases one decoder per shard at a time. Relation pipelines may hold separate
+sessions for the same shard when DuckDB runs independent input chunks
+concurrently; no FFmpeg object itself is shared. Decode runs in parallel up to
+the smaller of `decode_threads` and `max_cached_decoders`.
 
 The DuckDB file handle, FFmpeg container, codec, frames, and RGB conversion
 context stay open when a decoder is returned between buffers. A monotonic next
@@ -233,10 +241,11 @@ plus a 20,000-frame emergency margin, leaving room for keyframe preroll while
 still detecting corrupt routing metadata or pathological decode progress.
 
 The table function emits at most 16 rows and 64 MiB of image data per call by
-default. Target buffers hold at most 256 entries by default, and a global LRU
-retains at most 8 idle or leased decoder sessions. Decode worker count, open
-decoder count, queued target count, per-call image bytes, and FFmpeg codec
-threads are independent controls. Encountering an additional shard closes the
+default. Target buffers hold at most 256 entries by default, source reads use
+up to 4 producer tasks, and a global LRU retains at most 8 idle or leased
+decoder sessions. Producer count, decode worker count, open decoder count,
+queued target count, per-call image bytes, and FFmpeg codec threads are
+independent controls. Encountering an additional shard closes the
 least-recently-used idle decoder before opening the replacement. Each row
 includes the episode-local timestamp, absolute requested timestamp, actual
 decoded timestamp, dimensions, channels, and an HWC `BLOB`. RGB rows contain

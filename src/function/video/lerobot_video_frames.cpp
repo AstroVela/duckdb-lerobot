@@ -10,11 +10,14 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "duckdb/execution/executor.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/query_result.hpp"
+#include "duckdb/parallel/executor_task.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/table_filter.hpp"
@@ -26,12 +29,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <map>
 #include <utility>
 
 #ifdef LEROBOT_HAVE_FFMPEG
@@ -52,12 +57,15 @@ static const idx_t LEROBOT_DEFAULT_DECODE_BATCH_SIZE = 16;
 static const idx_t LEROBOT_DEFAULT_TARGET_BUFFER_SIZE = 256;
 static const idx_t LEROBOT_DEFAULT_MAX_CACHED_DECODERS = 8;
 static const idx_t LEROBOT_DEFAULT_DECODE_THREADS = 8;
+static const idx_t LEROBOT_DEFAULT_PRODUCER_THREADS = 4;
 static const idx_t LEROBOT_DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 static const int64_t LEROBOT_DEFAULT_CODEC_THREADS = 1;
 static const idx_t LEROBOT_MAX_TARGET_BUFFER_SIZE = 1024 * 1024;
 static const idx_t LEROBOT_MAX_CACHED_DECODERS = 1024;
 static const idx_t LEROBOT_MAX_DECODE_THREADS = 1024;
+static const idx_t LEROBOT_MAX_PRODUCER_THREADS = 1024;
 static const idx_t LEROBOT_MAX_PENDING_TARGETS = 10 * 1024 * 1024;
+static const idx_t LEROBOT_PRODUCER_ROWS_PER_TASK = 64;
 static const idx_t LEROBOT_MAX_WINDOW_TARGETS = 100000;
 static const idx_t LEROBOT_MAX_CLUSTER_FRAME_SPAN = 20000;
 static const double LEROBOT_DEFAULT_CLUSTER_GAP_SECONDS = 10.0;
@@ -268,6 +276,7 @@ struct LerobotVideoOptions {
 	idx_t target_buffer_size;
 	idx_t max_cached_decoders;
 	idx_t decode_threads;
+	idx_t producer_threads;
 	idx_t max_pending_targets;
 	idx_t max_output_bytes;
 	int32_t codec_threads;
@@ -327,6 +336,11 @@ LerobotVideoOptions GetVideoOptions(TableFunctionBindInput &input, const char *f
 	if (decode_threads_value <= 0 || decode_threads_value > static_cast<int64_t>(LEROBOT_MAX_DECODE_THREADS)) {
 		throw BinderException("%s decode_threads must be between 1 and %d", function_name, LEROBOT_MAX_DECODE_THREADS);
 	}
+	const auto producer_threads_value = GetNamedInteger(input, "producer_threads", LEROBOT_DEFAULT_PRODUCER_THREADS);
+	if (producer_threads_value <= 0 || producer_threads_value > static_cast<int64_t>(LEROBOT_MAX_PRODUCER_THREADS)) {
+		throw BinderException("%s producer_threads must be between 1 and %d", function_name,
+		                      LEROBOT_MAX_PRODUCER_THREADS);
+	}
 	const auto max_pending_targets_value = GetNamedInteger(input, "max_pending_targets", 0);
 	if (max_pending_targets_value < 0 ||
 	    max_pending_targets_value > static_cast<int64_t>(LEROBOT_MAX_PENDING_TARGETS)) {
@@ -370,6 +384,7 @@ LerobotVideoOptions GetVideoOptions(TableFunctionBindInput &input, const char *f
 	result.target_buffer_size = static_cast<idx_t>(target_buffer_size_value);
 	result.max_cached_decoders = static_cast<idx_t>(max_cached_decoders_value);
 	result.decode_threads = static_cast<idx_t>(decode_threads_value);
+	result.producer_threads = static_cast<idx_t>(producer_threads_value);
 	result.max_pending_targets = max_pending_targets;
 	result.max_output_bytes = static_cast<idx_t>(max_output_bytes_value);
 	result.codec_threads = static_cast<int32_t>(codec_threads_value);
@@ -414,12 +429,19 @@ struct LerobotDecodeTarget {
 //! allow decoder workers to update the counters without serializing hot paths.
 struct LerobotVideoDecodeMetrics {
 	LerobotVideoDecodeMetrics()
-	    : targets(0), decoder_acquires(0), decoder_cache_hits(0), decoder_opens(0), decoder_evictions(0),
+	    : targets(0), source_queries(0), producer_tasks(0), source_chunks(0), producer_waits(0), consumer_waits(0),
+	      queue_high_watermark(0), decoder_acquires(0), decoder_cache_hits(0), decoder_opens(0), decoder_evictions(0),
 	      decoder_seeks(0), avio_seeks(0), video_bytes_read(0), frames_decoded(0), rgb_conversions(0),
 	      rgb_fanout_hits(0), depth_conversions(0), depth_fanout_hits(0) {
 	}
 
 	std::atomic<uint64_t> targets;
+	std::atomic<uint64_t> source_queries;
+	std::atomic<uint64_t> producer_tasks;
+	std::atomic<uint64_t> source_chunks;
+	std::atomic<uint64_t> producer_waits;
+	std::atomic<uint64_t> consumer_waits;
+	std::atomic<uint64_t> queue_high_watermark;
 	std::atomic<uint64_t> decoder_acquires;
 	std::atomic<uint64_t> decoder_cache_hits;
 	std::atomic<uint64_t> decoder_opens;
@@ -473,18 +495,18 @@ idx_t DecodeFrameBudget(double first_timestamp, double last_timestamp, int64_t f
 
 struct LerobotVideoFramesBindData final : public TableFunctionData {
 	LerobotVideoFramesBindData(shared_ptr<LerobotVideoMetadata> metadata_p, vector<LerobotVideoRoute> routes_p,
-	                           string frame_query_p, bool window_mode_p, const LerobotVideoOptions &options)
-	    : metadata(std::move(metadata_p)), routes(std::move(routes_p)), frame_query(std::move(frame_query_p)),
+	                           vector<string> frame_queries_p, bool window_mode_p, const LerobotVideoOptions &options)
+	    : metadata(std::move(metadata_p)), routes(std::move(routes_p)), frame_queries(std::move(frame_queries_p)),
 	      window_mode(window_mode_p), tolerance(options.tolerance), cluster_gap(options.cluster_gap),
 	      width(options.width), height(options.height), output_batch_size(options.output_batch_size),
 	      target_buffer_size(options.target_buffer_size), max_cached_decoders(options.max_cached_decoders),
-	      decode_threads(options.decode_threads), max_pending_targets(options.max_pending_targets),
-	      max_output_bytes(options.max_output_bytes), codec_threads(options.codec_threads),
-	      depth_output_unit(options.depth_output_unit) {
+	      decode_threads(options.decode_threads), producer_threads(options.producer_threads),
+	      max_pending_targets(options.max_pending_targets), max_output_bytes(options.max_output_bytes),
+	      codec_threads(options.codec_threads), depth_output_unit(options.depth_output_unit) {
 	}
 
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<LerobotVideoFramesBindData>(metadata, routes, frame_query, window_mode, GetOptions());
+		return make_uniq<LerobotVideoFramesBindData>(metadata, routes, frame_queries, window_mode, GetOptions());
 	}
 
 	LerobotVideoOptions GetOptions() const {
@@ -497,6 +519,7 @@ struct LerobotVideoFramesBindData final : public TableFunctionData {
 		options.target_buffer_size = target_buffer_size;
 		options.max_cached_decoders = max_cached_decoders;
 		options.decode_threads = decode_threads;
+		options.producer_threads = producer_threads;
 		options.max_pending_targets = max_pending_targets;
 		options.max_output_bytes = max_output_bytes;
 		options.codec_threads = codec_threads;
@@ -506,7 +529,7 @@ struct LerobotVideoFramesBindData final : public TableFunctionData {
 
 	shared_ptr<LerobotVideoMetadata> metadata;
 	vector<LerobotVideoRoute> routes;
-	string frame_query;
+	vector<string> frame_queries;
 	bool window_mode;
 	double tolerance;
 	double cluster_gap;
@@ -516,6 +539,7 @@ struct LerobotVideoFramesBindData final : public TableFunctionData {
 	idx_t target_buffer_size;
 	idx_t max_cached_decoders;
 	idx_t decode_threads;
+	idx_t producer_threads;
 	idx_t max_pending_targets;
 	idx_t max_output_bytes;
 	int32_t codec_threads;
@@ -562,6 +586,19 @@ void FinalizeDecodeBuffer(LerobotDecodeBuffer &buffer, double cluster_gap) {
 	}
 }
 
+map<idx_t, vector<int64_t>> GroupEpisodesByDataFile(const LerobotDatasetMetadata &metadata,
+                                                    const vector<int64_t> &episode_indices) {
+	map<idx_t, vector<int64_t>> result;
+	for (const auto episode_index : episode_indices) {
+		const auto route = metadata.FindEpisodeRoute(episode_index);
+		if (!route) {
+			continue;
+		}
+		result[route->data_file_index].push_back(episode_index);
+	}
+	return result;
+}
+
 unique_ptr<FunctionData> LerobotVideoFramesBind(ClientContext &context, TableFunctionBindInput &input,
                                                 vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs[0].IsNull()) {
@@ -589,25 +626,29 @@ unique_ptr<FunctionData> LerobotVideoFramesBind(ClientContext &context, TableFun
 	                LogicalType::VARCHAR, LogicalType::DOUBLE,  LogicalType::DOUBLE, LogicalType::INTEGER,
 	                LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::BLOB};
 
-	string frame_query;
+	vector<string> frame_queries;
 	if (!episode_indices.empty() && !routes.empty() &&
 	    (frame_filter == input.named_parameters.end() || !frame_indices.empty())) {
 		bool data_cache_hit;
 		// LerobotVideoMetadata::Get above has already refreshed and validated the
 		// shared base metadata cache when refresh was requested.
 		auto dataset_metadata = LerobotDatasetMetadata::Get(context, root, false, data_cache_hit);
-		auto data_files = dataset_metadata->ResolveDataFiles(episode_indices);
-		if (!data_files.empty()) {
-			frame_query = "SELECT CAST(episode_index AS BIGINT), CAST(frame_index AS BIGINT), "
-			              "CAST(timestamp AS DOUBLE) FROM read_parquet(" +
-			              ValueListSQL(data_files) + ") WHERE episode_index IN " + IntegerListSQL(episode_indices);
+		const auto &data_files = dataset_metadata->GetDataFiles();
+		for (const auto &partition : GroupEpisodesByDataFile(*dataset_metadata, episode_indices)) {
+			D_ASSERT(partition.first < data_files.size());
+			vector<string> partition_file {data_files[partition.first]};
+			string frame_query = "SELECT CAST(episode_index AS BIGINT), CAST(frame_index AS BIGINT), "
+			                     "CAST(timestamp AS DOUBLE) FROM read_parquet(" +
+			                     ValueListSQL(partition_file) + ") WHERE episode_index IN " +
+			                     IntegerListSQL(partition.second);
 			if (frame_filter != input.named_parameters.end()) {
 				frame_query += " AND frame_index IN " + IntegerListSQL(frame_indices);
 			}
+			frame_queries.push_back(std::move(frame_query));
 		}
 	}
 
-	return make_uniq<LerobotVideoFramesBindData>(std::move(video_metadata), std::move(routes), std::move(frame_query),
+	return make_uniq<LerobotVideoFramesBindData>(std::move(video_metadata), std::move(routes), std::move(frame_queries),
 	                                             false, options);
 }
 
@@ -642,6 +683,20 @@ vector<LerobotVideoWindowRequest> GetVideoWindowRequests(const Value &value) {
 			throw BinderException("lerobot_video_windows episode_index and frame_index must be non-negative");
 		}
 		result.push_back(request);
+	}
+	return result;
+}
+
+map<idx_t, vector<LerobotVideoWindowRequest>>
+GroupWindowRequestsByDataFile(const LerobotDatasetMetadata &metadata,
+                              const vector<LerobotVideoWindowRequest> &requests) {
+	map<idx_t, vector<LerobotVideoWindowRequest>> result;
+	for (const auto &request : requests) {
+		const auto route = metadata.FindEpisodeRoute(request.episode_index);
+		if (!route) {
+			continue;
+		}
+		result[route->data_file_index].push_back(request);
 	}
 	return result;
 }
@@ -774,14 +829,27 @@ unique_ptr<FunctionData> LerobotVideoWindowsBind(ClientContext &context, TableFu
 	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::INTEGER, LogicalType::INTEGER,
 	                LogicalType::INTEGER, LogicalType::BLOB};
 
-	string frame_query;
+	vector<string> frame_queries;
 	if (!requests.empty() && !deltas.empty() && !routes.empty()) {
 		bool data_cache_hit;
 		auto dataset_metadata = LerobotDatasetMetadata::Get(context, root, false, data_cache_hit);
-		auto data_files = dataset_metadata->ResolveDataFiles(episode_indices);
-		frame_query = BuildVideoWindowQuery(requests, deltas, episode_lengths, data_files, episode_indices);
+		const auto &data_files = dataset_metadata->GetDataFiles();
+		for (const auto &partition : GroupWindowRequestsByDataFile(*dataset_metadata, requests)) {
+			D_ASSERT(partition.first < data_files.size());
+			vector<int64_t> partition_episodes;
+			partition_episodes.reserve(partition.second.size());
+			for (const auto &request : partition.second) {
+				partition_episodes.push_back(request.episode_index);
+			}
+			std::sort(partition_episodes.begin(), partition_episodes.end());
+			partition_episodes.erase(std::unique(partition_episodes.begin(), partition_episodes.end()),
+			                         partition_episodes.end());
+			vector<string> partition_file {data_files[partition.first]};
+			frame_queries.push_back(
+			    BuildVideoWindowQuery(partition.second, deltas, episode_lengths, partition_file, partition_episodes));
+		}
 	}
-	return make_uniq<LerobotVideoFramesBindData>(std::move(video_metadata), std::move(routes), std::move(frame_query),
+	return make_uniq<LerobotVideoFramesBindData>(std::move(video_metadata), std::move(routes), std::move(frame_queries),
 	                                             true, options);
 }
 
@@ -2031,11 +2099,597 @@ struct LerobotPartialBuffer {
 	vector<LerobotDecodeTarget> targets;
 };
 
+enum class LerobotBufferClaimResult : uint8_t { CLAIMED, BLOCKED, FINISHED };
+enum class LerobotTargetQueueResult : uint8_t { QUEUED, BLOCKED, STOPPED };
+
+//! Immutable copy of the source configuration. Producer tasks can outlive the
+//! physical table scan state briefly during LIMIT/cancellation, so they must
+//! not retain references into FunctionData.
+struct LerobotVideoProducerConfig {
+	explicit LerobotVideoProducerConfig(const LerobotVideoFramesBindData &bind_data)
+	    : metadata(bind_data.metadata), routes(bind_data.routes), frame_queries(bind_data.frame_queries),
+	      window_mode(bind_data.window_mode), tolerance(bind_data.tolerance), cluster_gap(bind_data.cluster_gap),
+	      target_buffer_size(bind_data.target_buffer_size), max_pending_targets(bind_data.max_pending_targets) {
+	}
+
+	shared_ptr<LerobotVideoMetadata> metadata;
+	vector<LerobotVideoRoute> routes;
+	vector<string> frame_queries;
+	bool window_mode;
+	double tolerance;
+	double cluster_gap;
+	idx_t target_buffer_size;
+	idx_t max_pending_targets;
+};
+
+class LerobotVideoProducerState {
+public:
+	explicit LerobotVideoProducerState(const LerobotVideoFramesBindData &bind_data)
+	    : config(bind_data),
+	      active_producers(std::min<idx_t>(bind_data.producer_threads, bind_data.frame_queries.size())),
+	      source_exhausted(active_producers == 0), stop_requested(false), pending_target_count(0) {
+		for (idx_t route_index = 0; route_index < config.routes.size(); route_index++) {
+			routes_by_episode[config.routes[route_index].episode_index].push_back(route_index);
+		}
+		metrics.source_queries.store(static_cast<uint64_t>(config.frame_queries.size()), std::memory_order_relaxed);
+		metrics.producer_tasks.store(static_cast<uint64_t>(active_producers), std::memory_order_relaxed);
+	}
+
+	idx_t ProducerCount() const {
+		return active_producers;
+	}
+
+	bool GetQuery(idx_t query_index, string &query) const {
+		if (stop_requested.load(std::memory_order_acquire) || query_index >= config.frame_queries.size()) {
+			return false;
+		}
+		query = config.frame_queries[query_index];
+		return true;
+	}
+
+	bool ShouldStop() const {
+		return stop_requested.load(std::memory_order_acquire);
+	}
+
+	void SourceChunkRead() {
+		metrics.source_chunks.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	void RegisterConnection(const shared_ptr<Connection> &connection) {
+		bool interrupt;
+		{
+			lock_guard<mutex> guard(lock);
+			producer_connections.push_back(connection);
+			interrupt = stop_requested.load(std::memory_order_acquire);
+		}
+		if (interrupt) {
+			connection->Interrupt();
+		}
+	}
+
+	void BuildTargets(const vector<UnifiedVectorFormat> &formats, idx_t row,
+	                  vector<LerobotDecodeTarget> &targets) const {
+		int64_t request_id = 0;
+		idx_t request_ordinal = 0;
+		idx_t delta_ordinal = 0;
+		double delta_timestamp = 0;
+		int64_t delta_frame_offset = 0;
+		bool is_padding = false;
+		int64_t episode_index;
+		int64_t frame_index;
+		int64_t target_frame_index;
+		double frame_timestamp;
+		if (config.window_mode) {
+			for (idx_t column = 0; column < 9; column++) {
+				if (SourceValueIsNull(formats, row, column)) {
+					throw InvalidInputException("LeRobot video window request columns must not contain NULL");
+				}
+			}
+			if (SourceValueIsNull(formats, row, 10)) {
+				throw InvalidInputException("LeRobot video window match count must not be NULL");
+			}
+			const auto match_count = SourceValue<int64_t>(formats, row, 10);
+			if (match_count != 1 || SourceValueIsNull(formats, row, 9)) {
+				const auto missing_episode = SourceValue<int64_t>(formats, row, 6);
+				const auto missing_frame = SourceValue<int64_t>(formats, row, 8);
+				if (match_count == 0) {
+					throw InvalidInputException("LeRobot episode %d has no Parquet row for frame %d", missing_episode,
+					                            missing_frame);
+				}
+				throw InvalidInputException("LeRobot episode %d has %d Parquet rows for frame %d", missing_episode,
+				                            match_count, missing_frame);
+			}
+			request_id = SourceValue<int64_t>(formats, row, 0);
+			const auto request_ordinal_value = SourceValue<int64_t>(formats, row, 1);
+			const auto delta_ordinal_value = SourceValue<int64_t>(formats, row, 2);
+			if (request_ordinal_value < 0 || delta_ordinal_value < 0) {
+				throw InvalidInputException("Invalid LeRobot video window ordinals");
+			}
+			request_ordinal = static_cast<idx_t>(request_ordinal_value);
+			delta_ordinal = static_cast<idx_t>(delta_ordinal_value);
+			delta_timestamp = SourceValue<double>(formats, row, 3);
+			delta_frame_offset = SourceValue<int64_t>(formats, row, 4);
+			is_padding = SourceValue<bool>(formats, row, 5);
+			episode_index = SourceValue<int64_t>(formats, row, 6);
+			frame_index = SourceValue<int64_t>(formats, row, 7);
+			target_frame_index = SourceValue<int64_t>(formats, row, 8);
+			frame_timestamp = SourceValue<double>(formats, row, 9);
+		} else {
+			for (idx_t column = 0; column < 3; column++) {
+				if (SourceValueIsNull(formats, row, column)) {
+					throw InvalidInputException("LeRobot frame alignment columns must not contain NULL");
+				}
+			}
+			episode_index = SourceValue<int64_t>(formats, row, 0);
+			frame_index = SourceValue<int64_t>(formats, row, 1);
+			target_frame_index = frame_index;
+			frame_timestamp = SourceValue<double>(formats, row, 2);
+		}
+		if (episode_index < 0 || frame_index < 0 || target_frame_index < 0 || !std::isfinite(frame_timestamp) ||
+		    frame_timestamp < 0 || !std::isfinite(delta_timestamp)) {
+			throw InvalidInputException("Invalid LeRobot frame alignment metadata for episode %d, frame %d",
+			                            episode_index, target_frame_index);
+		}
+
+		auto route_entry = routes_by_episode.find(episode_index);
+		if (route_entry == routes_by_episode.end()) {
+			return;
+		}
+		for (const auto route_index : route_entry->second) {
+			const auto &route = config.routes[route_index];
+			const auto video_timestamp = route.from_timestamp + frame_timestamp;
+			if (!std::isfinite(video_timestamp) || video_timestamp < route.from_timestamp - config.tolerance ||
+			    video_timestamp > route.to_timestamp + config.tolerance) {
+				throw InvalidInputException("LeRobot episode %d frame %d timestamp %.6f falls outside video route "
+				                            "[%.6f, %.6f] for key '%s'",
+				                            episode_index, target_frame_index, video_timestamp, route.from_timestamp,
+				                            route.to_timestamp, config.metadata->GetVideoKey(route));
+			}
+			if (config.window_mode) {
+				targets.push_back(LerobotDecodeTarget(
+				    request_id, request_ordinal, delta_ordinal, delta_timestamp, delta_frame_offset, is_padding,
+				    episode_index, frame_index, target_frame_index, frame_timestamp, video_timestamp, route_index));
+			} else {
+				targets.push_back(
+				    LerobotDecodeTarget(episode_index, frame_index, frame_timestamp, video_timestamp, route_index));
+			}
+		}
+	}
+
+	LerobotTargetQueueResult QueueTargets(const vector<LerobotDecodeTarget> &targets, idx_t &target_position,
+	                                      const shared_ptr<Task> &producer_task) {
+		unique_lock<mutex> guard(lock);
+		if (stop_requested.load(std::memory_order_relaxed)) {
+			return LerobotTargetQueueResult::STOPPED;
+		}
+		while (target_position < targets.size() && pending_target_count < config.max_pending_targets) {
+			QueueTarget(targets[target_position++]);
+		}
+		UpdateQueueHighWatermark();
+		if (target_position == targets.size()) {
+			guard.unlock();
+			state_changed.notify_all();
+			return LerobotTargetQueueResult::QUEUED;
+		}
+
+		// A partial buffer still counts against the bound. Publish one before
+		// sleeping so a consumer can always create capacity.
+		FlushOldestPartialBuffer();
+		blocked_producers.push_back(producer_task);
+		metrics.producer_waits.fetch_add(1, std::memory_order_relaxed);
+		guard.unlock();
+		state_changed.notify_all();
+		return LerobotTargetQueueResult::BLOCKED;
+	}
+
+	void ProducerFinished() {
+		lock_guard<mutex> guard(lock);
+		D_ASSERT(active_producers > 0);
+		active_producers--;
+		if (active_producers == 0) {
+			FlushAllPartialBuffers();
+			source_exhausted = true;
+		}
+		state_changed.notify_all();
+	}
+
+	void Fail(std::exception_ptr exception) {
+		vector<shared_ptr<Connection>> connections;
+		vector<shared_ptr<Task>> producers_to_wake;
+		{
+			lock_guard<mutex> guard(lock);
+			if (!error) {
+				error = std::move(exception);
+			}
+			stop_requested.store(true, std::memory_order_release);
+			GetLiveConnections(connections);
+			TakeBlockedProducers(producers_to_wake);
+		}
+		state_changed.notify_all();
+		InterruptConnections(connections);
+		RescheduleProducers(producers_to_wake);
+	}
+
+	void RequestStop() {
+		vector<shared_ptr<Connection>> connections;
+		vector<shared_ptr<Task>> producers_to_wake;
+		{
+			lock_guard<mutex> guard(lock);
+			stop_requested.store(true, std::memory_order_release);
+			GetLiveConnections(connections);
+			TakeBlockedProducers(producers_to_wake);
+		}
+		state_changed.notify_all();
+		InterruptConnections(connections);
+		RescheduleProducers(producers_to_wake);
+	}
+
+	LerobotBufferClaimResult ClaimBuffer(unique_ptr<LerobotDecodeBuffer> &result) {
+		vector<shared_ptr<Task>> producers_to_wake;
+		unique_lock<mutex> guard(lock);
+		if (error) {
+			auto source_error = error;
+			guard.unlock();
+			std::rethrow_exception(source_error);
+		}
+		if (TryClaimReady(result)) {
+			TakeBlockedProducers(producers_to_wake);
+			guard.unlock();
+			RescheduleProducers(producers_to_wake);
+			return LerobotBufferClaimResult::CLAIMED;
+		}
+		if (source_exhausted || stop_requested.load(std::memory_order_relaxed)) {
+			return LerobotBufferClaimResult::FINISHED;
+		}
+		return LerobotBufferClaimResult::BLOCKED;
+	}
+
+	void FinishBuffer(idx_t shard_index) {
+		lock_guard<mutex> guard(lock);
+		auto erased = busy_shards.erase(shard_index);
+		D_ASSERT(erased == 1);
+		state_changed.notify_all();
+	}
+
+	void WaitForConsumer(const weak_ptr<ClientContext> &context) {
+		RecordConsumerWait();
+		while (true) {
+			{
+				lock_guard<mutex> guard(lock);
+				if (ConsumerCanProgress()) {
+					return;
+				}
+			}
+
+			auto client = context.lock();
+			if (!client) {
+				RequestStop();
+				return;
+			}
+			if (client->IsInterrupted()) {
+				RequestStop();
+				return;
+			}
+
+			// AsyncTask::Execute runs on the same scheduler as the producers.
+			// Help one queued task before sleeping so an async waiter cannot
+			// starve a yielded producer when DuckDB has only one worker.
+			TaskScheduler::GetScheduler(*client).ExecuteTasks(1);
+
+			unique_lock<mutex> guard(lock);
+			if (!ConsumerCanProgress()) {
+				state_changed.wait_for(guard, std::chrono::milliseconds(10));
+			}
+		}
+	}
+
+	void RecordConsumerWait() {
+		metrics.consumer_waits.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	bool CanConsumerProgress() {
+		lock_guard<mutex> guard(lock);
+		return ConsumerCanProgress();
+	}
+
+	LerobotVideoDecodeMetrics &GetMetrics() {
+		return metrics;
+	}
+
+private:
+	static bool SourceValueIsNull(const vector<UnifiedVectorFormat> &formats, idx_t row, idx_t column) {
+		const auto &format = formats[column];
+		const auto source_index = format.sel->get_index(row);
+		return !format.validity.RowIsValid(source_index);
+	}
+
+	template <class T>
+	static T SourceValue(const vector<UnifiedVectorFormat> &formats, idx_t row, idx_t column) {
+		const auto &format = formats[column];
+		const auto source_index = format.sel->get_index(row);
+		return format.GetData<T>()[source_index];
+	}
+
+	void QueueTarget(const LerobotDecodeTarget &target) {
+		const auto &route = config.routes[target.route_index];
+		auto &partial = partial_buffers[route.video_file_index];
+		partial.targets.push_back(target);
+		TouchPartialBuffer(route.video_file_index);
+		pending_target_count++;
+		metrics.targets.fetch_add(1, std::memory_order_relaxed);
+		if (partial.targets.size() >= config.target_buffer_size) {
+			FlushPartialBuffer(route.video_file_index);
+		}
+	}
+
+	void UpdateQueueHighWatermark() {
+		auto high_watermark = metrics.queue_high_watermark.load(std::memory_order_relaxed);
+		while (high_watermark < pending_target_count &&
+		       !metrics.queue_high_watermark.compare_exchange_weak(high_watermark, pending_target_count,
+		                                                           std::memory_order_relaxed)) {
+		}
+	}
+
+	bool TryClaimReady(unique_ptr<LerobotDecodeBuffer> &result) {
+		for (auto entry = ready_buffers.begin(); entry != ready_buffers.end(); ++entry) {
+			const auto shard_index = (*entry)->shard_index;
+			if (busy_shards.find(shard_index) != busy_shards.end()) {
+				continue;
+			}
+			result = std::move(*entry);
+			ready_buffers.erase(entry);
+			busy_shards.insert(shard_index);
+			D_ASSERT(pending_target_count >= result->targets.size());
+			pending_target_count -= result->targets.size();
+			return true;
+		}
+		return false;
+	}
+
+	bool ConsumerCanProgress() const {
+		if (error || source_exhausted || stop_requested.load(std::memory_order_relaxed)) {
+			return true;
+		}
+		for (const auto &buffer : ready_buffers) {
+			if (busy_shards.find(buffer->shard_index) == busy_shards.end()) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void TakeBlockedProducers(vector<shared_ptr<Task>> &result) {
+		for (auto &producer : blocked_producers) {
+			auto task = producer.lock();
+			if (task) {
+				result.push_back(std::move(task));
+			}
+		}
+		blocked_producers.clear();
+	}
+
+	static void RescheduleProducers(vector<shared_ptr<Task>> &producers) {
+		for (auto &producer : producers) {
+			producer->Reschedule();
+		}
+	}
+
+	void GetLiveConnections(vector<shared_ptr<Connection>> &result) {
+		for (auto &connection : producer_connections) {
+			auto live_connection = connection.lock();
+			if (live_connection) {
+				result.push_back(std::move(live_connection));
+			}
+		}
+	}
+
+	static void InterruptConnections(vector<shared_ptr<Connection>> &connections) {
+		for (auto &connection : connections) {
+			connection->Interrupt();
+		}
+	}
+
+	void TouchPartialBuffer(idx_t shard_index) {
+		auto entry = partial_lru_entries.find(shard_index);
+		if (entry != partial_lru_entries.end()) {
+			partial_lru.erase(entry->second);
+		}
+		partial_lru.push_front(shard_index);
+		partial_lru_entries[shard_index] = partial_lru.begin();
+	}
+
+	void FlushPartialBuffer(idx_t shard_index) {
+		auto entry = partial_buffers.find(shard_index);
+		if (entry == partial_buffers.end() || entry->second.targets.empty()) {
+			return;
+		}
+		auto buffer = make_uniq<LerobotDecodeBuffer>(shard_index, config.metadata->GetFPS());
+		buffer->targets = std::move(entry->second.targets);
+		partial_buffers.erase(entry);
+		auto lru_entry = partial_lru_entries.find(shard_index);
+		D_ASSERT(lru_entry != partial_lru_entries.end());
+		partial_lru.erase(lru_entry->second);
+		partial_lru_entries.erase(lru_entry);
+		FinalizeDecodeBuffer(*buffer, config.cluster_gap);
+		ready_buffers.push_back(std::move(buffer));
+	}
+
+	bool FlushOldestPartialBuffer() {
+		if (partial_buffers.empty()) {
+			return false;
+		}
+		D_ASSERT(!partial_lru.empty());
+		const auto shard_index = partial_lru.back();
+		FlushPartialBuffer(shard_index);
+		return true;
+	}
+
+	void FlushAllPartialBuffers() {
+		while (!partial_buffers.empty()) {
+			FlushPartialBuffer(partial_buffers.begin()->first);
+		}
+	}
+
+private:
+	LerobotVideoProducerConfig config;
+	unordered_map<int64_t, vector<idx_t>> routes_by_episode;
+	mutex lock;
+	std::condition_variable state_changed;
+	idx_t active_producers;
+	bool source_exhausted;
+	std::atomic<bool> stop_requested;
+	std::exception_ptr error;
+	unordered_map<idx_t, LerobotPartialBuffer> partial_buffers;
+	list<idx_t> partial_lru;
+	unordered_map<idx_t, list<idx_t>::iterator> partial_lru_entries;
+	deque<unique_ptr<LerobotDecodeBuffer>> ready_buffers;
+	unordered_set<idx_t> busy_shards;
+	vector<weak_ptr<Task>> blocked_producers;
+	vector<weak_ptr<Connection>> producer_connections;
+	idx_t pending_target_count;
+	LerobotVideoDecodeMetrics metrics;
+};
+
+class LerobotVideoProducerTask final : public ExecutorTask {
+public:
+	LerobotVideoProducerTask(Executor &executor, shared_ptr<LerobotVideoProducerState> state_p,
+	                         shared_ptr<DatabaseInstance> database_p, idx_t producer_index, idx_t producer_count)
+	    : ExecutorTask(executor, nullptr), state(std::move(state_p)), database(std::move(database_p)), current_row(0),
+	      pending_target_position(0), next_query(producer_index), query_stride(producer_count), finished(false) {
+	}
+
+	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
+		try {
+			idx_t rows_processed = 0;
+			while (true) {
+				if (executor.context.IsInterrupted() || state->ShouldStop()) {
+					state->RequestStop();
+					Finish();
+					return TaskExecutionResult::TASK_FINISHED;
+				}
+
+				if (pending_target_position < pending_targets.size()) {
+					auto queue_result =
+					    state->QueueTargets(pending_targets, pending_target_position, shared_from_this());
+					if (queue_result == LerobotTargetQueueResult::BLOCKED) {
+						return TaskExecutionResult::TASK_BLOCKED;
+					}
+					if (queue_result == LerobotTargetQueueResult::STOPPED) {
+						Finish();
+						return TaskExecutionResult::TASK_FINISHED;
+					}
+					pending_targets.clear();
+					pending_target_position = 0;
+					if (mode == TaskExecutionMode::PROCESS_PARTIAL &&
+					    rows_processed >= LEROBOT_PRODUCER_ROWS_PER_TASK) {
+						return TaskExecutionResult::TASK_NOT_FINISHED;
+					}
+				}
+
+				if (!frame_result) {
+					string query;
+					if (!state->GetQuery(next_query, query)) {
+						Finish();
+						return TaskExecutionResult::TASK_FINISHED;
+					}
+					next_query += query_stride;
+					if (!frame_connection) {
+						frame_connection = make_shared_ptr<Connection>(*database);
+						state->RegisterConnection(frame_connection);
+					}
+					frame_result = frame_connection->SendQuery(query);
+					if (frame_result->HasError()) {
+						throw InvalidInputException("Failed to read LeRobot frame timestamps: %s",
+						                            frame_result->GetError());
+					}
+				}
+
+				if (!current_chunk || current_row >= current_chunk->size()) {
+					current_chunk = frame_result->Fetch();
+					current_row = 0;
+					if (!current_chunk) {
+						if (frame_result->HasError()) {
+							throw InvalidInputException("Failed to read LeRobot frame timestamps: %s",
+							                            frame_result->GetError());
+						}
+						frame_result.reset();
+						current_formats.clear();
+						continue;
+					}
+					state->SourceChunkRead();
+					current_formats.clear();
+					current_formats.reserve(current_chunk->ColumnCount());
+					for (idx_t column = 0; column < current_chunk->ColumnCount(); column++) {
+						current_formats.push_back(UnifiedVectorFormat());
+						PrepareUnifiedFormat(current_chunk->data[column], current_chunk->size(),
+						                     current_formats.back());
+					}
+				}
+
+				pending_targets.clear();
+				pending_target_position = 0;
+				state->BuildTargets(current_formats, current_row++, pending_targets);
+				rows_processed++;
+				if (pending_targets.empty() && mode == TaskExecutionMode::PROCESS_PARTIAL &&
+				    rows_processed >= LEROBOT_PRODUCER_ROWS_PER_TASK) {
+					return TaskExecutionResult::TASK_NOT_FINISHED;
+				}
+			}
+		} catch (...) {
+			state->Fail(std::current_exception());
+			Finish();
+			return TaskExecutionResult::TASK_FINISHED;
+		}
+	}
+
+	string TaskType() const override {
+		return "LerobotVideoProducerTask";
+	}
+
+private:
+	void Finish() {
+		if (finished) {
+			return;
+		}
+		finished = true;
+		state->ProducerFinished();
+	}
+
+private:
+	shared_ptr<LerobotVideoProducerState> state;
+	shared_ptr<DatabaseInstance> database;
+	shared_ptr<Connection> frame_connection;
+	unique_ptr<QueryResult> frame_result;
+	unique_ptr<DataChunk> current_chunk;
+	vector<UnifiedVectorFormat> current_formats;
+	idx_t current_row;
+	vector<LerobotDecodeTarget> pending_targets;
+	idx_t pending_target_position;
+	idx_t next_query;
+	idx_t query_stride;
+	bool finished;
+};
+
+class LerobotVideoConsumerWaitTask final : public AsyncTask {
+public:
+	LerobotVideoConsumerWaitTask(shared_ptr<LerobotVideoProducerState> state_p, weak_ptr<ClientContext> context_p)
+	    : state(std::move(state_p)), context(std::move(context_p)) {
+	}
+
+	void Execute() override {
+		state->WaitForConsumer(context);
+	}
+
+private:
+	shared_ptr<LerobotVideoProducerState> state;
+	weak_ptr<ClientContext> context;
+};
+
 struct LerobotVideoFramesGlobalState final : public GlobalTableFunctionState {
 	LerobotVideoFramesGlobalState(ClientContext &context, const LerobotVideoFramesBindData &bind_data_p,
 	                              const vector<column_t> &column_ids)
-	    : bind_data(bind_data_p), source_exhausted(bind_data.frame_query.empty()), producer_active(false),
-	      current_row(0), pending_target_count(0), max_threads(1), needs_decode(false), needs_pixels(false) {
+	    : bind_data(bind_data_p), producer_state(make_shared_ptr<LerobotVideoProducerState>(bind_data)), max_threads(1),
+	      needs_decode(false), needs_pixels(false) {
 		const auto output_column_count = bind_data.window_mode ? static_cast<idx_t>(LEROBOT_WINDOW_COLUMN_COUNT)
 		                                                       : static_cast<idx_t>(LEROBOT_FRAME_COLUMN_COUNT);
 		for (const auto column_id : column_ids) {
@@ -2060,9 +2714,7 @@ struct LerobotVideoFramesGlobalState final : public GlobalTableFunctionState {
 		                (IsProjected(width_column) || IsProjected(height_column)));
 
 		unordered_set<idx_t> shards;
-		for (idx_t route_index = 0; route_index < bind_data.routes.size(); route_index++) {
-			const auto &route = bind_data.routes[route_index];
-			routes_by_episode[route.episode_index].push_back(route_index);
+		for (const auto &route : bind_data.routes) {
 			shards.insert(route.video_file_index);
 		}
 		if (!shards.empty()) {
@@ -2071,18 +2723,16 @@ struct LerobotVideoFramesGlobalState final : public GlobalTableFunctionState {
 			max_threads = std::min<idx_t>(max_threads, shards.size());
 		}
 
-		if (!source_exhausted) {
-			frame_connection = make_uniq<Connection>(*context.db);
-			frame_result = frame_connection->SendQuery(bind_data.frame_query);
-			if (frame_result->HasError()) {
-				throw InvalidInputException("Failed to read LeRobot frame timestamps: %s", frame_result->GetError());
-			}
-		}
 #ifdef LEROBOT_HAVE_FFMPEG
 		if (needs_decode) {
-			decoder_cache = make_uniq<LerobotDecoderCache>(bind_data.max_cached_decoders, metrics);
+			decoder_cache = make_uniq<LerobotDecoderCache>(bind_data.max_cached_decoders, GetMetrics());
 		}
 #endif
+		StartProducers(context);
+	}
+
+	~LerobotVideoFramesGlobalState() override {
+		producer_state->RequestStop();
 	}
 
 	idx_t MaxThreads() const override {
@@ -2098,62 +2748,34 @@ struct LerobotVideoFramesGlobalState final : public GlobalTableFunctionState {
 	}
 
 	LerobotVideoDecodeMetrics &GetMetrics() {
-		return metrics;
+		return producer_state->GetMetrics();
 	}
 
-	bool ClaimBuffer(unique_ptr<LerobotDecodeBuffer> &result) {
-		unique_lock<mutex> guard(lock);
-		while (true) {
-			if (TryClaimReady(result)) {
-				return true;
-			}
-			if (source_exhausted) {
-				if (!partial_buffers.empty()) {
-					FlushAllPartialBuffers();
-					continue;
-				}
-				return false;
-			}
-			if (pending_target_count >= bind_data.max_pending_targets) {
-				if (FlushOldestPartialBuffer()) {
-					continue;
-				}
-				state_changed.wait(guard);
-				continue;
-			}
-			if (producer_active) {
-				state_changed.wait(guard);
-				continue;
-			}
+	LerobotBufferClaimResult ClaimBuffer(unique_ptr<LerobotDecodeBuffer> &result) {
+		return producer_state->ClaimBuffer(result);
+	}
 
-			producer_active = true;
-			guard.unlock();
-			vector<LerobotDecodeTarget> targets;
-			bool have_source_row;
-			try {
-				have_source_row = ReadSourceTargets(targets);
-			} catch (...) {
-				guard.lock();
-				producer_active = false;
-				state_changed.notify_all();
-				throw;
+	void WaitForBuffer(ClientContext &context) {
+		producer_state->RecordConsumerWait();
+		auto &scheduler = TaskScheduler::GetScheduler(context);
+		while (!producer_state->CanConsumerProgress()) {
+			if (context.IsInterrupted()) {
+				producer_state->RequestStop();
+				throw InterruptException();
 			}
-			guard.lock();
-			producer_active = false;
-			if (have_source_row) {
-				QueueTargets(targets);
-			} else {
-				source_exhausted = true;
-			}
-			state_changed.notify_all();
+			// Synchronous table scans cannot surface BLOCKED. With one DuckDB
+			// thread, actively execute a queued producer instead of waiting for a
+			// background worker that does not exist.
+			scheduler.ExecuteTasks(1);
 		}
 	}
 
+	unique_ptr<AsyncTask> CreateWaitTask(ClientContext &context) {
+		return make_uniq<LerobotVideoConsumerWaitTask>(producer_state, context.shared_from_this());
+	}
+
 	void FinishBuffer(idx_t shard_index) {
-		lock_guard<mutex> guard(lock);
-		auto erased = busy_shards.erase(shard_index);
-		D_ASSERT(erased == 1);
-		state_changed.notify_all();
+		producer_state->FinishBuffer(shard_index);
 	}
 
 #ifdef LEROBOT_HAVE_FFMPEG
@@ -2182,221 +2804,28 @@ private:
 		return std::find(projected_columns.begin(), projected_columns.end(), logical_column) != projected_columns.end();
 	}
 
-	bool TryClaimReady(unique_ptr<LerobotDecodeBuffer> &result) {
-		for (auto entry = ready_buffers.begin(); entry != ready_buffers.end(); ++entry) {
-			const auto shard_index = (*entry)->shard_index;
-			if (busy_shards.find(shard_index) != busy_shards.end()) {
-				continue;
-			}
-			result = std::move(*entry);
-			ready_buffers.erase(entry);
-			busy_shards.insert(shard_index);
-			D_ASSERT(pending_target_count >= result->targets.size());
-			pending_target_count -= result->targets.size();
-			return true;
-		}
-		return false;
-	}
-
-	bool ReadSourceTargets(vector<LerobotDecodeTarget> &targets) {
-		while (!current_chunk || current_row >= current_chunk->size()) {
-			current_chunk = frame_result->Fetch();
-			current_row = 0;
-			if (!current_chunk) {
-				if (frame_result->HasError()) {
-					throw InvalidInputException("Failed to read LeRobot frame timestamps: %s",
-					                            frame_result->GetError());
-				}
-				return false;
-			}
-			current_formats.clear();
-			current_formats.reserve(current_chunk->ColumnCount());
-			for (idx_t column = 0; column < current_chunk->ColumnCount(); column++) {
-				current_formats.push_back(UnifiedVectorFormat());
-				PrepareUnifiedFormat(current_chunk->data[column], current_chunk->size(), current_formats.back());
-			}
-		}
-
-		int64_t request_id = 0;
-		idx_t request_ordinal = 0;
-		idx_t delta_ordinal = 0;
-		double delta_timestamp = 0;
-		int64_t delta_frame_offset = 0;
-		bool is_padding = false;
-		int64_t episode_index;
-		int64_t frame_index;
-		int64_t target_frame_index;
-		double frame_timestamp;
-		if (bind_data.window_mode) {
-			for (idx_t column = 0; column < 9; column++) {
-				if (SourceValueIsNull(column)) {
-					throw InvalidInputException("LeRobot video window request columns must not contain NULL");
-				}
-			}
-			if (SourceValueIsNull(10)) {
-				throw InvalidInputException("LeRobot video window match count must not be NULL");
-			}
-			const auto match_count = SourceValue<int64_t>(10);
-			if (match_count != 1 || SourceValueIsNull(9)) {
-				const auto missing_episode = SourceValue<int64_t>(6);
-				const auto missing_frame = SourceValue<int64_t>(8);
-				if (match_count == 0) {
-					throw InvalidInputException("LeRobot episode %d has no Parquet row for frame %d", missing_episode,
-					                            missing_frame);
-				}
-				throw InvalidInputException("LeRobot episode %d has %d Parquet rows for frame %d", missing_episode,
-				                            match_count, missing_frame);
-			}
-			request_id = SourceValue<int64_t>(0);
-			const auto request_ordinal_value = SourceValue<int64_t>(1);
-			const auto delta_ordinal_value = SourceValue<int64_t>(2);
-			if (request_ordinal_value < 0 || delta_ordinal_value < 0) {
-				throw InvalidInputException("Invalid LeRobot video window ordinals");
-			}
-			request_ordinal = static_cast<idx_t>(request_ordinal_value);
-			delta_ordinal = static_cast<idx_t>(delta_ordinal_value);
-			delta_timestamp = SourceValue<double>(3);
-			delta_frame_offset = SourceValue<int64_t>(4);
-			is_padding = SourceValue<bool>(5);
-			episode_index = SourceValue<int64_t>(6);
-			frame_index = SourceValue<int64_t>(7);
-			target_frame_index = SourceValue<int64_t>(8);
-			frame_timestamp = SourceValue<double>(9);
-		} else {
-			for (idx_t column = 0; column < 3; column++) {
-				if (SourceValueIsNull(column)) {
-					throw InvalidInputException("LeRobot frame alignment columns must not contain NULL");
-				}
-			}
-			episode_index = SourceValue<int64_t>(0);
-			frame_index = SourceValue<int64_t>(1);
-			target_frame_index = frame_index;
-			frame_timestamp = SourceValue<double>(2);
-		}
-		current_row++;
-		if (episode_index < 0 || frame_index < 0 || target_frame_index < 0 || !std::isfinite(frame_timestamp) ||
-		    frame_timestamp < 0 || !std::isfinite(delta_timestamp)) {
-			throw InvalidInputException("Invalid LeRobot frame alignment metadata for episode %d, frame %d",
-			                            episode_index, target_frame_index);
-		}
-
-		auto route_entry = routes_by_episode.find(episode_index);
-		if (route_entry == routes_by_episode.end()) {
-			return true;
-		}
-		for (const auto route_index : route_entry->second) {
-			const auto &route = bind_data.routes[route_index];
-			const auto video_timestamp = route.from_timestamp + frame_timestamp;
-			if (!std::isfinite(video_timestamp) || video_timestamp < route.from_timestamp - bind_data.tolerance ||
-			    video_timestamp > route.to_timestamp + bind_data.tolerance) {
-				throw InvalidInputException("LeRobot episode %d frame %d timestamp %.6f falls outside video route "
-				                            "[%.6f, %.6f] for key '%s'",
-				                            episode_index, target_frame_index, video_timestamp, route.from_timestamp,
-				                            route.to_timestamp, bind_data.metadata->GetVideoKey(route));
-			}
-			if (bind_data.window_mode) {
-				targets.push_back(LerobotDecodeTarget(
-				    request_id, request_ordinal, delta_ordinal, delta_timestamp, delta_frame_offset, is_padding,
-				    episode_index, frame_index, target_frame_index, frame_timestamp, video_timestamp, route_index));
-			} else {
-				targets.push_back(
-				    LerobotDecodeTarget(episode_index, frame_index, frame_timestamp, video_timestamp, route_index));
-			}
-		}
-		return true;
-	}
-
-	bool SourceValueIsNull(idx_t column) const {
-		const auto &format = current_formats[column];
-		const auto source_index = format.sel->get_index(current_row);
-		return !format.validity.RowIsValid(source_index);
-	}
-
-	template <class T>
-	T SourceValue(idx_t column) const {
-		const auto &format = current_formats[column];
-		const auto source_index = format.sel->get_index(current_row);
-		return format.GetData<T>()[source_index];
-	}
-
-	void QueueTargets(const vector<LerobotDecodeTarget> &targets) {
-		metrics.targets.fetch_add(static_cast<uint64_t>(targets.size()), std::memory_order_relaxed);
-		for (const auto &target : targets) {
-			const auto &route = bind_data.routes[target.route_index];
-			auto &partial = partial_buffers[route.video_file_index];
-			partial.targets.push_back(target);
-			TouchPartialBuffer(route.video_file_index);
-			pending_target_count++;
-			if (partial.targets.size() >= bind_data.target_buffer_size) {
-				FlushPartialBuffer(route.video_file_index);
-			}
-		}
-	}
-
-	void TouchPartialBuffer(idx_t shard_index) {
-		auto entry = partial_lru_entries.find(shard_index);
-		if (entry != partial_lru_entries.end()) {
-			partial_lru.erase(entry->second);
-		}
-		partial_lru.push_front(shard_index);
-		partial_lru_entries[shard_index] = partial_lru.begin();
-	}
-
-	void FlushPartialBuffer(idx_t shard_index) {
-		auto entry = partial_buffers.find(shard_index);
-		if (entry == partial_buffers.end() || entry->second.targets.empty()) {
+	void StartProducers(ClientContext &context) {
+		const auto producer_count = producer_state->ProducerCount();
+		if (producer_count == 0) {
 			return;
 		}
-		auto buffer = make_uniq<LerobotDecodeBuffer>(shard_index, bind_data.metadata->GetFPS());
-		buffer->targets = std::move(entry->second.targets);
-		partial_buffers.erase(entry);
-		auto lru_entry = partial_lru_entries.find(shard_index);
-		D_ASSERT(lru_entry != partial_lru_entries.end());
-		partial_lru.erase(lru_entry->second);
-		partial_lru_entries.erase(lru_entry);
-		FinalizeDecodeBuffer(*buffer, bind_data.cluster_gap);
-		ready_buffers.push_back(std::move(buffer));
-	}
-
-	bool FlushOldestPartialBuffer() {
-		if (partial_buffers.empty()) {
-			return false;
+		auto &executor = Executor::Get(context);
+		vector<shared_ptr<Task>> tasks;
+		tasks.reserve(producer_count);
+		for (idx_t producer_index = 0; producer_index < producer_count; producer_index++) {
+			tasks.push_back(make_shared_ptr<LerobotVideoProducerTask>(executor, producer_state, context.db,
+			                                                          producer_index, producer_count));
 		}
-		D_ASSERT(!partial_lru.empty());
-		const auto shard_index = partial_lru.back();
-		FlushPartialBuffer(shard_index);
-		return true;
-	}
-
-	void FlushAllPartialBuffers() {
-		while (!partial_buffers.empty()) {
-			FlushPartialBuffer(partial_buffers.begin()->first);
-		}
+		TaskScheduler::GetScheduler(context).ScheduleTasks(executor.GetToken(), tasks);
 	}
 
 private:
 	const LerobotVideoFramesBindData &bind_data;
-	mutex lock;
-	std::condition_variable state_changed;
-	unique_ptr<Connection> frame_connection;
-	unique_ptr<QueryResult> frame_result;
-	bool source_exhausted;
-	bool producer_active;
-	unique_ptr<DataChunk> current_chunk;
-	vector<UnifiedVectorFormat> current_formats;
-	idx_t current_row;
-	unordered_map<int64_t, vector<idx_t>> routes_by_episode;
-	unordered_map<idx_t, LerobotPartialBuffer> partial_buffers;
-	list<idx_t> partial_lru;
-	unordered_map<idx_t, list<idx_t>::iterator> partial_lru_entries;
-	deque<unique_ptr<LerobotDecodeBuffer>> ready_buffers;
-	unordered_set<idx_t> busy_shards;
-	idx_t pending_target_count;
+	shared_ptr<LerobotVideoProducerState> producer_state;
 	idx_t max_threads;
 	vector<idx_t> projected_columns;
 	bool needs_decode;
 	bool needs_pixels;
-	LerobotVideoDecodeMetrics metrics;
 #ifdef LEROBOT_HAVE_FFMPEG
 	unique_ptr<LerobotDecoderCache> decoder_cache;
 #endif
@@ -2781,17 +3210,25 @@ void WriteVideoTarget(const LerobotVideoFramesBindData &bind_data, const Lerobot
 	}
 }
 
-bool ProduceLerobotVideoFrames(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+enum class LerobotVideoProduceResult : uint8_t { HAVE_OUTPUT, BLOCKED, FINISHED };
+
+LerobotVideoProduceResult ProduceLerobotVideoFrames(ClientContext &context, TableFunctionInput &input,
+                                                    DataChunk &output) {
 	auto &bind_data = input.bind_data->Cast<LerobotVideoFramesBindData>();
 	auto &global_state = input.global_state->Cast<LerobotVideoFramesGlobalState>();
 	auto &local_state = input.local_state->Cast<LerobotVideoFramesLocalState>();
 	idx_t count = 0;
 	idx_t output_bytes = 0;
+	auto produce_result = LerobotVideoProduceResult::HAVE_OUTPUT;
 	const auto &projected_columns = global_state.GetProjectedColumns();
 
 	while (count < bind_data.output_batch_size) {
 		if (!local_state.buffer) {
-			if (!global_state.ClaimBuffer(local_state.buffer)) {
+			const auto claim_result = global_state.ClaimBuffer(local_state.buffer);
+			if (claim_result != LerobotBufferClaimResult::CLAIMED) {
+				produce_result = claim_result == LerobotBufferClaimResult::BLOCKED
+				                     ? LerobotVideoProduceResult::BLOCKED
+				                     : LerobotVideoProduceResult::FINISHED;
 				break;
 			}
 			local_state.target_position = 0;
@@ -2867,15 +3304,32 @@ bool ProduceLerobotVideoFrames(ClientContext &context, TableFunctionInput &input
 	}
 	local_state.rows_scanned += count;
 	SetOutputCardinality(output, count);
-	return count == 0;
+	return count > 0 ? LerobotVideoProduceResult::HAVE_OUTPUT : produce_result;
 }
 
 void LerobotVideoFramesFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &global_state = input.global_state->Cast<LerobotVideoFramesGlobalState>();
 	auto &local_state = input.local_state->Cast<LerobotVideoFramesLocalState>();
 	while (true) {
-		const auto exhausted = ProduceLerobotVideoFrames(context, input, output);
+		const auto result = ProduceLerobotVideoFrames(context, input, output);
 		local_state.ApplyFilters(output);
-		if (output.size() > 0 || exhausted) {
+		if (output.size() > 0) {
+			input.async_result = SourceResultType::HAVE_MORE_OUTPUT;
+			return;
+		}
+		if (result == LerobotVideoProduceResult::FINISHED) {
+			input.async_result = SourceResultType::FINISHED;
+			return;
+		}
+		if (result == LerobotVideoProduceResult::BLOCKED) {
+			if (input.results_execution_mode == AsyncResultsExecutionMode::SYNCHRONOUS) {
+				global_state.WaitForBuffer(context);
+				output.Reset();
+				continue;
+			}
+			vector<unique_ptr<AsyncTask>> wait_tasks;
+			wait_tasks.push_back(global_state.CreateWaitTask(context));
+			input.async_result = AsyncResult(std::move(wait_tasks));
 			return;
 		}
 		output.Reset();
@@ -3002,11 +3456,22 @@ void AddLerobotVideoMetrics(InsertionOrderPreservingMap<string> &result, const L
 	result["LeRobot Depth Fan-out Hits"] = std::to_string(metrics.depth_fanout_hits.load());
 }
 
+void AddLerobotVideoSourceMetrics(InsertionOrderPreservingMap<string> &result,
+                                  const LerobotVideoDecodeMetrics &metrics) {
+	result["LeRobot Source Queries"] = std::to_string(metrics.source_queries.load());
+	result["LeRobot Producer Tasks"] = std::to_string(metrics.producer_tasks.load());
+	result["LeRobot Source Chunks"] = std::to_string(metrics.source_chunks.load());
+	result["LeRobot Producer Waits"] = std::to_string(metrics.producer_waits.load());
+	result["LeRobot Consumer Waits"] = std::to_string(metrics.consumer_waits.load());
+	result["LeRobot Queue High Watermark"] = std::to_string(metrics.queue_high_watermark.load());
+	AddLerobotVideoMetrics(result, metrics);
+}
+
 InsertionOrderPreservingMap<string> LerobotVideoFramesDynamicToString(TableFunctionDynamicToStringInput &input) {
 	InsertionOrderPreservingMap<string> result;
 	if (input.global_state) {
 		auto &metrics = input.global_state->Cast<LerobotVideoFramesGlobalState>().GetMetrics();
-		AddLerobotVideoMetrics(result, metrics);
+		AddLerobotVideoSourceMetrics(result, metrics);
 	}
 	return result;
 }
@@ -3036,6 +3501,9 @@ void AddVideoDecodeNamedParameters(TableFunction &function, bool include_video_k
 	// worker limits became independently configurable.
 	function.named_parameters["max_open_shards"] = LogicalType::BIGINT;
 	function.named_parameters["decode_threads"] = LogicalType::BIGINT;
+	if (source_function) {
+		function.named_parameters["producer_threads"] = LogicalType::BIGINT;
+	}
 	function.named_parameters["max_pending_targets"] = LogicalType::BIGINT;
 	function.named_parameters["max_output_bytes"] = LogicalType::BIGINT;
 	function.named_parameters["codec_threads"] = LogicalType::BIGINT;

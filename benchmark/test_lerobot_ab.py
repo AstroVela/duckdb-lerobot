@@ -16,6 +16,7 @@ def benchmark_args() -> SimpleNamespace:
         max_cached_decoders=8,
         max_output_bytes=64 * 1024 * 1024,
         max_pending_targets=4096,
+        producer_threads=4,
         target_buffer_size=256,
         tolerance=1e-4,
         width=0,
@@ -51,6 +52,7 @@ class LeRobotBenchmarkTest(TestCase):
         validation = lerobot_ab.duckdb_decode_query(
             args, selected, hash_images=True, order_output=True
         )
+        source_profiles = lerobot_ab.source_profile_queries(args, selected)
 
         self.assertIn("VALUES (12, 45), (12, 46)", timed)
         self.assertIn("octet_length(image)", timed)
@@ -65,3 +67,5 @@ class LeRobotBenchmarkTest(TestCase):
             )
         )
         self.assertIn("'/tmp/a''dataset'", validation)
+        self.assertNotIn("producer_threads", timed)
+        self.assertIn("producer_threads := 4", source_profiles[0][1])
