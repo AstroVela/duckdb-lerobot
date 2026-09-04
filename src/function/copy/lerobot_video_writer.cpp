@@ -2,6 +2,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 
 #include <cmath>
@@ -65,10 +66,28 @@ struct AVFrameDeleter {
 	}
 };
 
+mutex &SVTAV1LifecycleLock() {
+	// Older SVT-AV1 releases mutate process-global initialization state from
+	// both open and close. Serialize those short lifecycle calls while leaving
+	// the substantially longer encode phase concurrent.
+	static mutex lifecycle_lock;
+	return lifecycle_lock;
+}
+
 struct AVCodecContextDeleter {
-	void operator()(AVCodecContext *context) const {
-		avcodec_free_context(&context);
+	explicit AVCodecContextDeleter(bool serialize_svt_p = false) : serialize_svt(serialize_svt_p) {
 	}
+
+	void operator()(AVCodecContext *context) const {
+		if (serialize_svt) {
+			lock_guard<mutex> guard(SVTAV1LifecycleLock());
+			avcodec_free_context(&context);
+		} else {
+			avcodec_free_context(&context);
+		}
+	}
+
+	bool serialize_svt;
 };
 
 struct SwsContextDeleter {
@@ -323,6 +342,12 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 #ifndef LEROBOT_HAVE_FFMPEG
 	throw MissingExtensionException("FORMAT lerobot video writing requires FFmpeg development libraries");
 #else
+	auto throw_if_cancelled = [&]() {
+		if (options.cancelled && options.cancelled->load()) {
+			throw InterruptException();
+		}
+	};
+	throw_if_cancelled();
 	if (frame_count == 0) {
 		throw InvalidInputException("Cannot encode an empty LeRobot video");
 	}
@@ -360,7 +385,7 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 	if (!stream) {
 		throw OutOfMemoryException("Failed to allocate a LeRobot MP4 stream");
 	}
-	CodecContextPtr codec_context(avcodec_alloc_context3(codec));
+	CodecContextPtr codec_context(avcodec_alloc_context3(codec), AVCodecContextDeleter(!is_depth));
 	if (!codec_context) {
 		throw OutOfMemoryException("Failed to allocate a LeRobot video encoder");
 	}
@@ -380,10 +405,13 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 	av_dict_set(&raw_codec_options, "g", "2", 0);
 	av_dict_set(&raw_codec_options, "crf", "30", 0);
 	if (is_depth) {
-		av_dict_set(&raw_codec_options, "x265-params", "lossless=1", 0);
+		string x265_parameters = "lossless=1";
 		if (options.encoder_threads.IsValid()) {
-			av_dict_set(&raw_codec_options, "threads", std::to_string(options.encoder_threads.GetIndex()).c_str(), 0);
+			const auto encoder_threads = options.encoder_threads.GetIndex();
+			x265_parameters += encoder_threads == 1 ? ":pools=none" : ":pools=" + std::to_string(encoder_threads - 1);
+			x265_parameters += ":frame-threads=1";
 		}
+		av_dict_set(&raw_codec_options, "x265-params", x265_parameters.c_str(), 0);
 	} else {
 		av_dict_set(&raw_codec_options, "preset", "12", 0);
 		string svt_parameters = "fast-decode=0";
@@ -400,7 +428,12 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 		}
 		AVDictionary *&dictionary;
 	} codec_options_guard(raw_codec_options);
-	ThrowOnFFmpegError(avcodec_open2(codec_context.get(), codec, &raw_codec_options), "open the encoder for", path);
+	if (is_depth) {
+		ThrowOnFFmpegError(avcodec_open2(codec_context.get(), codec, &raw_codec_options), "open the encoder for", path);
+	} else {
+		lock_guard<mutex> guard(SVTAV1LifecycleLock());
+		ThrowOnFFmpegError(avcodec_open2(codec_context.get(), codec, &raw_codec_options), "open the encoder for", path);
+	}
 	ThrowOnUnusedOptions(raw_codec_options, "codec", path);
 	ThrowOnFFmpegError(avcodec_parameters_from_context(stream->codecpar, codec_context.get()),
 	                   "copy encoder parameters for", path);
@@ -414,6 +447,7 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 	DictionaryGuard format_options_guard(raw_format_options);
 	ThrowOnFFmpegError(avformat_write_header(output.get(), &raw_format_options), "write the MP4 header for", path);
 	ThrowOnUnusedOptions(raw_format_options, "container", path);
+	throw_if_cancelled();
 
 	FramePtr target_frame(av_frame_alloc());
 	PacketPtr packet(av_packet_alloc());
@@ -437,6 +471,7 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 
 	string raw_frame(expected_size, '\0');
 	for (idx_t frame_index = 0; frame_index < frame_count; frame_index++) {
+		throw_if_cancelled();
 		raw_frames->Read(&raw_frame[0], expected_size, frame_index * expected_size);
 		ThrowOnFFmpegError(av_frame_make_writable(target_frame.get()), "make an encoder frame writable for", path);
 		if (is_depth) {
@@ -456,8 +491,10 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 		ThrowOnFFmpegError(avcodec_send_frame(codec_context.get(), target_frame.get()), "submit a frame for", path);
 		DrainEncoder(*codec_context, *output, *stream, *packet, path, is_depth && frame_count <= 2);
 	}
+	throw_if_cancelled();
 	ThrowOnFFmpegError(avcodec_send_frame(codec_context.get(), nullptr), "flush the encoder for", path);
 	DrainEncoder(*codec_context, *output, *stream, *packet, path, is_depth && frame_count <= 2);
+	throw_if_cancelled();
 	ThrowOnFFmpegError(av_write_trailer(output.get()), "write the MP4 trailer for", path);
 
 	LerobotEncodedVideoInfo result;

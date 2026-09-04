@@ -176,6 +176,15 @@ not populated until `lerobot_video_routes` or
 `lerobot_video_metadata_cache` is bound; that query projects only four columns
 per video key plus `episode_index` and episode `length`.
 
+Control-plane cache construction itself is synchronous at bind: it executes
+the `info.json` and projected `meta/episodes` reads through an internal DuckDB
+connection and publishes the immutable cache entry only after validation. The
+native JSON/Parquet scans may use DuckDB pipeline parallelism internally, but
+the LeRobot cache layer does not expose a `TryGetNextBatch` state machine. That
+incremental scheduler pattern is reserved for the much larger video source
+alignment phase below, whose producer tasks return `TASK_NOT_FINISHED` after a
+chunk and `TASK_BLOCKED` when their bounded queue is full.
+
 Native LeRobot does not create episode, task, data, statistics, or media files
 until its first episode is saved. `FORMAT lerobot` preserves that layout: a
 zero-row COPY publishes `meta/info.json` with zero totals, and the readers use
@@ -325,8 +334,16 @@ tree and leaves no readable partial dataset.
 Raw image and video frames are spooled per feature under that staging tree
 instead of being retained in an episode-sized vector. At an episode boundary,
 the writer closes the spools, computes visual statistics by positional reads of
-only the rounded-linspace sample, and encodes each camera sequentially with one
-raw frame buffer. Numeric statistics scan the episode's buffer-managed column
+only the rounded-linspace sample, and submits every video camera to a dedicated
+database-instance codec executor. The executor uses persistent extension-owned
+threads rather than DuckDB pipeline workers. A per-COPY `VIDEO_WORKERS` limit,
+a per-COPY `ENCODER_THREADS` codec budget, and a database-wide admission limit
+bound codec work to DuckDB's configured thread count. They do not reserve
+pipeline capacity, so unrelated queries may execute concurrently. The single
+COPY coordinator waits for the episode batch but does not perform codec CPU
+work during that wait. Completed jobs occupy feature-indexed result slots; the
+COPY thread registers them in feature order only after the episode batch
+finishes. Numeric statistics scan the episode's buffer-managed column
 collection twice per dimension batch: once for the NumPy reduction tree and
 once for the 5000-bin histograms. During the first reduction scan, signed and
 unsigned integer extrema are also collected as original-typed DuckDB values.
@@ -336,10 +353,12 @@ exact beyond `2^53`. Integer mean, standard deviation, and quantiles
 deliberately remain floating point. Features wider than 64 dimensions are
 processed in fixed batches, preserving the same value order while capping
 histogram and reduction scratch space.
-`MAX_VISUAL_FRAME_BYTES` (64 MiB by default) bounds each extension-owned raw
-frame allocation; raw-frame scratch memory is therefore independent of episode
-length and camera count, apart from DuckDB's input/output chunks and
-buffer-managed pages.
+`MAX_VISUAL_FRAME_BYTES` (64 MiB by default) bounds each active encoder's raw
+frame allocation. Encoding scratch is therefore bounded by
+`VIDEO_WORKERS * MAX_VISUAL_FRAME_BYTES` and independent of episode length,
+apart from DuckDB's input/output chunks and buffer-managed pages. Encoded
+episode fragments remain on staging disk until their shard rotates or COPY
+finalizes.
 
 LeRobot's control-plane rules remain extension-owned: canonical path
 templates, task indexing, episode routes, metadata chunk/file indices, and
@@ -355,8 +374,10 @@ RGB24. A depth feature is marked by `info.is_depth_map` and is either
 little-endian uint16 millimetres or float32 metres, inferred once and enforced
 for the whole dataset. RGB video uses LeRobot's AV1/yuv420p/GOP-2/CRF-30/
 preset-12 defaults. Depth uses the native 12-bit logarithmic quantizer followed
-by lossless HEVC gray12le. Per-episode MP4s are stream-copy concatenated, and
-their cumulative durations become the episode route boundaries.
+by lossless HEVC gray12le. Per-episode MP4s are accumulated and stream-copy
+concatenated once when their shard closes. Consequently each fragment is read
+once and each final shard is written once, while cumulative durations remain
+the episode route boundaries.
 
 The writer is deliberately strict and create-only. It does not infer legacy
 schemas, append to an existing root, overwrite output, change codecs when an

@@ -127,9 +127,10 @@ FROM read_text('{TEST_DIR}/lerobot_copy_video/meta/info.json');
 ----
 true	true	true
 
-# Each camera is spooled and encoded sequentially. The byte contract applies
-# to one raw frame, so multiple cameras and frames can exceed the configured
-# value cumulatively without retaining an episode-sized copy in memory.
+# Each camera is spooled independently. Two dedicated codec workers encode the
+# cameras concurrently under a two-thread total codec budget, and feature-order
+# result registration keeps metadata deterministic. The byte contract applies
+# to each active raw frame, not to the complete episode.
 statement ok
 COPY (
     SELECT 0::BIGINT AS episode_index, 'multi camera'::VARCHAR AS task,
@@ -144,7 +145,8 @@ COPY (
     FPS 10,
     FEATURES '{"observation.images.front":{"dtype":"video","shape":[64,64,3],"names":["height","width","channels"]},"observation.images.wrist":{"dtype":"video","shape":[64,64,3],"names":["height","width","channels"]}}',
     MAX_VISUAL_FRAME_BYTES 12288,
-    ENCODER_THREADS 1
+    VIDEO_WORKERS 2,
+    ENCODER_THREADS 2
 );
 
 query II

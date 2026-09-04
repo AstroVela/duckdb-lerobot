@@ -279,6 +279,7 @@ COPY (
   VIDEO_FILES_SIZE_IN_MB 200,
   METADATA_BUFFER_SIZE 10,
   MAX_VISUAL_FRAME_BYTES 67108864,
+  VIDEO_WORKERS 4,
   ENCODER_THREADS 4
 );
 ```
@@ -289,23 +290,37 @@ exactly `height * width * 3` uint8 bytes. Depth features set
 or float32 metres. Image features are embedded as PNG/TIFF structs in Parquet.
 Video features use LeRobot's current defaults: AV1/yuv420p for RGB and
 lossless HEVC/gray12le after 12-bit logarithmic quantization for depth.
-Multiple episodes are stream-copy concatenated into a shard, and the episode
-metadata records the resulting `[from_timestamp, to_timestamp)` routes.
+Episode fragments are retained until a video shard closes and then
+stream-copy concatenated once. Episode metadata records the resulting
+`[from_timestamp, to_timestamp)` routes without repeatedly rewriting a growing
+shard prefix.
 
 COPY uses bounded episode memory. Numeric rows live in DuckDB's buffer-managed
 collection and statistics are computed in bounded streaming passes. Raw visual
 frames are appended to per-feature staging files; visual sampling and video
-encoding read one frame at a time, and cameras are processed sequentially.
+encoding read one frame at a time. Independent cameras are encoded by a
+database-instance bounded worker pool and registered in feature order after the
+whole episode batch completes. `VIDEO_WORKERS` limits active camera encoders;
+`ENCODER_THREADS` is the total codec-thread budget for one COPY and is divided
+across those workers. Both default to `min(4, DuckDB's thread limit)` and cannot
+exceed that limit. Concurrent COPY statements share a database-wide admission
+limit, so codec work alone cannot exceed DuckDB's configured thread count.
+Codec work deliberately does not occupy DuckDB pipeline workers; unrelated
+queries can still consume their own pipeline budget at the same time. The
+single COPY coordinator waits for each episode batch, but performs no codec
+CPU work while it waits.
 Integer `min`/`max` statistics use LeRobot's native-compatible `BIGINT` leaf in
 episode Parquet metadata (`UBIGINT` for the complete `uint64` domain) and retain
 their exact decimal value in `stats.json`; they never pass through `DOUBLE`.
 Integer `mean`, `std`, and quantiles intentionally use LeRobot's floating-point
 reduction contract.
-`MAX_VISUAL_FRAME_BYTES` is the strict per-frame scratch-memory contract and
-defaults to 64 MiB. It is not a total dataset or episode byte limit. Statistics
-retain only their final output and one flattened row proportional to the
-declared feature width; reductions and 5000-bin histograms process at most 64
-dimensions at a time, never an episode-sized value array.
+`MAX_VISUAL_FRAME_BYTES` is the strict per-active-camera frame scratch-memory
+contract and defaults to 64 MiB. Thus the extension-owned raw encoding scratch
+is bounded by `VIDEO_WORKERS * MAX_VISUAL_FRAME_BYTES`; it is not a total
+dataset or episode byte limit. Unmaterialized encoded fragments occupy staging
+disk, not RAM. Statistics retain only their final output and one flattened row
+proportional to the declared feature width; reductions and 5000-bin histograms
+process at most 64 dimensions at a time, never an episode-sized value array.
 
 On read, depth video codes are dequantized from the canonical
 `video.depth_min`, `video.depth_max`, `video.shift`, and `video.use_log`

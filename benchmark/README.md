@@ -179,6 +179,34 @@ relations, but its effective parallelism is also bounded by the upstream
 DuckDB pipeline; a single ordered input partition may therefore feed only one
 decoder worker even when `decode_threads` is larger.
 
+## Native multi-camera write benchmark
+
+`lerobot_copy_write.py` is a local, generated-data benchmark for issue #8; it
+does not use Hugging Face or the network. It runs 2- and 4-camera COPY workloads
+with a fixed DuckDB/codec thread budget, first with one camera worker and then
+with bounded camera parallelism. Every measured output is checked for route
+timestamps, one final shard per camera, frame shape/count, and decoded pixel
+hash equivalence before its timing is accepted.
+
+```bash
+python benchmark/lerobot_copy_write.py \
+  --duckdb-cli build/release/duckdb \
+  --work-dir build/write-benchmark-data \
+  --output build/write-benchmark.json \
+  --threads 4 \
+  --episodes 8 \
+  --frames-per-episode 30 \
+  --repeats 3
+```
+
+The result records wall time, peak RSS, Linux `/proc/<pid>/io` counters, output
+size, and the serial/parallel median ratio. It also doubles the episode count
+for the 4-camera parallel case. With one-pass shard materialization, `rchar`
+and `wchar` should scale approximately 2x rather than with the quadratic
+episode-prefix rewrite pattern. Treat process-I/O ratios as a diagnostic, not a
+portable pass/fail threshold: filesystems and DuckDB versions account bytes
+differently. Use `--keep-output` to retain all validated datasets.
+
 ## Daft reference scale
 
 Daft's published benchmark used one Apple M4 Max with 36 GB RAM, not a
