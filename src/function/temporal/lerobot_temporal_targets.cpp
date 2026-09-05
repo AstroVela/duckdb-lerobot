@@ -10,6 +10,7 @@
 #include "lerobot_path.hpp"
 #include "storage/lerobot_metadata_cache.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <limits>
@@ -107,7 +108,7 @@ struct LerobotTemporalTargetsBindData final : public TableFunctionData {
 	shared_ptr<LerobotDatasetMetadata> metadata;
 	vector<LerobotTemporalDelta> deltas;
 	//! Physical input indexes in request_id, episode_index, frame_index,
-	//! delta_index order.
+	//! delta_index, optional target_id order.
 	vector<idx_t> input_columns;
 };
 
@@ -159,9 +160,10 @@ unique_ptr<FunctionData> LerobotTemporalTargetsBind(ClientContext &context, Tabl
 	if (input.inputs.empty() || input.inputs[0].IsNull()) {
 		throw BinderException("lerobot_temporal_targets root must not be NULL");
 	}
-	if (input.input_table_types.size() != 4 || input.input_table_names.size() != 4) {
+	if ((input.input_table_types.size() != 4 && input.input_table_types.size() != 5) ||
+	    input.input_table_types.size() != input.input_table_names.size()) {
 		throw BinderException("lerobot_temporal_targets input relation must contain exactly request_id, episode_index, "
-		                      "frame_index, and delta_index");
+		                      "frame_index, and delta_index, with an optional target_id");
 	}
 
 	vector<idx_t> input_columns;
@@ -169,6 +171,14 @@ unique_ptr<FunctionData> LerobotTemporalTargetsBind(ClientContext &context, Tabl
 	input_columns.push_back(FindInputColumn(input, "episode_index"));
 	input_columns.push_back(FindInputColumn(input, "frame_index"));
 	input_columns.push_back(FindInputColumn(input, "delta_index"));
+	if (input.input_table_types.size() == 5) {
+		if (std::find(input.input_table_names.begin(), input.input_table_names.end(), "target_id") ==
+		    input.input_table_names.end()) {
+			throw BinderException("lerobot_temporal_targets input relation must contain exactly request_id, episode_index, "
+			                      "frame_index, and delta_index, with an optional target_id");
+		}
+		input_columns.push_back(FindInputColumn(input, "target_id"));
+	}
 	for (const auto column : input_columns) {
 		input.input_table_types[column] = LogicalType::BIGINT;
 	}
@@ -183,6 +193,10 @@ unique_ptr<FunctionData> LerobotTemporalTargetsBind(ClientContext &context, Tabl
 	return_types = {LogicalType::BIGINT, LogicalType::BIGINT,  LogicalType::BIGINT,
 	                LogicalType::BIGINT, LogicalType::BIGINT,  LogicalType::DOUBLE,
 	                LogicalType::BIGINT, LogicalType::BOOLEAN, LogicalType::BIGINT};
+	if (input_columns.size() == 5) {
+		names.push_back("target_id");
+		return_types.push_back(LogicalType::BIGINT);
+	}
 	return make_uniq<LerobotTemporalTargetsBindData>(std::move(metadata), std::move(deltas), std::move(input_columns));
 }
 
@@ -196,7 +210,8 @@ enum LerobotTemporalTargetColumn {
 	LEROBOT_TEMPORAL_DELTA_FRAME_OFFSET = 6,
 	LEROBOT_TEMPORAL_IS_PADDING = 7,
 	LEROBOT_TEMPORAL_TARGET_FRAME_INDEX = 8,
-	LEROBOT_TEMPORAL_COLUMN_COUNT = 9
+	LEROBOT_TEMPORAL_TARGET_ID = 9,
+	LEROBOT_TEMPORAL_COLUMN_COUNT = 10
 };
 
 struct LerobotTemporalTargetsGlobalState final : public GlobalTableFunctionState {
@@ -241,6 +256,7 @@ int64_t ReadInputInteger(const vector<UnifiedVectorFormat> &formats, idx_t colum
 struct LerobotTemporalTarget {
 	int64_t request_id;
 	int64_t target_ordinal;
+	int64_t target_id;
 	int64_t episode_index;
 	int64_t frame_index;
 	int64_t delta_index;
@@ -257,6 +273,9 @@ void WriteTargetColumn(const LerobotTemporalTarget &target, idx_t logical_column
 		break;
 	case LEROBOT_TEMPORAL_TARGET_ORDINAL:
 		GetMutableFlatData<int64_t>(output)[row] = target.target_ordinal;
+		break;
+	case LEROBOT_TEMPORAL_TARGET_ID:
+		GetMutableFlatData<int64_t>(output)[row] = target.target_id;
 		break;
 	case LEROBOT_TEMPORAL_EPISODE_INDEX:
 		GetMutableFlatData<int64_t>(output)[row] = target.episode_index;
@@ -305,6 +324,9 @@ OperatorResultType LerobotTemporalTargetsFunction(ExecutionContext &, TableFunct
 		LerobotTemporalTarget target;
 		target.request_id = ReadInputInteger(formats, bind_data.input_columns[0], row, input_names[0]);
 		target.target_ordinal = static_cast<int64_t>(first_ordinal + row);
+		target.target_id = bind_data.input_columns.size() == 5
+		                       ? ReadInputInteger(formats, bind_data.input_columns[4], row, "target_id")
+		                       : 0;
 		target.episode_index = ReadInputInteger(formats, bind_data.input_columns[1], row, input_names[1]);
 		target.frame_index = ReadInputInteger(formats, bind_data.input_columns[2], row, input_names[2]);
 		target.delta_index = ReadInputInteger(formats, bind_data.input_columns[3], row, input_names[3]);

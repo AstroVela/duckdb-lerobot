@@ -79,23 +79,34 @@ mapping it into the MP4 shard. Request and delta ordinals survive the internal
 shard/time reorder, so callers can restore the requested tensor order without
 discarding duplicates.
 
+The current C++ implementation materializes at most 100,000 request/delta
+pairs as SQL `VALUES` during binding, before camera expansion. A full macro
+replacement must preserve these positions and the existing defaults; see the
+[migration prerequisites](docs/design.md#window-macro-migration).
+
 `lerobot_video_targets` is the scalable relation entry point. Its second
-argument is a DuckDB relation with exactly `request_id`, `episode_index`,
-`frame_index`, `video_key`, and `delta_index`. Each row selects one camera and
-one element of the named `delta_timestamps` list, so upstream joins, duplicate
+argument is a DuckDB relation with `request_id`, `episode_index`,
+`frame_index`, `video_key`, and `delta_index`, plus an optional `target_id`.
+Each row selects one camera and one element of the named `delta_timestamps`
+list, so upstream joins, duplicate
 requests, and filters remain relational instead of being boxed into a bind-time
 list or expanded into a camera/window Cartesian product. The semantic keys
 survive shard/time scheduling, and `target_ordinal` keeps even exact duplicates
-distinct. Use an order-bearing `request_id` together with `delta_index` and
-`target_ordinal` to restore the caller's tensor order. Padding and the resolved
-target frame are returned explicitly.
+distinct within a query. `target_ordinal` is assigned by an atomic counter as
+parallel workers consume input; it is neither an input position nor stable
+across executions. To restore caller order, provide an order-bearing
+`target_id`. This non-NULL `BIGINT` is returned unchanged as an additional
+output column, including repeated IDs; choose unique IDs when individual
+occurrences need a rejoin key. Omitting it preserves the original output
+schema. Padding and the resolved target frame are returned explicitly.
 
 `lerobot_temporal_targets` applies the same LeRobot FPS validation,
 Python-compatible ties-to-even integer frame-offset conversion,
 episode-boundary clamp, and padding semantics without opening video. Its input
-relation has exactly `request_id`, `episode_index`, `frame_index`, and
-`delta_index`. Join the returned `target_frame_index` to `lerobot_scan` to
-fetch any state, action, or other non-video feature.
+relation has `request_id`, `episode_index`, `frame_index`, and `delta_index`,
+with the same optional `target_id` contract and unordered `target_ordinal`.
+Join the returned `target_frame_index` to `lerobot_scan` to fetch any state,
+action, or other non-video feature.
 `lerobot_tasks` scans the current v3 `meta/tasks.parquet` contract directly, so
 joining a frame's `task_index` yields its `task` string while retaining native
 Parquet projection and filter pushdown. Legacy task layouts are not inferred.
@@ -177,31 +188,31 @@ ORDER BY request_ordinal, delta_ordinal;
 -- exactly one camera and one delta.
 WITH targets AS (
   SELECT * FROM (VALUES
-    (1001::BIGINT, 12::BIGINT, 45::BIGINT,
+    (0::BIGINT, 1001::BIGINT, 12::BIGINT, 45::BIGINT,
      'observation.images.wrist'::VARCHAR, 0::BIGINT),
-    (1001::BIGINT, 12::BIGINT, 45::BIGINT,
+    (1::BIGINT, 1001::BIGINT, 12::BIGINT, 45::BIGINT,
      'observation.images.wrist'::VARCHAR, 1::BIGINT),
-    (1002::BIGINT, 12::BIGINT, 90::BIGINT,
+    (2::BIGINT, 1002::BIGINT, 12::BIGINT, 90::BIGINT,
      'observation.images.front'::VARCHAR, 2::BIGINT)
-  ) t(request_id, episode_index, frame_index, video_key, delta_index)
+  ) t(target_id, request_id, episode_index, frame_index, video_key, delta_index)
 )
-SELECT request_id, target_ordinal, video_key, delta_index, is_padding,
+SELECT request_id, target_id, video_key, delta_index, is_padding,
        target_frame_index, decoded_timestamp, image
 FROM lerobot_video_targets(
   'hf://datasets/lerobot/droid_1.0.1',
   (SELECT * FROM targets),
   delta_timestamps := [-0.2, -0.1, 0.0]
 )
-ORDER BY target_ordinal;
+ORDER BY target_id;
 
 -- Resolve temporal state/action targets without decoding video. Every input
--- row chooses one delta; exact duplicates remain distinct via target_ordinal.
+-- row chooses one delta and carries a stable caller-provided target_id.
 WITH requests AS (
   SELECT * FROM (VALUES
-    (1001::BIGINT, 12::BIGINT, 45::BIGINT, 0::BIGINT),
-    (1001::BIGINT, 12::BIGINT, 45::BIGINT, 1::BIGINT),
-    (1001::BIGINT, 12::BIGINT, 45::BIGINT, 2::BIGINT)
-  ) t(request_id, episode_index, frame_index, delta_index)
+    (0::BIGINT, 1001::BIGINT, 12::BIGINT, 45::BIGINT, 0::BIGINT),
+    (1::BIGINT, 1001::BIGINT, 12::BIGINT, 45::BIGINT, 1::BIGINT),
+    (2::BIGINT, 1001::BIGINT, 12::BIGINT, 45::BIGINT, 2::BIGINT)
+  ) t(target_id, request_id, episode_index, frame_index, delta_index)
 ), targets AS (
   SELECT *
   FROM lerobot_temporal_targets(
@@ -217,7 +228,7 @@ JOIN lerobot_scan('hf://datasets/lerobot/droid_1.0.1') frames
   ON frames.episode_index = targets.episode_index
  AND frames.frame_index = targets.target_frame_index
 JOIN lerobot_tasks('hf://datasets/lerobot/droid_1.0.1') tasks USING (task_index)
-ORDER BY targets.request_id, targets.delta_index, targets.target_ordinal;
+ORDER BY targets.target_id;
 
 -- Inspect existing route-cache entries without loading or validating either
 -- component as a side effect.
@@ -333,6 +344,13 @@ of `meta/info.json` invalidates stale entries automatically; `refresh := true`
 invalidates both entries for non-versioned or manually edited datasets, after
 which a cache-consuming query rebuilds only what it needs. Versioned Hugging
 Face revisions should normally need no explicit refresh.
+
+`lerobot_info`, `lerobot_episodes`, and `lerobot_tasks` register `refresh` in
+the current API. Passing `true` invalidates both routing caches at bind time
+without rebuilding them; the metadata itself is read by the native scan.
+This support was added in `ca5260c`. At `81db162`, these three functions did
+not register the parameter: DuckDB rejected it during binding as an invalid
+named parameter, and the option-parsing branch was unreachable.
 
 `lerobot_cache_info(root)` always returns one `data` row and one `video` row
 with the stable columns `root`, `component`, `cached`, `entries`, and `bytes`.

@@ -216,7 +216,8 @@ enum LerobotVideoTargetColumn {
 	LEROBOT_TARGET_HEIGHT = 15,
 	LEROBOT_TARGET_CHANNELS = 16,
 	LEROBOT_TARGET_IMAGE = 17,
-	LEROBOT_TARGET_COLUMN_COUNT = 18
+	LEROBOT_TARGET_ID = 18,
+	LEROBOT_TARGET_COLUMN_COUNT = 19
 };
 
 struct LerobotDecodeTarget {
@@ -239,6 +240,8 @@ struct LerobotDecodeTarget {
 	}
 
 	int64_t request_id;
+	//! Caller identity is independent of the scheduler's unique ordinal.
+	int64_t target_id = 0;
 	idx_t request_ordinal;
 	idx_t delta_ordinal;
 	double delta_timestamp;
@@ -691,7 +694,7 @@ struct LerobotVideoTargetsBindData final : public TableFunctionData {
 	shared_ptr<LerobotVideoMetadata> metadata;
 	vector<LerobotTemporalDelta> deltas;
 	//! Physical input indexes in request_id, episode_index, frame_index,
-	//! video_key, delta_index order.
+	//! video_key, delta_index, optional target_id order.
 	vector<idx_t> input_columns;
 	LerobotVideoOptions options;
 };
@@ -718,9 +721,10 @@ unique_ptr<FunctionData> LerobotVideoTargetsBind(ClientContext &context, TableFu
 	if (input.inputs.empty() || input.inputs[0].IsNull()) {
 		throw BinderException("lerobot_video_targets root must not be NULL");
 	}
-	if (input.input_table_types.size() != 5 || input.input_table_names.size() != 5) {
+	if ((input.input_table_types.size() != 5 && input.input_table_types.size() != 6) ||
+	    input.input_table_types.size() != input.input_table_names.size()) {
 		throw BinderException("lerobot_video_targets input relation must contain exactly request_id, episode_index, "
-		                      "frame_index, video_key, and delta_index");
+		                      "frame_index, video_key, and delta_index, with an optional target_id");
 	}
 	vector<idx_t> input_columns;
 	input_columns.push_back(FindTargetInputColumn(input, "request_id"));
@@ -728,8 +732,16 @@ unique_ptr<FunctionData> LerobotVideoTargetsBind(ClientContext &context, TableFu
 	input_columns.push_back(FindTargetInputColumn(input, "frame_index"));
 	input_columns.push_back(FindTargetInputColumn(input, "video_key"));
 	input_columns.push_back(FindTargetInputColumn(input, "delta_index"));
+	if (input.input_table_types.size() == 6) {
+		if (std::find(input.input_table_names.begin(), input.input_table_names.end(), "target_id") ==
+		    input.input_table_names.end()) {
+			throw BinderException("lerobot_video_targets input relation must contain exactly request_id, episode_index, "
+			                      "frame_index, video_key, and delta_index, with an optional target_id");
+		}
+		input_columns.push_back(FindTargetInputColumn(input, "target_id"));
+	}
 	const LogicalType required_types[] = {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
-	                                      LogicalType::VARCHAR, LogicalType::BIGINT};
+	                                      LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT};
 	for (idx_t required = 0; required < input_columns.size(); required++) {
 		// Let DuckDB add a typed projection/cast between the input relation and
 		// this operator. Execution can then consume vectors without Value boxing.
@@ -756,6 +768,10 @@ unique_ptr<FunctionData> LerobotVideoTargetsBind(ClientContext &context, TableFu
 	                LogicalType::BOOLEAN, LogicalType::BIGINT, LogicalType::DOUBLE,  LogicalType::VARCHAR,
 	                LogicalType::DOUBLE,  LogicalType::DOUBLE, LogicalType::INTEGER, LogicalType::INTEGER,
 	                LogicalType::INTEGER, LogicalType::BLOB};
+	if (input_columns.size() == 6) {
+		names.push_back("target_id");
+		return_types.push_back(LogicalType::BIGINT);
+	}
 	return make_uniq<LerobotVideoTargetsBindData>(std::move(dataset), std::move(metadata), std::move(deltas),
 	                                              std::move(input_columns), options);
 }
@@ -1814,6 +1830,9 @@ void BuildTargetBuffers(ClientContext &context, const LerobotVideoTargetsBindDat
 	targets.reserve(batch_count);
 	local_state.routes.reserve(batch_count);
 	const auto first_ordinal = global_state.ClaimTargetOrdinals(batch_count);
+	if (first_ordinal > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) - batch_count) {
+		throw InvalidInputException("lerobot_video_targets produced too many rows for target_ordinal");
+	}
 	const char *input_names[] = {"request_id", "episode_index", "frame_index", "video_key", "delta_index"};
 
 	for (idx_t offset = 0; offset < batch_count; offset++) {
@@ -1828,6 +1847,10 @@ void BuildTargetBuffers(ClientContext &context, const LerobotVideoTargetsBindDat
 		    ReadUnifiedValue<string_t>(local_state.input_formats, bind_data.input_columns[3], row, input_names[3]);
 		const auto delta_index =
 		    ReadUnifiedInteger(local_state.input_formats, bind_data.input_columns[4], row, input_names[4]);
+		const auto target_id = bind_data.input_columns.size() == 6
+		                           ? ReadUnifiedInteger(local_state.input_formats, bind_data.input_columns[5], row,
+		                                                "target_id")
+		                           : 0;
 		if (episode_index < 0 || frame_index < 0) {
 			throw InvalidInputException("lerobot_video_targets episode_index and frame_index must be non-negative");
 		}
@@ -1865,6 +1888,7 @@ void BuildTargetBuffers(ClientContext &context, const LerobotVideoTargetsBindDat
 		targets.push_back(LerobotDecodeTarget(request_id, first_ordinal + offset, static_cast<idx_t>(delta_index),
 		                                      delta.timestamp, delta.frame_offset, is_padding, episode_index,
 		                                      frame_index, target_frame_index, 0, 0, route_index));
+		targets.back().target_id = target_id;
 	}
 	local_state.input_position += batch_count;
 	auto timestamps = ReadTargetTimestamps(context, bind_data, targets);
@@ -2947,6 +2971,9 @@ void WriteTargetRelationColumn(const LerobotVideoTargetsBindData &bind_data, con
 		break;
 	case LEROBOT_TARGET_ORDINAL:
 		WriteInt64(output, row, static_cast<int64_t>(target.request_ordinal));
+		break;
+	case LEROBOT_TARGET_ID:
+		WriteInt64(output, row, target.target_id);
 		break;
 	case LEROBOT_TARGET_EPISODE_INDEX:
 		WriteInt64(output, row, target.episode_index);

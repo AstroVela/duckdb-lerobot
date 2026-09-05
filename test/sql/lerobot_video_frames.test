@@ -243,6 +243,30 @@ ORDER BY target_ordinal;
 31	1	1	0	0.0	520e780c7e7644f58eac8ad5c259a341
 32	2	2	1	0.5	09b3f62794209739b33ee60adadcae39
 
+# Stable IDs accompany decoded pixels, including duplicate padded frames.
+query IIRT
+SELECT target_id, delta_index, decoded_timestamp, md5(image)
+FROM lerobot_video_targets(
+    '{TEST_DIR}/lerobot_video_frames',
+    (SELECT * FROM (VALUES
+        (99, 7, 0, 0, 'observation.images.front', 2),
+        (-5, 7, 0, 0, 'observation.images.front', 0),
+        (42, 7, 0, 0, 'observation.images.front', 1),
+        (42, 7, 0, 0, 'observation.images.front', 1)
+    ) targets(target_id, request_id, episode_index, frame_index, video_key, delta_index)),
+    delta_timestamps := [-0.5, 0.0, 0.5],
+    decode_threads := 2,
+    target_buffer_size := 2,
+    max_pending_targets := 2,
+    max_output_bytes := 1
+)
+ORDER BY target_id;
+----
+-5	0	0.0	520e780c7e7644f58eac8ad5c259a341
+42	1	0.0	520e780c7e7644f58eac8ad5c259a341
+42	1	0.0	520e780c7e7644f58eac8ad5c259a341
+99	2	0.5	09b3f62794209739b33ee60adadcae39
+
 # Standard source APIs publish decoder/open/seek/bytes/frame/conversion counters
 # through DuckDB's native JSON profiler.
 statement ok

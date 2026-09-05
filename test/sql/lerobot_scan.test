@@ -318,6 +318,41 @@ ORDER BY component;
 data	false	0	true
 video	false	0	true
 
+# All three metadata readers now register refresh. The old 81db162 readers
+# rejected it during binding, before their option-parsing code could run.
+foreach metadata_function lerobot_info lerobot_episodes lerobot_tasks
+
+query I
+SELECT count(*) FROM lerobot_video_routes('{TEST_DIR}/lerobot_scan', [0]);
+----
+2
+
+statement ok
+SELECT * FROM ${metadata_function}('{TEST_DIR}/lerobot_scan', refresh := false);
+
+query I
+SELECT bool_and(cached) FROM lerobot_cache_info('{TEST_DIR}/lerobot_scan');
+----
+true
+
+statement ok
+SELECT * FROM ${metadata_function}('{TEST_DIR}/lerobot_scan', refresh := true);
+
+query TIII
+SELECT component, cached, entries, bytes = 0
+FROM lerobot_cache_info('{TEST_DIR}/lerobot_scan')
+ORDER BY component;
+----
+data	false	0	true
+video	false	0	true
+
+statement error
+SELECT * FROM ${metadata_function}('{TEST_DIR}/lerobot_scan', refresh := NULL);
+----
+refresh must not be NULL
+
+endloop
+
 # Rebuild both components, then change the info.json commit marker. The changed
 # path length makes the fingerprint change deterministic even on coarse-mtime
 # filesystems.
