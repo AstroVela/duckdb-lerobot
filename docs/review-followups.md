@@ -83,13 +83,21 @@ Removing SQL text construction and reducing storage work are separate goals.
 
 ## Local validation
 
+The follow-up review fixes share the reader's depth-parameter validation with
+COPY and validate CRF/GOP before conversion to integers. TIFF sample formats
+are checked per channel. For FFmpeg compatibility, the packet's first-page
+directory omits only validated unsigned SampleFormat and unassociated RGBA
+ExtraSamples entries, keeping the original payload and all field offsets intact.
+Strict decode errors remain enabled so a corrupt compressed strip cannot become
+a blank image. Regression tests cover these cases and big-endian directories.
+
 The following checks passed on Linux x86_64 with pinned DuckDB v1.5.5:
 
 | Check | Result |
 | --- | --- |
-| Release, FFmpeg enabled, complete SQL suite | 1,131 assertions across 12 test cases |
-| Release, FFmpeg disabled, complete SQL suite | 832 assertions across 7 test cases; 5 visual test files skipped |
-| Debug, ASAN + UBSAN, targeted SQL suite | 959 assertions across 11 test cases |
+| Release, FFmpeg enabled, complete SQL suite | 1,171 assertions across 13 test cases |
+| Release, FFmpeg disabled, complete SQL suite | 847 assertions across 8 test cases; 5 visual test files skipped |
+| Debug, ASAN + UBSAN, targeted SQL suite | 999 assertions across 12 test cases |
 | Pinned LeRobot 0.6.1 numeric and visual conformance | Both directions passed; visual checks include an independent quantizer comparison |
 | Changed C++ formatting and Python lint/format checks | Passed |
 

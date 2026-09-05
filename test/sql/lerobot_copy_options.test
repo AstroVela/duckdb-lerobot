@@ -1,0 +1,57 @@
+# name: test/sql/lerobot_copy_options.test
+# description: COPY validates quantizer and integer options before staging, with or without FFmpeg
+# group: [lerobot]
+
+require parquet
+
+require json
+
+require lerobot
+
+# DuckDB must not round fractions to BIGINT before the extension validates them.
+foreach option RGB_CRF RGB_GOP
+
+foreach value 0.6 30.5 63.4 -0.1 '30.5'
+
+statement error
+COPY (SELECT 0::BIGINT AS episode_index, 'test' AS task, 1::FLOAT AS state)
+TO '{TEST_DIR}/lerobot_invalid_integer_option' (FORMAT lerobot, FPS 10,
+FEATURES '{"state":{"dtype":"float32","shape":[1]}}', ${option} ${value});
+----
+must be
+
+endloop
+
+endloop
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/lerobot_invalid_integer_option*');
+----
+0
+
+# Endpoints fit in float32, but the linear dequantization step underflows to zero.
+# This must fail before COPY can publish a dataset that its own reader rejects.
+statement error
+COPY (SELECT 0::BIGINT AS episode_index, 'test' AS task,
+             from_hex(repeat('00000000', 4096)) AS depth)
+TO '{TEST_DIR}/lerobot_invalid_depth_scale' (FORMAT lerobot, FPS 10,
+FEATURES '{"depth":{"dtype":"video","shape":[64,64,1],"info":{"is_depth_map":true}}}',
+DEPTH_MIN 0, DEPTH_MAX 1e-43, DEPTH_SHIFT 0, DEPTH_USE_LOG false);
+----
+not representable for float32 dequantization
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/lerobot_invalid_depth_scale*');
+----
+0
+
+# Integer-valued decimals and strings still work, including the legal endpoints.
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, 'test' AS task, 1::FLOAT AS state)
+TO '{TEST_DIR}/lerobot_valid_integer_options' (FORMAT lerobot, FPS 10,
+FEATURES '{"state":{"dtype":"float32","shape":[1]}}', RGB_CRF 63.0, RGB_GOP '1');
+
+query I
+SELECT count(*) FROM lerobot_scan('{TEST_DIR}/lerobot_valid_integer_options');
+----
+1

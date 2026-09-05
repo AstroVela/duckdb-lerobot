@@ -1,6 +1,7 @@
 #include "storage/lerobot_metadata_cache.hpp"
 
 #include "function/lerobot_schema.hpp"
+#include "lerobot_depth.hpp"
 
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/exception.hpp"
@@ -166,38 +167,6 @@ string QuoteIdentifier(const string &identifier) {
 bool IsV3Version(const string &version) {
 	return version == "v3" || version == "3" || StringUtil::StartsWith(version, "v3.") ||
 	       StringUtil::StartsWith(version, "3.");
-}
-
-bool ValidFloat32DepthParameters(double depth_min, double depth_max, double shift, bool use_log) {
-	const auto depth_min_float = static_cast<float>(depth_min);
-	const auto depth_max_float = static_cast<float>(depth_max);
-	const auto shift_float = static_cast<float>(shift);
-	if (!std::isfinite(depth_min_float) || !std::isfinite(depth_max_float) || !std::isfinite(shift_float) ||
-	    depth_min_float >= depth_max_float) {
-		return false;
-	}
-
-	double scale;
-	double offset;
-	if (use_log) {
-		const auto shifted_min = depth_min + shift;
-		const auto shifted_max = depth_max + shift;
-		if (!std::isfinite(shifted_min) || !std::isfinite(shifted_max) || shifted_min <= 0 ||
-		    shifted_max <= shifted_min) {
-			return false;
-		}
-		const auto log_min = std::log(shifted_min);
-		const auto log_max = std::log(shifted_max);
-		scale = (log_max - log_min) / 4095.0;
-		offset = log_min;
-	} else {
-		scale = (depth_max - depth_min) / 4095.0;
-		offset = depth_min;
-	}
-	const auto scale_float = static_cast<float>(scale);
-	const auto offset_float = static_cast<float>(offset);
-	return std::isfinite(scale) && std::isfinite(offset) && std::isfinite(scale_float) && scale_float > 0 &&
-	       std::isfinite(offset_float);
 }
 
 void AppendColumn(LerobotScanSchema &schema, string name, LogicalType type) {
@@ -402,7 +371,8 @@ LerobotDatasetInfo ParseLerobotInfo(Connection &connection, const string &info_p
 					const auto use_log = BooleanValue::Get(chunk->GetValue(15, row));
 					const auto pixel_format = StringValue::Get(chunk->GetValue(16, row));
 					if (!std::isfinite(depth_min) || !std::isfinite(depth_max) || !std::isfinite(shift) ||
-					    depth_min >= depth_max || !ValidFloat32DepthParameters(depth_min, depth_max, shift, use_log)) {
+					    depth_min >= depth_max ||
+					    !LerobotValidFloat32DepthParameters(depth_min, depth_max, shift, use_log)) {
 						throw BinderException("LeRobot depth video feature '%s' has invalid quantization parameters",
 						                      feature.name);
 					}

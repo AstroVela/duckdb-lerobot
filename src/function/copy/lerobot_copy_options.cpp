@@ -1,4 +1,5 @@
 #include "function/lerobot_copy_options.hpp"
+#include "lerobot_depth.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/limits.hpp"
@@ -114,6 +115,10 @@ void ParseLerobotCopyOptionalConfig(ClientContext &context, const CopyFunctionBi
 		throw BinderException("LeRobot depth parameters require finite 0 <= DEPTH_MIN < DEPTH_MAX and, for log "
 		                      "quantization, DEPTH_MIN + DEPTH_SHIFT > 0");
 	}
+	if (!LerobotValidFloat32DepthParameters(encoding.depth_min, encoding.depth_max, encoding.depth_shift,
+	                                        encoding.depth_use_log)) {
+		throw BinderException("LeRobot depth parameters are not representable for float32 dequantization");
+	}
 	// Both accepted input units use float32 arithmetic, matching LeRobot.
 	for (const auto scale : {1.0, 1000.0}) {
 		const auto low = static_cast<float>(encoding.depth_min * scale);
@@ -198,8 +203,10 @@ void LerobotCopyOptionDefinitions(ClientContext &, CopyOptionsInput &input) {
 	input.options["video_workers"] = CopyOption(LogicalType::UBIGINT, CopyOptionMode::WRITE_ONLY);
 	input.options["encoder_threads"] = CopyOption(LogicalType::UBIGINT, CopyOptionMode::WRITE_ONLY);
 	input.options["rgb_codec"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::WRITE_ONLY);
-	input.options["rgb_crf"] = CopyOption(LogicalType::BIGINT, CopyOptionMode::WRITE_ONLY);
-	input.options["rgb_gop"] = CopyOption(LogicalType::BIGINT, CopyOptionMode::WRITE_ONLY);
+	// Preserve fractions until our range/integrality checks have run. BIGINT
+	// would let DuckDB round invalid values before the extension sees them.
+	input.options["rgb_crf"] = CopyOption(LogicalType::DOUBLE, CopyOptionMode::WRITE_ONLY);
+	input.options["rgb_gop"] = CopyOption(LogicalType::DOUBLE, CopyOptionMode::WRITE_ONLY);
 	input.options["depth_min"] = CopyOption(LogicalType::DOUBLE, CopyOptionMode::WRITE_ONLY);
 	input.options["depth_max"] = CopyOption(LogicalType::DOUBLE, CopyOptionMode::WRITE_ONLY);
 	input.options["depth_shift"] = CopyOption(LogicalType::DOUBLE, CopyOptionMode::WRITE_ONLY);

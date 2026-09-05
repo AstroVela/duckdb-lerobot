@@ -30,7 +30,8 @@ build/conformance-venv/bin/python test/conformance/test_bidirectional.py \
 ```
 
 An FFmpeg-enabled build additionally runs `test_visual.py` with the same CLI
-arguments and pinned environment. It generates independent Pillow PNG/RGBA and
+arguments and pinned environment. It generates independent Pillow PNG/RGBA,
+RGB TIFF with per-channel SampleFormat, compressed/uncompressed RGBA TIFF, and
 uint16/float32 TIFF fixtures, creates RGB and depth videos with official
 LeRobot, and compares both readers on official and extension-created datasets.
 Both directions cover two concatenated episodes, exact frame selection, padded

@@ -36,7 +36,7 @@ Value ImageValue(string pixels, int width, int height, int channels, const char 
 // FFmpeg builds differ in TIFF SampleFormat support. Decode the uncompressed
 // uint16/float32 depth contract directly so unsupported float TIFFs can never
 // silently become integer pixels. PNG and other TIFF formats use FFmpeg below.
-bool DecodeDepthTiff(const string_t &input, Value &result) {
+bool DecodeDepthTiff(const string_t &input, Value &result, vector<idx_t> &decoder_entries) {
 	const auto data = reinterpret_cast<const uint8_t *>(input.GetDataUnsafe());
 	const auto size = input.GetSize();
 	const bool little = data[0] == 'I';
@@ -59,14 +59,18 @@ bool DecodeDepthTiff(const string_t &input, Value &result) {
 	for (idx_t i = 0; i < count; i++) {
 		const auto entry = directory + 2 + i * 12;
 		const auto tag = read(entry, 2);
+		if (tag != 338 && tag != 339) {
+			decoder_entries.push_back(entry);
+		}
 		if (tag != 256 && tag != 257 && tag != 258 && tag != 259 && tag != 262 && tag != 273 && tag != 274 &&
-		    tag != 277 && tag != 278 && tag != 279 && tag != 284 && tag != 339) {
+		    tag != 277 && tag != 278 && tag != 279 && tag != 284 && tag != 338 && tag != 339) {
 			continue;
 		}
 		const auto type = read(entry + 2, 2);
 		const auto elements = read(entry + 4, 4);
 		const idx_t element_size = type == 3 ? 2 : (type == 4 ? 4 : 0);
-		const auto max_elements = tag == 273 || tag == 279 ? size / 4 : (tag == 258 ? 4U : 1U);
+		const auto max_elements =
+		    tag == 273 || tag == 279 ? size / 4 : (tag == 258 || tag == 338 || tag == 339 ? 4U : 1U);
 		if (!element_size || !elements || elements > max_elements || elements > size / element_size ||
 		    fields.count(tag)) {
 			throw InvalidInputException("Invalid LeRobot TIFF field");
@@ -85,9 +89,46 @@ bool DecodeDepthTiff(const string_t &input, Value &result) {
 		auto entry = fields.find(tag);
 		return entry == fields.end() ? fallback : (entry->second.size() == 1 ? entry->second[0] : 0);
 	};
-	const auto bits = scalar(258, 1);
-	const auto format = scalar(339, 1);
-	if (scalar(277, 1) != 1 || !((bits == 16 && format == 1) || (bits == 32 && format == 3))) {
+	const auto samples = scalar(277, 1);
+	auto uniform = [&](uint32_t tag, uint32_t fallback) {
+		auto entry = fields.find(tag);
+		if (entry == fields.end()) {
+			return fallback;
+		}
+		const auto &values = entry->second;
+		if (values.size() != 1 && values.size() != samples) {
+			throw InvalidInputException("Invalid LeRobot TIFF per-channel field count");
+		}
+		for (auto value : values) {
+			if (value != values[0]) {
+				throw InvalidInputException("LeRobot TIFF requires uniform sample widths and formats");
+			}
+		}
+		return values[0];
+	};
+	const auto bits = uniform(258, 1);
+	const auto format = uniform(339, 1);
+	// Older FFmpeg TIFF decoders ignore SampleFormat. Validate it before the
+	// fallback so signed/floating samples cannot silently become unsigned pixels.
+	if (!samples || samples > 4 || !bits || (format == 1 ? bits > 16 : !(format == 3 && bits == 32 && samples == 1))) {
+		throw InvalidInputException("Unsupported LeRobot TIFF sample width or format");
+	}
+	auto extra_samples = fields.find(338);
+	if (extra_samples != fields.end() &&
+	    (samples != 4 || scalar(262, 1) != 2 || extra_samples->second.size() != 1 || extra_samples->second[0] != 2)) {
+		throw InvalidInputException("LeRobot TIFF supports only unassociated RGBA extra samples");
+	}
+	auto &offsets = fields[273];
+	auto &counts = fields[279];
+	if (offsets.size() != counts.size()) {
+		throw InvalidInputException("Invalid LeRobot TIFF strip layout");
+	}
+	for (idx_t i = 0; i < offsets.size(); i++) {
+		if (offsets[i] > size || counts[i] > size - offsets[i]) {
+			throw InvalidInputException("Truncated LeRobot TIFF strip");
+		}
+	}
+	if (samples != 1 || !((bits == 16 && format == 1) || (bits == 32 && format == 3))) {
 		return false;
 	}
 	if (scalar(259, 1) != 1) {
@@ -104,8 +145,6 @@ bool DecodeDepthTiff(const string_t &input, Value &result) {
 		throw InvalidInputException("LeRobot decoded image exceeds the 64 MiB per-image limit or has zero dimensions");
 	}
 	const idx_t rows_per_strip = scalar(278, static_cast<uint32_t>(height));
-	auto &offsets = fields[273];
-	auto &counts = fields[279];
 	if (!rows_per_strip || offsets.size() != (height - 1) / rows_per_strip + 1 || counts.size() != offsets.size()) {
 		throw InvalidInputException("Invalid LeRobot TIFF strip layout");
 	}
@@ -170,12 +209,13 @@ Value DecodeImage(const string_t &input) {
 		throw InvalidInputException("LeRobot encoded image exceeds the 64 MiB per-image limit");
 	}
 	AVCodecID codec_id;
+	vector<idx_t> tiff_decoder_entries;
 	if (size >= 8 && memcmp(data, "\x89PNG\r\n\x1a\n", 8) == 0) {
 		codec_id = AV_CODEC_ID_PNG;
 	} else if (size >= 4 && (memcmp(data, "II\x2a\x00", 4) == 0 || memcmp(data, "MM\x00\x2a", 4) == 0)) {
 		codec_id = AV_CODEC_ID_TIFF;
 		Value decoded;
-		if (DecodeDepthTiff(input, decoded)) {
+		if (DecodeDepthTiff(input, decoded, tiff_decoder_entries)) {
 			return decoded;
 		}
 	} else {
@@ -197,8 +237,30 @@ Value DecodeImage(const string_t &input) {
 	state.codec->get_buffer2 = AllocateImageFrame;
 	state.codec->err_recognition = AV_EF_CRCCHECK | AV_EF_BITSTREAM | AV_EF_EXPLODE;
 	CheckImageStatus(avcodec_open2(state.codec, decoder, nullptr));
-	CheckImageStatus(av_new_packet(state.packet, static_cast<int>(size)));
+	const idx_t tiff_directory = (static_cast<idx_t>(size) + 1) & ~idx_t(1);
+	const auto packet_size = codec_id == AV_CODEC_ID_TIFF ? tiff_directory + 2 + tiff_decoder_entries.size() * 12 + 4
+	                                                      : static_cast<idx_t>(size);
+	CheckImageStatus(av_new_packet(state.packet, static_cast<int>(packet_size)));
 	memcpy(state.packet->data, data, size); // av_new_packet supplies FFmpeg's required zero padding.
+	if (codec_id == AV_CODEC_ID_TIFF) {
+		// Keep strict payload decoding: older FFmpeg can otherwise return blank
+		// pixels after a decompression error. It rejects SampleFormat/ExtraSamples
+		// tags under EXPLODE even for the unsigned, unassociated RGBA samples
+		// validated above. Omit only those tags from a new first-page directory.
+		// Append it so original pixel data and out-of-line field offsets stay intact.
+		memset(state.packet->data + size, 0, packet_size - size);
+		auto write = [&](idx_t offset, uint32_t value, idx_t bytes) {
+			for (idx_t i = 0; i < bytes; i++) {
+				state.packet->data[offset + i] =
+				    static_cast<uint8_t>(value >> (8 * (data[0] == 'I' ? i : bytes - i - 1)));
+			}
+		};
+		write(4, static_cast<uint32_t>(tiff_directory), 4);
+		write(tiff_directory, static_cast<uint32_t>(tiff_decoder_entries.size()), 2);
+		for (idx_t i = 0; i < tiff_decoder_entries.size(); i++) {
+			memcpy(state.packet->data + tiff_directory + 2 + i * 12, data + tiff_decoder_entries[i], 12);
+		}
+	}
 	CheckImageStatus(avcodec_send_packet(state.codec, state.packet));
 	auto status = avcodec_receive_frame(state.codec, state.frame);
 	if (status == AVERROR(EAGAIN)) {
@@ -207,6 +269,9 @@ Value DecodeImage(const string_t &input) {
 	}
 	CheckImageStatus(status);
 	auto &frame = *state.frame;
+	if (frame.decode_error_flags || (frame.flags & AV_FRAME_FLAG_CORRUPT)) {
+		throw InvalidInputException("Cannot decode LeRobot PNG/TIFF image: corrupt frame");
+	}
 	const auto source_format = static_cast<AVPixelFormat>(frame.format);
 	const auto descriptor = av_pix_fmt_desc_get(source_format);
 	if (!descriptor || frame.width <= 0 || frame.height <= 0) {

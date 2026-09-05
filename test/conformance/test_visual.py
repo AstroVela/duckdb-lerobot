@@ -168,18 +168,26 @@ def compare_readers(duckdb: Path, extension: Path, root: Path, quantizer: dict) 
 
 def compare_images(duckdb: Path, extension: Path, workspace: Path) -> None:
     # Pillow-generated independent fixtures exercise alpha, endianness and float TIFF.
+    rgb = raw_frame(0)["rgb"]
+    rgba = np.concatenate((rgb, np.full((SIZE, SIZE, 1), 128, dtype=np.uint8)), axis=2)
     images = {
-        "rgb.png": raw_frame(0)["rgb"],
-        "rgba.png": np.concatenate(
-            (raw_frame(0)["rgb"], np.full((SIZE, SIZE, 1), 128, dtype=np.uint8)), axis=2
-        ),
+        "rgb.png": rgb,
+        "rgba.png": rgba,
+        "rgb-sampleformat.tiff": rgb,
+        "rgba.tiff": rgba,
+        "rgba-deflate.tiff": rgba,
         "depth.tiff": raw_frame(0)["depth"][..., 0],
         "depth-be.tiff": raw_frame(0)["depth"][..., 0].astype(">u2"),
         "depth-float.tiff": raw_frame(0)["depth"][..., 0].astype(np.float32) / 1000,
     }
     for name, array in images.items():
         path = workspace / name
-        Image.fromarray(array).save(path)
+        save_options = {}
+        if name == "rgb-sampleformat.tiff":
+            save_options["tiffinfo"] = {339: (1, 1, 1)}
+        if name == "rgba-deflate.tiff":
+            save_options["compression"] = "tiff_adobe_deflate"
+        Image.fromarray(array).save(path, **save_options)
         rows = run_duckdb(
             duckdb,
             extension,

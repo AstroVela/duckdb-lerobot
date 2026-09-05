@@ -264,8 +264,10 @@ SELECT lerobot_decode_image(content) FROM read_blob('my_dataset/images/frame-000
 dtypes are `uint8`, little-endian `uint16`, and little-endian `float32`. RGB
 and RGBA retain their channels. The first TIFF page is decoded; uncompressed
 uint16/float32 grayscale TIFF strips have a native precision-preserving path,
-while other supported PNG/TIFF formats use FFmpeg. Compressed float TIFFs are
-rejected. Non-NULL input requires an FFmpeg-enabled build; NULL returns NULL.
+while other supported PNG/TIFF formats use FFmpeg. TIFF sample widths and formats
+must be uniform across channels; RGBA TIFF uses unassociated alpha. Signed
+integer and compressed float TIFFs are rejected. Non-NULL input requires an
+FFmpeg-enabled build; NULL returns NULL.
 Encoded input and decoded image sizes each
 have a 64 MiB hard limit; these are per-image guards, not a shared memory budget.
 Units are not inferred from pixel values: consult the feature's `depth_unit`
@@ -387,7 +389,8 @@ The following encoding options are independent of worker budgets:
 Depth remains lossless HEVC/gray12le and is unaffected by the RGB options.
 NaN/infinite input and invalid logarithm domains are rejected even when clipping
 is enabled. Quantizer parameters must remain representable in float32 in both
-supported input units. They are persisted in `info.json` for dequantization.
+supported input units and pass the reader's float32 dequantization checks.
+They are persisted in `info.json` for dequantization.
 Selecting libaom at runtime does not change the license of the linked FFmpeg
 build; distribution must be assessed against its actual enabled dependencies.
 
