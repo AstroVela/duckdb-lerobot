@@ -1,4 +1,6 @@
 build/
+.cache/
 cmake-build-*/
 duckdb_unittest_tempdir/
 __pycache__/
+vcpkg_installed/

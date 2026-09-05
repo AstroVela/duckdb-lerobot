@@ -19,7 +19,8 @@ class FileSystem;
 enum class LerobotRawVisualType : uint8_t { RGB24, DEPTH_UINT16, DEPTH_FLOAT32 };
 
 struct LerobotVideoEncodingConfig {
-	string rgb_codec = "libsvtav1";
+	//! Empty selects the build's default encoder; explicit SQL choices are strict.
+	string rgb_codec;
 	int rgb_crf = 30;
 	int rgb_gop = 2;
 	double depth_min = 0.01;
@@ -46,6 +47,7 @@ struct LerobotVideoEncodeOptions {
 };
 
 struct LerobotEncodedVideoInfo {
+	string encoder;
 	string codec;
 	string pixel_format;
 	double duration = 0;

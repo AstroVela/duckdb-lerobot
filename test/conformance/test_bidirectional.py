@@ -11,7 +11,6 @@ from pathlib import Path
 import numpy as np
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-
 LEROBOT_VERSION = "0.6.1"
 FEATURES = {
     "observation.state": {
@@ -80,8 +79,7 @@ def assert_duckdb_reads_reference(duckdb: Path, extension: Path, root: Path) -> 
     rows = run_duckdb(
         duckdb,
         extension,
-        "SELECT episode_index, frame_index, \"index\" "
-        f"FROM lerobot_scan({root_sql}, episode_indices := [1]);",
+        "SELECT episode_index, frame_index, \"index\" " f"FROM lerobot_scan({root_sql}, episode_indices := [1]);",
     )
     assert rows == [["1", "0", "2"]], rows
 

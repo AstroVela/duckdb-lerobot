@@ -461,12 +461,14 @@ row-group index.
 Image and video input columns contain raw HWC frames as BLOBs. RGB is uint8
 RGB24. A depth feature is marked by `info.is_depth_map` and is either
 little-endian uint16 millimetres or float32 metres, inferred once and enforced
-for the whole dataset. RGB video uses LeRobot's AV1/yuv420p/GOP-2/CRF-30/
-preset-12 defaults. Depth uses the native 12-bit logarithmic quantizer followed
-by lossless HEVC gray12le with closed GOPs. Open GOPs in independently encoded
-short episodes can cause missing frames during PyAV random seeks after concat;
-the visual conformance suite covers that boundary. Per-episode MP4s are
-accumulated and stream-copy concatenated once when their shard closes.
+for the whole dataset. RGB video uses LeRobot's AV1/yuv420p/GOP-2/CRF-30
+contract. Without an explicit `RGB_CODEC`, the build preference applies:
+`auto` prefers SVT-AV1 with preset 12 and falls back to libaom. Explicit SQL
+selections never fall back. Depth uses the native 12-bit logarithmic quantizer
+followed by lossless HEVC gray12le with closed GOPs, requiring libx265. Open GOPs
+in independently encoded short episodes can cause missing frames during PyAV
+random seeks after concat; visual conformance covers that boundary. Per-episode
+MP4s are accumulated and stream-copy concatenated once when their shard closes.
 Consequently each fragment is read
 once and each final shard is written once, while cumulative durations remain
 the episode route boundaries.

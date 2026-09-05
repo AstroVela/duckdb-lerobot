@@ -1,6 +1,6 @@
 # name: test/sql/lerobot_video_frame_budget.test
 # description: Long sparse target clusters are bounded by estimated frame span
-# group: [lerobot]
+# group: [sql]
 
 require-env LEROBOT_FFMPEG_TESTS
 

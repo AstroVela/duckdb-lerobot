@@ -174,8 +174,9 @@ unique_ptr<FunctionData> LerobotTemporalTargetsBind(ClientContext &context, Tabl
 	if (input.input_table_types.size() == 5) {
 		if (std::find(input.input_table_names.begin(), input.input_table_names.end(), "target_id") ==
 		    input.input_table_names.end()) {
-			throw BinderException("lerobot_temporal_targets input relation must contain exactly request_id, episode_index, "
-			                      "frame_index, and delta_index, with an optional target_id");
+			throw BinderException(
+			    "lerobot_temporal_targets input relation must contain exactly request_id, episode_index, "
+			    "frame_index, and delta_index, with an optional target_id");
 		}
 		input_columns.push_back(FindInputColumn(input, "target_id"));
 	}

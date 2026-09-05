@@ -1,6 +1,6 @@
 # name: test/sql/lerobot_copy_options.test
 # description: COPY validates quantizer and integer options before staging, with or without FFmpeg
-# group: [lerobot]
+# group: [sql]
 
 require parquet
 

@@ -1887,7 +1887,8 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 		}
 		auto &encoded_info = encoded_video_info[feature_index];
 		if (!encoded_info.codec.empty() &&
-		    (encoded_info.codec != result.encoded.codec || encoded_info.pixel_format != result.encoded.pixel_format)) {
+		    (encoded_info.encoder != result.encoded.encoder || encoded_info.codec != result.encoded.codec ||
+		     encoded_info.pixel_format != result.encoded.pixel_format)) {
 			throw IOException("LeRobot encoder changed the stream format between episodes");
 		}
 		encoded_info = result.encoded;
@@ -2264,7 +2265,7 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 			// Empty RGB datasets have no encoder result to report.
 			return string();
 		}
-		const auto is_svt = bind.encoding.rgb_codec == "libsvtav1";
+		const auto is_svt = encoded.encoder == "libsvtav1";
 		string result =
 		    "{\"video.height\":" + std::to_string(feature.shape[0]) +
 		    ",\"video.width\":" + std::to_string(feature.shape[1]) + ",\"video.codec\":" + JsonEscape(encoded.codec) +

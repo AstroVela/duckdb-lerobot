@@ -329,6 +329,10 @@ Video features use LeRobot's current defaults: AV1/yuv420p for RGB and
 lossless HEVC/gray12le after 12-bit logarithmic quantization for depth. Depth
 uses closed GOPs so independently encoded episodes remain seekable after
 concatenation. The writer records the encoder's returned codec and pixel format.
+When `RGB_CODEC` is omitted, the build's AV1 encoder preference applies; the
+`auto` build prefers SVT-AV1 and falls back to libaom. An explicit `RGB_CODEC`
+selects that encoder without fallback. Depth-video writing requires an FFmpeg
+build with libx265; the default vcpkg feature set omits that dependency.
 Episode fragments are retained until a video shard closes and then
 stream-copy concatenated once. Episode metadata records the resulting
 `[from_timestamp, to_timestamp)` routes without repeatedly rewriting a growing
@@ -372,13 +376,14 @@ one-channel shape, and `gray12le` pixel format; no defaults or legacy markers ar
 inferred.
 
 The destination must be a new local path. There is intentionally no append,
-overwrite, legacy-layout inference, or codec fallback in this strict writer.
+overwrite, legacy-layout inference, or output-codec substitution in this strict
+writer.
 
 The following encoding options are independent of worker budgets:
 
 | COPY option | Default | Contract |
 | --- | --- | --- |
-| `RGB_CODEC` | `'libsvtav1'` | `'libsvtav1'` or `'libaom-av1'`; RGB AV1/yuv420p only; no automatic fallback |
+| `RGB_CODEC` | Build preference (`auto`: SVT-AV1, then libaom) | Explicit `'libsvtav1'` or `'libaom-av1'`; RGB AV1/yuv420p only; explicit selections never fall back |
 | `RGB_CRF` | `30` | Integer 0–63 |
 | `RGB_GOP` | `2` | Positive 32-bit integer |
 | `DEPTH_MIN`, `DEPTH_MAX` | `0.01`, `10` | Finite metres, `0 <= min < max` |
@@ -453,28 +458,56 @@ format, query-planning, and video-alignment invariants.
 
 ## Build
 
-Initialize the DuckDB submodule, then build a loadable extension and a DuckDB
-shell with the extension preloaded:
+Initialize both pinned submodules, then use the same build targets as DuckDB's
+official extension template:
 
 ```bash
 git submodule update --init --recursive
-make
+make release
+make test
 ```
 
-The metadata and Parquet functions can be built without FFmpeg by explicitly
-setting `LEROBOT_ENABLE_FFMPEG=OFF`. Native visual writing and video decoding
-are enabled by default, and configuration fails unless `pkg-config` can find
-`libavformat`, `libavcodec`, `libavutil`, and `libswscale`; on Debian/Ubuntu the
-corresponding development packages can be installed with:
+For reproducible distribution builds, pass a vcpkg toolchain. The default
+manifest enables FFmpeg, dav1d, libaom, and zlib (required by the PNG encoder)
+without GPL codecs. Ninja and, on x86/x64, NASM must be available on `PATH`:
+
+```bash
+make release GEN=ninja \
+  VCPKG_TOOLCHAIN_PATH=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+```
+
+To opt into lossless HEVC depth-video writing, explicitly enable the
+`gpl-codecs` manifest feature. Binaries produced this way include GPL-enabled
+FFmpeg and a Main12 x265 build, and must be distributed under compatible terms:
+
+```bash
+make release GEN=ninja \
+  VCPKG_TOOLCHAIN_PATH=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake \
+  EXT_FLAGS="-DVCPKG_MANIFEST_FEATURES=gpl-codecs"
+```
+
+Selecting this feature does not rewrite the licence of the extension source.
+It does change the obligations for the linked artifact: the default static
+FFmpeg build remains LGPL, while the x265-enabled artifact must be treated as a
+GPL-covered combined work. Before publishing either binary, package the
+applicable licence notices, source/relink materials, and other items from
+[FFmpeg's compliance checklist](https://ffmpeg.org/legal.html).
+
+Development builds may instead use system libraries. Native visual writing and
+video decoding are enabled by default, and configuration fails unless
+`pkg-config` can find `libavformat`, `libavcodec`, `libavutil`, and
+`libswscale`; on Debian/Ubuntu:
 
 ```bash
 sudo apt-get install pkg-config libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
 ```
 
-Use `-DLEROBOT_ENABLE_FFMPEG=OFF` for a metadata-only build. Run the deterministic
-H.264 decode test explicitly with:
+Use `EXT_FLAGS="-DLEROBOT_ENABLE_FFMPEG=OFF"` for an intentional metadata-only
+build. The complete visual suite additionally requires FFmpeg with libaom,
+SVT-AV1, and x265:
 
 ```bash
+make release
 LEROBOT_FFMPEG_TESTS=1 make test
 ```
 
@@ -488,10 +521,9 @@ reproduced locally without replacing the project's standard configure command,
 for example:
 
 ```bash
-LEROBOT_FFMPEG_TESTS=1 make test \
-  BUILD_DIR=build/sanitize \
-  BUILD_TYPE=RelWithDebInfo \
-  EXTRA_CMAKE_ARGS="-DLEROBOT_ENABLE_FFMPEG=ON -DFORCE_ASSERT=ON -DENABLE_SANITIZER=ON -DENABLE_UBSAN=ON"
+make reldebug GEN=ninja \
+  EXT_FLAGS="-DLEROBOT_ENABLE_FFMPEG=ON -DFORCE_ASSERT=ON -DENABLE_SANITIZER=ON -DENABLE_UBSAN=ON"
+LEROBOT_FFMPEG_TESTS=1 make test_reldebug
 ```
 
 FFmpeg support is fail-closed: configuring with its default

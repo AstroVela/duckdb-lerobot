@@ -1,0 +1,105 @@
+# name: test/sql/lerobot_portable_ffmpeg.test
+# description: The portable non-GPL FFmpeg build writes PNG and AV1 but rejects depth encoding
+# group: [sql]
+
+require-env LEROBOT_NON_GPL_FFMPEG_TESTS
+
+require parquet
+
+require json
+
+require lerobot
+
+statement ok
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'portable RGB'::VARCHAR AS task,
+           from_hex(repeat(CASE WHEN frame_index = 0 THEN '14283c' ELSE '1e2d3f' END, 4096))
+               AS "observation.images.front",
+           from_hex(repeat(CASE WHEN frame_index = 0 THEN '14283c' ELSE '1e2d3f' END, 4096))
+               AS "observation.images.still"
+    FROM range(2) frames(frame_index)
+    ORDER BY frame_index
+) TO '{TEST_DIR}/lerobot_portable_ffmpeg' (
+    FORMAT lerobot,
+    FPS 10,
+    FEATURES '{"observation.images.front":{"dtype":"video","shape":[64,64,3],"names":["height","width","channels"]},"observation.images.still":{"dtype":"image","shape":[64,64,3],"names":["height","width","channels"]}}',
+    ENCODER_THREADS 1
+);
+
+query II
+SELECT count(*), min(size) > 0
+FROM read_blob('{TEST_DIR}/lerobot_portable_ffmpeg/videos/**/*.mp4');
+----
+1	true
+
+query III
+SELECT count(*), min(channels), min(octet_length(image))
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_portable_ffmpeg', [0],
+    video_keys := ['observation.images.front'], frame_indices := [0, 1]
+);
+----
+2	3	12288
+
+query II
+SELECT count(*),
+       min(left(hex(("observation.images.still").bytes), 16) = '89504E470D0A1A0A')
+FROM lerobot_scan('{TEST_DIR}/lerobot_portable_ffmpeg');
+----
+2	true
+
+query III
+SELECT contains(content, '"video.codec":"av1"'),
+       contains(content, '"video.pix_fmt":"yuv420p"'),
+       contains(content, '"video.g":2')
+FROM read_text('{TEST_DIR}/lerobot_portable_ffmpeg/meta/info.json');
+----
+true	true	true
+
+# Encoder metadata must reflect the libaom fallback when RGB_CODEC is omitted.
+query TTT
+SELECT json_extract_string(features, '$."observation.images.front".info."video.preset"') IS NULL,
+       json_extract_string(features, '$."observation.images.front".info."video.extra_options"."cpu-used"'),
+       json_extract_string(features, '$."observation.images.front".info."video.extra_options".b')
+FROM lerobot_info('{TEST_DIR}/lerobot_portable_ffmpeg');
+----
+true	8	0
+
+# An explicit SQL codec choice must not fall back to another encoder.
+statement error
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'explicit SVT'::VARCHAR AS task,
+           from_hex(repeat('14283c', 4096)) AS rgb
+) TO '{TEST_DIR}/lerobot_portable_svt_failed' (
+    FORMAT lerobot, FPS 10,
+    FEATURES '{"rgb":{"dtype":"video","shape":[64,64,3]}}',
+    RGB_CODEC 'libsvtav1', ENCODER_THREADS 1
+);
+----
+no libsvtav1 encoder required by FORMAT lerobot
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/lerobot_portable_svt_failed*');
+----
+0
+
+# The distribution manifest intentionally excludes x265 and therefore cannot
+# write the GPL-backed, lossless Main12 depth representation.
+statement error
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'portable depth'::VARCHAR AS task,
+           from_hex(repeat('d007', 4096)) AS "observation.images.depth"
+) TO '{TEST_DIR}/lerobot_portable_depth_failed' (
+    FORMAT lerobot,
+    FPS 10,
+    FEATURES '{"observation.images.depth":{"dtype":"video","shape":[64,64,1],"names":["height","width","channels"],"info":{"is_depth_map":true}}}',
+    ENCODER_THREADS 1
+);
+----
+no libx265 encoder required by FORMAT lerobot
+
+query I
+SELECT count(*)
+FROM glob('{TEST_DIR}/lerobot_portable_depth_failed*');
+----
+0

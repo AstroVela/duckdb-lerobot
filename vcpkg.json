@@ -1,0 +1,47 @@
+{
+  "vcpkg-configuration": {
+    "overlay-ports": [
+      "./vcpkg_ports",
+      "./extension-ci-tools/vcpkg_ports"
+    ]
+  },
+  "name": "duckdb-lerobot",
+  "version-string": "0.1.0",
+  "description": "DuckDB extension for native LeRobot datasets",
+  "builtin-baseline": "84bab45d415d22042bd0b9081aea57f362da3f35",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": [
+        "aom",
+        "avcodec",
+        "avformat",
+        "dav1d",
+        "swscale",
+        "zlib"
+      ]
+    }
+  ],
+  "features": {
+    "gpl-codecs": {
+      "description": "Enable GPL codecs required for lossless HEVC depth-video writing",
+      "dependencies": [
+        {
+          "name": "ffmpeg",
+          "default-features": false,
+          "features": [
+            "x265"
+          ]
+        },
+        {
+          "name": "x265",
+          "default-features": false,
+          "features": [
+            "main12"
+          ]
+        }
+      ]
+    }
+  }
+}

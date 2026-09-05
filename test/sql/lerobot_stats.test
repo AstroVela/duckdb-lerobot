@@ -1,6 +1,6 @@
 # name: test/sql/lerobot_stats.test
 # description: Dataset statistics retain heterogeneous JSON shapes and exact extrema
-# group: [lerobot]
+# group: [sql]
 
 require parquet
 

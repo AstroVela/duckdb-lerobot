@@ -1,6 +1,6 @@
 # name: test/sql/lerobot_copy.test
 # description: Native COPY writes a strict LeRobot v3 dataset and publishes metadata last
-# group: [lerobot]
+# group: [sql]
 
 require parquet
 

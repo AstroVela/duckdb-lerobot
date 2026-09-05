@@ -1,6 +1,6 @@
 # name: test/sql/lerobot_video_frames.test
 # description: Shard-aware native FFmpeg decode aligns LeRobot frame timestamps
-# group: [lerobot]
+# group: [sql]
 
 require-env LEROBOT_FFMPEG_TESTS
 

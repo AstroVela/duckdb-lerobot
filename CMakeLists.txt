@@ -17,3 +17,11 @@ if(NOT COMMAND build_loadable_extension)
 endif()
 
 add_subdirectory(src)
+
+# Keep the loadable artifact at DuckDB's standard extension path even though
+# the target itself is organized in the src subdirectory. The distribution
+# workflow uploads build/<config>/extension/lerobot/lerobot.duckdb_extension.
+set_target_properties(
+    lerobot_loadable_extension
+    PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+               RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
