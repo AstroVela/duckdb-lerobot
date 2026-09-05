@@ -6,7 +6,8 @@ readonly NASM_VERSION="2.16.03"
 readonly NASM_SHA256="5bc940dd8a4245686976a8f7e96ba9340a0915f2d5b88356874890e207bdb581"
 readonly NASM_ARCHIVE="${RUNNER_TEMP:?RUNNER_TEMP must be set}/nasm-${NASM_VERSION}.tar.gz"
 readonly NASM_SOURCE_DIR="${RUNNER_TEMP}/nasm-${NASM_VERSION}"
-readonly NASM_INSTALL_DIR="${RUNNER_TEMP}/nasm-${NASM_VERSION}-install"
+# Keep this path aligned with the PATH exported by the top-level Makefile.
+readonly NASM_INSTALL_DIR="${RUNNER_TEMP}/lerobot-nasm"
 
 curl --fail --location --silent --show-error \
     --output "${NASM_ARCHIVE}" \
