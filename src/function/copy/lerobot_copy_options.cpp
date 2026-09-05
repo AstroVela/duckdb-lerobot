@@ -78,6 +78,53 @@ void ParseLerobotCopyOptionalConfig(ClientContext &context, const CopyFunctionBi
 	const auto host_threads = MaxValue<idx_t>(1, context.db->NumberOfThreads());
 	result.video_workers = MinValue(LEROBOT_DEFAULT_VIDEO_WORKERS, host_threads);
 	result.encoder_threads = MinValue(LEROBOT_DEFAULT_ENCODER_THREADS, host_threads);
+
+	auto &encoding = result.encoding;
+	auto codec = GetSingleOption(input, "rgb_codec", false);
+	if (!codec.IsNull()) {
+		encoding.rgb_codec = StringValue::Get(codec.DefaultCastAs(LogicalType::VARCHAR));
+	}
+	if (encoding.rgb_codec != "libsvtav1" && encoding.rgb_codec != "libaom-av1") {
+		throw BinderException("LeRobot RGB_CODEC must be 'libsvtav1' or 'libaom-av1'");
+	}
+	auto crf = GetNumericOption<double>(input, "rgb_crf", 30);
+	auto gop = GetNumericOption<double>(input, "rgb_gop", 2);
+	if (!std::isfinite(crf) || crf < 0 || crf > 63 || std::floor(crf) != crf) {
+		throw BinderException("LeRobot RGB_CRF must be an integer between 0 and 63");
+	}
+	if (!std::isfinite(gop) || gop < 1 || gop > NumericLimits<int>::Maximum() || std::floor(gop) != gop) {
+		throw BinderException("LeRobot RGB_GOP must be a positive 32-bit integer");
+	}
+	encoding.rgb_crf = static_cast<int>(crf);
+	encoding.rgb_gop = static_cast<int>(gop);
+	encoding.depth_min = GetNumericOption<double>(input, "depth_min", 0.01);
+	encoding.depth_max = GetNumericOption<double>(input, "depth_max", 10);
+	encoding.depth_shift = GetNumericOption<double>(input, "depth_shift", 3.5);
+	auto use_log = GetSingleOption(input, "depth_use_log", false);
+	auto clip = GetSingleOption(input, "depth_clip", false);
+	if (!use_log.IsNull()) {
+		encoding.depth_use_log = use_log.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+	}
+	if (!clip.IsNull()) {
+		encoding.depth_clip = clip.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+	}
+	if (!std::isfinite(encoding.depth_min) || !std::isfinite(encoding.depth_max) ||
+	    !std::isfinite(encoding.depth_shift) || encoding.depth_min < 0 || encoding.depth_max <= encoding.depth_min ||
+	    (encoding.depth_use_log && encoding.depth_min + encoding.depth_shift <= 0)) {
+		throw BinderException("LeRobot depth parameters require finite 0 <= DEPTH_MIN < DEPTH_MAX and, for log "
+		                      "quantization, DEPTH_MIN + DEPTH_SHIFT > 0");
+	}
+	// Both accepted input units use float32 arithmetic, matching LeRobot.
+	for (const auto scale : {1.0, 1000.0}) {
+		const auto low = static_cast<float>(encoding.depth_min * scale);
+		const auto high = static_cast<float>(encoding.depth_max * scale);
+		const auto shift = static_cast<float>(encoding.depth_shift * scale);
+		if (!std::isfinite(low) || !std::isfinite(high) || !std::isfinite(shift) || !(high > low) ||
+		    (encoding.depth_use_log &&
+		     (!(low + shift > 0) || !std::isfinite(high + shift) || !(high + shift > low + shift)))) {
+			throw BinderException("LeRobot depth parameters are not representable in float32 metres and millimetres");
+		}
+	}
 	auto chunks_size = GetNumericOption<double>(input, "chunks_size", LEROBOT_DEFAULT_CHUNK_SIZE);
 	auto metadata_buffer_size =
 	    GetNumericOption<double>(input, "metadata_buffer_size", LEROBOT_DEFAULT_METADATA_BUFFER_SIZE);
@@ -150,6 +197,14 @@ void LerobotCopyOptionDefinitions(ClientContext &, CopyOptionsInput &input) {
 	input.options["max_visual_frame_bytes"] = CopyOption(LogicalType::UBIGINT, CopyOptionMode::WRITE_ONLY);
 	input.options["video_workers"] = CopyOption(LogicalType::UBIGINT, CopyOptionMode::WRITE_ONLY);
 	input.options["encoder_threads"] = CopyOption(LogicalType::UBIGINT, CopyOptionMode::WRITE_ONLY);
+	input.options["rgb_codec"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::WRITE_ONLY);
+	input.options["rgb_crf"] = CopyOption(LogicalType::BIGINT, CopyOptionMode::WRITE_ONLY);
+	input.options["rgb_gop"] = CopyOption(LogicalType::BIGINT, CopyOptionMode::WRITE_ONLY);
+	input.options["depth_min"] = CopyOption(LogicalType::DOUBLE, CopyOptionMode::WRITE_ONLY);
+	input.options["depth_max"] = CopyOption(LogicalType::DOUBLE, CopyOptionMode::WRITE_ONLY);
+	input.options["depth_shift"] = CopyOption(LogicalType::DOUBLE, CopyOptionMode::WRITE_ONLY);
+	input.options["depth_use_log"] = CopyOption(LogicalType::BOOLEAN, CopyOptionMode::WRITE_ONLY);
+	input.options["depth_clip"] = CopyOption(LogicalType::BOOLEAN, CopyOptionMode::WRITE_ONLY);
 }
 
 } // namespace duckdb

@@ -7,6 +7,7 @@ vector<TableFunctionSet> LerobotFunctions::GetTableFunctions() {
 	functions.push_back(GetInfoFunction());
 	functions.push_back(GetEpisodesFunction());
 	functions.push_back(GetTasksFunction());
+	functions.push_back(GetStatsFunction());
 	functions.push_back(GetScanFunction());
 	functions.push_back(GetCacheInfoFunction());
 	functions.push_back(GetVideoRoutesFunction());

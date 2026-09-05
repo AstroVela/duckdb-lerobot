@@ -15,6 +15,7 @@ extern "C" {
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 }
 #endif
@@ -145,33 +146,41 @@ uint16_t LoadUInt16(const char *source) {
 	return result;
 }
 
-uint16_t QuantizeDepth(float depth, bool millimeters) {
-	static const float DEPTH_MIN_METERS = 0.01f;
-	static const float DEPTH_MAX_METERS = 10.0f;
-	static const float DEPTH_SHIFT_METERS = 3.5f;
+uint16_t QuantizeDepth(float depth, bool millimeters, const LerobotVideoEncodingConfig &options) {
 	static const float QMAX = 4095.0f;
-	const auto unit_scale = millimeters ? 1000.0f : 1.0f;
-	const auto depth_min = DEPTH_MIN_METERS * unit_scale;
-	const auto depth_max = DEPTH_MAX_METERS * unit_scale;
-	const auto shift = DEPTH_SHIFT_METERS * unit_scale;
-	const auto log_min_double = std::log(static_cast<double>(depth_min + shift));
-	const auto log_max_double = std::log(static_cast<double>(depth_max + shift));
-	const auto shifted = depth + shift;
-	if (!std::isfinite(depth) || !(shifted > 0)) {
-		throw InvalidInputException("LeRobot depth frames require finite values greater than -3.5 metres");
+	const auto unit_scale = millimeters ? 1000.0 : 1.0;
+	const auto depth_min = static_cast<float>(options.depth_min * unit_scale);
+	const auto depth_max = static_cast<float>(options.depth_max * unit_scale);
+	const auto shift = static_cast<float>(options.depth_shift * unit_scale);
+	if (!std::isfinite(depth)) {
+		throw InvalidInputException("LeRobot depth frames require finite values");
+	}
+	if (!options.depth_clip && (depth < depth_min || depth > depth_max)) {
+		throw InvalidInputException("LeRobot depth value is outside DEPTH_MIN/DEPTH_MAX with DEPTH_CLIP=false");
+	}
+	if (options.depth_use_log && !(depth + shift > 0)) {
+		throw InvalidInputException("LeRobot logarithmic depth values require depth + DEPTH_SHIFT > 0");
 	}
 	// The native implementation intentionally performs its ndarray math in
 	// float32. Python's scalar log bounds are cast back to the array dtype by
 	// NumPy 2.x's weak-scalar promotion rules.
-	const auto log_value = static_cast<float>(std::log(static_cast<double>(shifted)));
-	const auto log_min = static_cast<float>(log_min_double);
-	const auto log_range = static_cast<float>(log_max_double - log_min_double);
-	const auto normalized = static_cast<float>((log_value - log_min) / log_range);
+	float normalized;
+	if (options.depth_use_log) {
+		const auto log_min_double = std::log(static_cast<double>(depth_min + shift));
+		const auto log_max_double = std::log(static_cast<double>(depth_max + shift));
+		const auto log_value = static_cast<float>(std::log(static_cast<double>(depth + shift)));
+		const auto log_min = static_cast<float>(log_min_double);
+		const auto log_range = static_cast<float>(log_max_double - log_min_double);
+		normalized = static_cast<float>((log_value - log_min) / log_range);
+	} else {
+		normalized = (depth - depth_min) / (depth_max - depth_min);
+	}
 	const auto clipped = MaxValue(0.0f, MinValue(1.0f, normalized));
 	return static_cast<uint16_t>(std::nearbyint(clipped * QMAX));
 }
 
-void FillDepthFrame(const string &raw, LerobotRawVisualType raw_type, idx_t width, idx_t height, AVFrame &frame) {
+void FillDepthFrame(const string &raw, LerobotRawVisualType raw_type, idx_t width, idx_t height, AVFrame &frame,
+                    const LerobotVideoEncodingConfig &options) {
 	for (idx_t y = 0; y < height; y++) {
 		auto target = reinterpret_cast<uint16_t *>(frame.data[0] + y * frame.linesize[0]);
 		for (idx_t x = 0; x < width; x++) {
@@ -185,7 +194,7 @@ void FillDepthFrame(const string &raw, LerobotRawVisualType raw_type, idx_t widt
 				value = LoadFloat32(raw.data() + index * sizeof(float));
 				millimeters = false;
 			}
-			target[x] = QuantizeDepth(value, millimeters);
+			target[x] = QuantizeDepth(value, millimeters, options);
 		}
 	}
 }
@@ -365,11 +374,11 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 	}
 
 	const auto is_depth = options.raw_type != LerobotRawVisualType::RGB24;
-	const AVCodec *codec =
-	    is_depth ? avcodec_find_encoder_by_name("libx265") : avcodec_find_encoder_by_name("libsvtav1");
+	const auto codec_name = is_depth ? "libx265" : options.encoding.rgb_codec.c_str();
+	const auto is_svt = !is_depth && options.encoding.rgb_codec == "libsvtav1";
+	const AVCodec *codec = avcodec_find_encoder_by_name(codec_name);
 	if (!codec) {
-		throw MissingExtensionException("FFmpeg has no %s encoder required by FORMAT lerobot",
-		                                is_depth ? "libx265" : "libsvtav1");
+		throw MissingExtensionException("FFmpeg has no %s encoder required by FORMAT lerobot", codec_name);
 	}
 
 	AVFormatContext *raw_output = nullptr;
@@ -383,7 +392,7 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 	if (!stream) {
 		throw OutOfMemoryException("Failed to allocate a LeRobot MP4 stream");
 	}
-	CodecContextPtr codec_context(avcodec_alloc_context3(codec), AVCodecContextDeleter(!is_depth));
+	CodecContextPtr codec_context(avcodec_alloc_context3(codec), AVCodecContextDeleter(is_svt));
 	if (!codec_context) {
 		throw OutOfMemoryException("Failed to allocate a LeRobot video encoder");
 	}
@@ -394,29 +403,37 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 	codec_context->pix_fmt = is_depth ? AV_PIX_FMT_GRAY12LE : AV_PIX_FMT_YUV420P;
 	codec_context->time_base = AVRational {1, NumericCast<int>(options.fps)};
 	codec_context->framerate = AVRational {NumericCast<int>(options.fps), 1};
-	codec_context->gop_size = 2;
+	codec_context->gop_size = is_depth ? 2 : options.encoding.rgb_gop;
+	if (options.encoder_threads.IsValid()) {
+		codec_context->thread_count = NumericCast<int>(options.encoder_threads.GetIndex());
+	}
 	if (output->oformat->flags & AVFMT_GLOBALHEADER) {
 		codec_context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 	}
 
 	AVDictionary *raw_codec_options = nullptr;
-	av_dict_set(&raw_codec_options, "g", "2", 0);
-	av_dict_set(&raw_codec_options, "crf", "30", 0);
+	av_dict_set(&raw_codec_options, "g", std::to_string(codec_context->gop_size).c_str(), 0);
+	av_dict_set(&raw_codec_options, "crf", std::to_string(is_depth ? 30 : options.encoding.rgb_crf).c_str(), 0);
 	if (is_depth) {
-		string x265_parameters = "lossless=1";
+		// Each episode is encoded independently then stream-concatenated. Closed
+		// GOPs keep keyframe seeks independently decodable at episode boundaries.
+		string x265_parameters = "lossless=1:open-gop=0";
 		if (options.encoder_threads.IsValid()) {
 			const auto encoder_threads = options.encoder_threads.GetIndex();
 			x265_parameters += encoder_threads == 1 ? ":pools=none" : ":pools=" + std::to_string(encoder_threads - 1);
 			x265_parameters += ":frame-threads=1";
 		}
 		av_dict_set(&raw_codec_options, "x265-params", x265_parameters.c_str(), 0);
-	} else {
+	} else if (is_svt) {
 		av_dict_set(&raw_codec_options, "preset", "12", 0);
 		string svt_parameters = "fast-decode=0";
 		if (options.encoder_threads.IsValid()) {
 			svt_parameters += ":lp=" + std::to_string(options.encoder_threads.GetIndex());
 		}
 		av_dict_set(&raw_codec_options, "svtav1-params", svt_parameters.c_str(), 0);
+	} else {
+		av_dict_set(&raw_codec_options, "cpu-used", "8", 0);
+		av_dict_set(&raw_codec_options, "b", "0", 0);
 	}
 	struct DictionaryGuard {
 		explicit DictionaryGuard(AVDictionary *&dictionary_p) : dictionary(dictionary_p) {
@@ -426,7 +443,7 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 		}
 		AVDictionary *&dictionary;
 	} codec_options_guard(raw_codec_options);
-	if (is_depth) {
+	if (!is_svt) {
 		ThrowOnFFmpegError(avcodec_open2(codec_context.get(), codec, &raw_codec_options), "open the encoder for", path);
 	} else {
 		lock_guard<mutex> guard(SVTAV1LifecycleLock());
@@ -473,7 +490,7 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 		raw_frames->Read(&raw_frame[0], expected_size, frame_index * expected_size);
 		ThrowOnFFmpegError(av_frame_make_writable(target_frame.get()), "make an encoder frame writable for", path);
 		if (is_depth) {
-			FillDepthFrame(raw_frame, options.raw_type, options.width, options.height, *target_frame);
+			FillDepthFrame(raw_frame, options.raw_type, options.width, options.height, *target_frame, options.encoding);
 		} else {
 			const uint8_t *source_data[] = {reinterpret_cast<const uint8_t *>(raw_frame.data()), nullptr, nullptr,
 			                                nullptr};
@@ -496,8 +513,12 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 	ThrowOnFFmpegError(av_write_trailer(output.get()), "write the MP4 trailer for", path);
 
 	LerobotEncodedVideoInfo result;
-	result.codec = is_depth ? "hevc" : "av1";
-	result.pixel_format = is_depth ? "gray12le" : "yuv420p";
+	result.codec = avcodec_get_name(stream->codecpar->codec_id);
+	const auto pixel_format = av_get_pix_fmt_name(static_cast<AVPixelFormat>(stream->codecpar->format));
+	if (!pixel_format) {
+		throw IOException("LeRobot encoder returned an unknown pixel format");
+	}
+	result.pixel_format = pixel_format;
 	result.duration = static_cast<double>(frame_count) / static_cast<double>(options.fps);
 	result.frame_count = frame_count;
 	return result;

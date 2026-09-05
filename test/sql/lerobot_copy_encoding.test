@@ -1,0 +1,86 @@
+# name: test/sql/lerobot_copy_encoding.test
+# description: Depth quantizers, strict range checks and bounded RGB codec options
+# group: [lerobot]
+
+require-env LEROBOT_FFMPEG_TESTS
+
+require parquet
+
+require json
+
+require lerobot
+
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, 'depth' AS task,
+             from_hex(repeat('2823', 4096)) AS depth)
+TO '{TEST_DIR}/lerobot_depth_linear_clip' (FORMAT lerobot, FPS 10,
+FEATURES '{"depth":{"dtype":"video","shape":[64,64,1],"info":{"is_depth_map":true}}}',
+DEPTH_MIN 1.0, DEPTH_MAX 5.0, DEPTH_SHIFT 0.0, DEPTH_USE_LOG false, ENCODER_THREADS 1);
+
+# A 9000 mm input is clipped to the configured 5 metre maximum.
+query I
+SELECT image = from_hex(repeat('0000a040', 4096))
+FROM lerobot_video_frames('{TEST_DIR}/lerobot_depth_linear_clip', [0], depth_output_unit := 'm');
+----
+true
+
+query TTTT
+SELECT json_extract_string(features, '$.depth.info."video.depth_min"'),
+       json_extract_string(features, '$.depth.info."video.depth_max"'),
+       json_extract_string(features, '$.depth.info."video.shift"'),
+       json_extract_string(features, '$.depth.info."video.use_log"')
+FROM lerobot_info('{TEST_DIR}/lerobot_depth_linear_clip');
+----
+1	5	0	false
+
+statement error
+COPY (SELECT 0::BIGINT AS episode_index, 'depth' AS task,
+             from_hex(repeat('2823', 4096)) AS depth)
+TO '{TEST_DIR}/lerobot_depth_strict' (FORMAT lerobot, FPS 10,
+FEATURES '{"depth":{"dtype":"video","shape":[64,64,1],"info":{"is_depth_map":true}}}',
+DEPTH_MIN 1.0, DEPTH_MAX 5.0, DEPTH_USE_LOG false, DEPTH_CLIP false, ENCODER_THREADS 1);
+----
+outside DEPTH_MIN/DEPTH_MAX
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/lerobot_depth_strict*/meta/info.json');
+----
+0
+
+# Range errors are recoverable and do not invalidate the database.
+query I
+SELECT 42;
+----
+42
+
+foreach option DEPTH_MIN DEPTH_MAX DEPTH_SHIFT
+
+statement error
+COPY (SELECT 0::BIGINT AS episode_index, 'depth' AS task, 1::FLOAT AS state)
+TO '{TEST_DIR}/lerobot_bad_quantizer' (FORMAT lerobot, FPS 10,
+FEATURES '{"state":{"dtype":"float32","shape":[1]}}', ${option} 'NaN');
+----
+depth parameters require finite
+
+endloop
+
+statement error
+COPY (SELECT 0::BIGINT AS episode_index, 'depth' AS task, 1::FLOAT AS state)
+TO '{TEST_DIR}/lerobot_bad_codec' (FORMAT lerobot, FPS 10,
+FEATURES '{"state":{"dtype":"float32","shape":[1]}}', RGB_CODEC 'libx265');
+----
+RGB_CODEC must be
+
+statement error
+COPY (SELECT 0::BIGINT AS episode_index, 'depth' AS task, 1::FLOAT AS state)
+TO '{TEST_DIR}/lerobot_bad_crf' (FORMAT lerobot, FPS 10,
+FEATURES '{"state":{"dtype":"float32","shape":[1]}}', RGB_CRF 64);
+----
+RGB_CRF must be
+
+statement error
+COPY (SELECT 0::BIGINT AS episode_index, 'depth' AS task, 1::FLOAT AS state)
+TO '{TEST_DIR}/lerobot_bad_gop' (FORMAT lerobot, FPS 10,
+FEATURES '{"state":{"dtype":"float32","shape":[1]}}', RGB_GOP 0);
+----
+RGB_GOP must be

@@ -210,7 +210,8 @@ struct LerobotCodecExecutor::Impl {
 		}
 		const auto host_thread_budget = MaxValue<idx_t>(1, context.db->NumberOfThreads());
 		if (max_workers == 0 || codec_thread_budget == 0 || codec_thread_budget > host_thread_budget) {
-			throw InternalException("Invalid LeRobot codec executor budget");
+			throw InvalidInputException("LeRobot codec executor budget exceeds the current DuckDB thread limit; "
+			                            "rebind COPY after changing threads");
 		}
 		max_workers = MinValue(max_workers, jobs.size());
 		max_workers = MinValue(max_workers, codec_thread_budget);

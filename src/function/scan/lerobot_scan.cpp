@@ -1,6 +1,8 @@
 #include "function/lerobot_functions.hpp"
 
 #include "compat/lerobot_bind_replace.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
@@ -104,6 +106,40 @@ unique_ptr<TableRef> LerobotTasksBindReplace(ClientContext &context, TableFuncti
 		                                         {LogicalType::BIGINT, LogicalType::VARCHAR});
 	}
 	return LerobotCreateTableFunctionRef("read_parquet", Value(root + LEROBOT_TASKS_SUFFIX));
+}
+
+unique_ptr<TableRef> LerobotStatsBindReplace(ClientContext &context, TableFunctionBindInput &input) {
+	auto root = GetRoot(input, "lerobot_stats");
+	MaybeInvalidateCaches(context, root, input);
+	auto info = ReadLerobotDatasetInfo(context, root);
+	if (info.total_episodes == 0) {
+		return LerobotCreateEmptyParquetRelation(context, {"feature", "stats"},
+		                                         {LogicalType::VARCHAR, LogicalType::JSON()});
+	}
+	// Preserve heterogeneous feature shapes and exact integer JSON values.
+	// Native readers own file access, parsing, and execution; no nested Connection.
+	auto source = LerobotCreateTableFunctionRef("read_json_objects", Value(root + "/meta/stats.json"));
+	source->alias = "document";
+	vector<unique_ptr<ParsedExpression>> arguments;
+	arguments.push_back(make_uniq<ColumnRefExpression>("json", "document"));
+	auto entries = make_uniq<TableFunctionRef>();
+	entries->function = make_uniq<FunctionExpression>("json_each", std::move(arguments));
+	entries->alias = "entry";
+	auto join = make_uniq<JoinRef>();
+	join->ref_type = JoinRefType::CROSS;
+	join->left = std::move(source);
+	join->right = std::move(entries);
+	auto select = make_uniq<SelectNode>();
+	auto feature = make_uniq<ColumnRefExpression>("key", "entry");
+	feature->SetAlias("feature");
+	select->select_list.push_back(std::move(feature));
+	auto stats = make_uniq<ColumnRefExpression>("value", "entry");
+	stats->SetAlias("stats");
+	select->select_list.push_back(std::move(stats));
+	select->from_table = std::move(join);
+	auto statement = make_uniq<SelectStatement>();
+	statement->node = std::move(select);
+	return make_uniq<SubqueryRef>(std::move(statement));
 }
 
 unique_ptr<TableRef> CreateFilteredFrameScan(vector<string> paths, const named_parameter_map_t &parameters,
@@ -333,6 +369,10 @@ TableFunctionSet LerobotFunctions::GetEpisodesFunction() {
 
 TableFunctionSet LerobotFunctions::GetTasksFunction() {
 	return TableFunctionSet(CreateBindReplaceFunction("lerobot_tasks", LerobotTasksBindReplace));
+}
+
+TableFunctionSet LerobotFunctions::GetStatsFunction() {
+	return TableFunctionSet(CreateBindReplaceFunction("lerobot_stats", LerobotStatsBindReplace));
 }
 
 TableFunctionSet LerobotFunctions::GetScanFunction() {

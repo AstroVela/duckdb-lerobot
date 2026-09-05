@@ -235,3 +235,11 @@ the benchmark data justifies added complexity:
   1.5x on representative codecs and resolutions.
 - Treat pixel mismatches as correctness failures before interpreting timings.
   The `compare` command exits non-zero when shapes or SHA-256 values differ.
+
+## Timestamp lookup experiment
+
+`timestamp_lookup.py` measures the tradeoff between repeated native Parquet
+timestamp lookups and preloading an explicit SQL table. It uses the supplied
+DuckDB CLI and checks result equivalence before reporting timings. See
+[scope and interpretation](../docs/review-followups.md#timestamp-experiment).
+It does not add or benchmark an extension-owned timestamp cache.

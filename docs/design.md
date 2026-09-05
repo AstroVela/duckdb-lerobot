@@ -425,9 +425,11 @@ only the rounded-linspace sample, and submits every video camera to a dedicated
 database-instance codec executor. The executor uses persistent extension-owned
 threads rather than DuckDB pipeline workers. A per-COPY `VIDEO_WORKERS` limit,
 a per-COPY `ENCODER_THREADS` codec budget, and a database-wide admission limit
-bound codec work to DuckDB's configured thread count. They do not reserve
-pipeline capacity, so unrelated queries may execute concurrently. The single
-COPY coordinator waits for the episode batch but does not perform codec CPU
+bound the configured codec budgets within one DatabaseInstance. They do not
+reserve pipeline capacity, so unrelated queries may execute concurrently,
+competing for CPU and memory. Codec-internal helper threads and read-side
+decoders are outside this executor's accounting. The single COPY coordinator
+waits for the episode batch but does not perform codec CPU
 work during that wait. Completed jobs occupy feature-indexed result slots; the
 COPY thread registers them in feature order only after the episode batch
 finishes. Numeric statistics scan the episode's buffer-managed column
@@ -461,10 +463,34 @@ RGB24. A depth feature is marked by `info.is_depth_map` and is either
 little-endian uint16 millimetres or float32 metres, inferred once and enforced
 for the whole dataset. RGB video uses LeRobot's AV1/yuv420p/GOP-2/CRF-30/
 preset-12 defaults. Depth uses the native 12-bit logarithmic quantizer followed
-by lossless HEVC gray12le. Per-episode MP4s are accumulated and stream-copy
-concatenated once when their shard closes. Consequently each fragment is read
+by lossless HEVC gray12le with closed GOPs. Open GOPs in independently encoded
+short episodes can cause missing frames during PyAV random seeks after concat;
+the visual conformance suite covers that boundary. Per-episode MP4s are
+accumulated and stream-copy concatenated once when their shard closes.
+Consequently each fragment is read
 once and each final shard is written once, while cumulative durations remain
 the episode route boundaries.
+
+`RGB_CODEC`, `RGB_CRF`, and `RGB_GOP` configure only the RGB branch. The supported
+encoders are libsvtav1 and libaom-av1; depth remains fixed to lossless x265
+gray12le. `DEPTH_MIN/MAX/SHIFT/USE_LOG` configure the depth quantizer in metres;
+`DEPTH_CLIP` defaults to true to preserve existing behavior and can explicitly
+request strict range validation. Returned encoder codec/pixel-format values are
+retained per feature and must agree between episodes before shard concatenation.
+Metadata is built from those results and the validated quantizer configuration.
+
+`lerobot_stats` binds native JSON objects and `json_each` into a relation with
+fixed `feature VARCHAR, stats JSON` columns. It preserves heterogeneous shapes
+without widening all features into one inferred SQL schema. A zero-episode
+dataset produces a typed empty relation. This helper and the metadata scans
+still read info at bind time: bind replacement does not itself provide info caching.
+
+`lerobot_decode_image` returns typed HWC bytes without interpreting physical
+units or resolving external paths. Its 64 MiB encoded/decoded per-image guards
+bound individual malformed inputs. The native TIFF path preserves uncompressed
+16-bit integer and 32-bit floating samples, including big-endian source data;
+other supported PNG/TIFF formats delegate to FFmpeg. This guard is distinct from
+any future aggregate visual memory budget.
 
 The writer is deliberately strict and create-only. It does not infer legacy
 schemas, append to an existing root, overwrite output, change codecs when an
@@ -476,6 +502,11 @@ commit protocol.
 The first native scanner targets v3. v2.0/v2.1 support is a separate adapter:
 those datasets use `meta/episodes.jsonl` and episode-per-file media, so they
 must not be silently routed through the v3 scanner.
+
+External data and configuration failures must not use `InternalException`.
+Use `InvalidInputException`/`IOException` as appropriate and preserve dedicated
+OOM, cancellation, and missing-capability exceptions. A codec budget that became
+invalid after changing `threads` now produces a recoverable input error.
 
 The implementation follows DuckDB extension conventions and uses DuckDB's
 container and ownership types rather than `std::vector` or `std::unique_ptr`.

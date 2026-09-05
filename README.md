@@ -66,9 +66,10 @@ lerobot` delegates data, episode metadata, and task tables to DuckDB's native
 Parquet writer, while the extension owns LeRobot's episode boundaries, shard
 rotation, statistics, visual encoding, and final metadata commit. The writer
 uses a sibling staging directory and publishes the dataset root only after all
-Parquet, image/video, `stats.json`, and `info.json` work succeeds. Like the
-current LeRobot recorder, it is create-only and requires contiguous episodes
-ordered from zero.
+Parquet, image/video, `stats.json`, and `info.json` work succeeds. It is
+create-only and requires contiguous episodes ordered from zero. Official
+LeRobot also supports resuming recording;
+that append workflow is outside this COPY contract.
 
 `lerobot_video_windows` is the training-oriented entry point. It accepts an
 ordered list of `(request_id, episode_index, frame_index)` structs plus LeRobot
@@ -236,6 +237,46 @@ SELECT *
 FROM lerobot_cache_info('hf://datasets/lerobot/droid_1.0.1');
 ```
 
+## Dataset statistics and embedded images
+
+`lerobot_stats(root, refresh := false)` reads `meta/stats.json` as
+`feature VARCHAR, stats JSON`, one row per feature. JSON preserves differing
+feature shapes and exact integer extrema. Empty datasets return the same
+two-column schema with zero rows without requiring a stats file. A missing or
+malformed stats file in a nonempty dataset is an error.
+
+```sql
+SELECT feature, stats->'$.mean' AS mean, stats->'$.std' AS std
+FROM lerobot_stats('my_dataset');
+
+SELECT decoded.width, decoded.height, decoded.channels, decoded.dtype, decoded.image
+FROM (
+  SELECT lerobot_decode_image("observation.images.front".bytes) AS decoded
+  FROM lerobot_scan('my_dataset')
+);
+
+-- External image paths must be resolved explicitly by the caller.
+SELECT lerobot_decode_image(content) FROM read_blob('my_dataset/images/frame-000000.png');
+```
+
+`lerobot_decode_image(blob)` returns a struct containing `image BLOB`, `width`,
+`height`, `channels`, and `dtype`. Bytes are contiguous HWC; supported output
+dtypes are `uint8`, little-endian `uint16`, and little-endian `float32`. RGB
+and RGBA retain their channels. The first TIFF page is decoded; uncompressed
+uint16/float32 grayscale TIFF strips have a native precision-preserving path,
+while other supported PNG/TIFF formats use FFmpeg. Compressed float TIFFs are
+rejected. Non-NULL input requires an FFmpeg-enabled build; NULL returns NULL.
+Encoded input and decoded image sizes each
+have a 64 MiB hard limit; these are per-image guards, not a shared memory budget.
+Units are not inferred from pixel values: consult the feature's `depth_unit`
+metadata. The function consumes bytes and does not follow a feature's `path`.
+
+Video projection also has a precise contract: `image` requires decoding and
+pixel conversion; `decoded_timestamp` requires decoding; `width` and `height`
+require decoding only when output dimensions were not both supplied. `channels`
+comes from feature metadata. Projection of metadata-only columns does not open
+MP4 files.
+
 ## Native LeRobot v3 write
 
 The COPY query supplies `episode_index`, `task`, and exactly the user features
@@ -283,7 +324,9 @@ exactly `height * width * 3` uint8 bytes. Depth features set
 `info.is_depth_map` to true and require either little-endian uint16 millimetres
 or float32 metres. Image features are embedded as PNG/TIFF structs in Parquet.
 Video features use LeRobot's current defaults: AV1/yuv420p for RGB and
-lossless HEVC/gray12le after 12-bit logarithmic quantization for depth.
+lossless HEVC/gray12le after 12-bit logarithmic quantization for depth. Depth
+uses closed GOPs so independently encoded episodes remain seekable after
+concatenation. The writer records the encoder's returned codec and pixel format.
 Episode fragments are retained until a video shard closes and then
 stream-copy concatenated once. Episode metadata records the resulting
 `[from_timestamp, to_timestamp)` routes without repeatedly rewriting a growing
@@ -298,10 +341,12 @@ whole episode batch completes. `VIDEO_WORKERS` limits active camera encoders;
 `ENCODER_THREADS` is the total codec-thread budget for one COPY and is divided
 across those workers. Both default to `min(4, DuckDB's thread limit)` and cannot
 exceed that limit. Concurrent COPY statements share a database-wide admission
-limit, so codec work alone cannot exceed DuckDB's configured thread count.
+limit for the configured codec budgets within that DatabaseInstance.
 Codec work deliberately does not occupy DuckDB pipeline workers; unrelated
-queries can still consume their own pipeline budget at the same time. The
-single COPY coordinator waits for each episode batch, but performs no codec
+queries can still consume their own pipeline budget at the same time. These
+threads still compete for CPU and memory; this is not admission control for
+all read/write queries or an exact cap on threads created internally by codecs.
+The single COPY coordinator waits for each episode batch, but performs no codec
 CPU work while it waits.
 Integer `min`/`max` statistics use LeRobot's native-compatible `BIGINT` leaf in
 episode Parquet metadata (`UBIGINT` for the complete `uint64` domain) and retain
@@ -327,13 +372,33 @@ inferred.
 The destination must be a new local path. There is intentionally no append,
 overwrite, legacy-layout inference, or codec fallback in this strict writer.
 
+The following encoding options are independent of worker budgets:
+
+| COPY option | Default | Contract |
+| --- | --- | --- |
+| `RGB_CODEC` | `'libsvtav1'` | `'libsvtav1'` or `'libaom-av1'`; RGB AV1/yuv420p only; no automatic fallback |
+| `RGB_CRF` | `30` | Integer 0–63 |
+| `RGB_GOP` | `2` | Positive 32-bit integer |
+| `DEPTH_MIN`, `DEPTH_MAX` | `0.01`, `10` | Finite metres, `0 <= min < max` |
+| `DEPTH_SHIFT` | `3.5` | Finite metres; logarithmic mapping requires `min + shift > 0` |
+| `DEPTH_USE_LOG` | `true` | Select logarithmic or linear 12-bit quantization |
+| `DEPTH_CLIP` | `true` | Existing saturation behavior; `false` rejects values outside the configured range |
+
+Depth remains lossless HEVC/gray12le and is unaffected by the RGB options.
+NaN/infinite input and invalid logarithm domains are rejected even when clipping
+is enabled. Quantizer parameters must remain representable in float32 in both
+supported input units. They are persisted in `info.json` for dequantization.
+Selecting libaom at runtime does not change the license of the linked FFmpeg
+build; distribution must be assessed against its actual enabled dependencies.
+
 ## Roadmap
 
-1. Vane-side tensor layout and image-transform materialization.
-2. Optional adaptive seek clustering if cross-storage benchmarks beat the
-   fixed 10-second policy materially.
-3. Optional hardware-accelerated FFmpeg backends after the CPU contract is
-   stable.
+See the [review decisions and remaining work](docs/review-followups.md).
+The first-release gate is correctness and tested read/write compatibility.
+V2 adapters, a full windows macro replacement, shared resource governance,
+timestamp caching, append/remote COPY, and hardware acceleration remain
+separate projects with explicit acceptance criteria. Execution controls remain
+available as named parameters; moving them into SET alone is not resource governance.
 
 ## Metadata and Parquet caching
 

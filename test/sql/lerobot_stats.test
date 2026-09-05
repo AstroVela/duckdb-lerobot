@@ -1,0 +1,63 @@
+# name: test/sql/lerobot_stats.test
+# description: Dataset statistics retain heterogeneous JSON shapes and exact extrema
+# group: [lerobot]
+
+require parquet
+
+require json
+
+require lerobot
+
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, 'pick' AS task,
+             9223372036854775807::BIGINT AS counter, [1.0, 3.0]::FLOAT[2] AS state)
+TO '{TEST_DIR}/lerobot_stats' (FORMAT lerobot, FPS 10,
+FEATURES '{"counter":{"dtype":"int64","shape":[1]},"state":{"dtype":"float32","shape":[2]}}');
+
+query TTT
+SELECT feature, typeof(stats), stats->>'$.max'
+FROM lerobot_stats('{TEST_DIR}/lerobot_stats')
+WHERE feature IN ('counter', 'state') ORDER BY feature;
+----
+counter	JSON	[9223372036854775807]
+state	JSON	[1,3]
+
+query I
+SELECT CAST(stats->>'$.count[0]' AS BIGINT)
+FROM lerobot_stats('{TEST_DIR}/lerobot_stats', refresh := true) WHERE feature = 'counter';
+----
+1
+
+statement error
+SELECT * FROM lerobot_stats('{TEST_DIR}/lerobot_stats', refresh := NULL);
+----
+refresh must not be NULL
+
+statement error
+SELECT * FROM lerobot_stats(NULL);
+----
+root must not be NULL
+
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, 'pick' AS task, 1::BIGINT AS counter WHERE false)
+TO '{TEST_DIR}/lerobot_stats_empty' (FORMAT lerobot, FPS 10,
+FEATURES '{"counter":{"dtype":"int64","shape":[1]}}');
+
+query I
+SELECT count(*) FROM lerobot_stats('{TEST_DIR}/lerobot_stats_empty');
+----
+0
+
+query TTTTTT rowsort
+DESCRIBE SELECT * FROM lerobot_stats('{TEST_DIR}/lerobot_stats_empty');
+----
+feature	VARCHAR	YES	NULL	NULL	NULL
+stats	JSON	YES	NULL	NULL	NULL
+
+statement ok
+PREPARE statistics_query AS SELECT feature FROM lerobot_stats('{TEST_DIR}/lerobot_stats') WHERE feature = 'counter';
+
+query T
+EXECUTE statistics_query;
+----
+counter
