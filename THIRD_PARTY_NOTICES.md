@@ -52,6 +52,11 @@ not legal advice.
   and is test-only.
 - **NumPy 2.2.6** is imported directly by the conformance fixture generator and
   is licensed under BSD-3-Clause. It is test-only.
+- **PyAV 15.1.0** and **Pillow 12.3.0** are pinned for the visual conformance
+  environment. PyAV is BSD-3-Clause and Pillow uses the
+  [MIT-CMU license](https://pillow.readthedocs.io/en/stable/about.html#license). Their
+  wheels may bundle native libraries with separate licenses; they are test-only
+  and are not part of the extension artifact.
 
 ## Checked-in media fixture
 

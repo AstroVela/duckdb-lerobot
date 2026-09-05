@@ -25,6 +25,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		loader.RegisterFunction(std::move(function));
 	}
 	loader.RegisterFunction(LerobotCopyFunction::Create());
+	loader.RegisterFunction(LerobotFunctions::GetDecodeImageFunction());
 }
 
 void LerobotExtension::Load(ExtensionLoader &loader) {

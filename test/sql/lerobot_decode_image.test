@@ -1,0 +1,147 @@
+# name: test/sql/lerobot_decode_image.test
+# description: PNG/TIFF decode preserves HWC dtype and handles NULL, corrupt and vector inputs
+# group: [lerobot]
+
+require-env LEROBOT_FFMPEG_TESTS
+
+require parquet
+
+require json
+
+require lerobot
+
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, 'image' AS task,
+             from_hex(repeat('14283c', 24)) AS rgb,
+             from_hex(repeat('d007', 24)) AS depth_u16,
+             from_hex(repeat('00000040', 24)) AS depth_f32)
+TO '{TEST_DIR}/lerobot_decode_images' (FORMAT lerobot, FPS 10,
+FEATURES '{"rgb":{"dtype":"image","shape":[4,6,3]},"depth_u16":{"dtype":"image","shape":[4,6,1],"info":{"is_depth_map":true}},"depth_f32":{"dtype":"image","shape":[4,6,1],"info":{"is_depth_map":true}}}');
+
+query IIIIT
+SELECT d.width, d.height, d.channels, d.image = from_hex(repeat('14283c', 24)), d.dtype
+FROM (SELECT lerobot_decode_image(rgb.bytes) AS d FROM lerobot_scan('{TEST_DIR}/lerobot_decode_images'));
+----
+6	4	3	true	uint8
+
+query IIITT
+SELECT d.width, d.height, d.channels, hex(d.image), d.dtype
+FROM (SELECT lerobot_decode_image(depth_u16.bytes) AS d FROM lerobot_scan('{TEST_DIR}/lerobot_decode_images'));
+----
+6	4	1	D007D007D007D007D007D007D007D007D007D007D007D007D007D007D007D007D007D007D007D007D007D007D007D007	uint16
+
+query IIIIT
+SELECT d.width, d.height, d.channels, d.image = from_hex(repeat('00000040', 24)), d.dtype
+FROM (SELECT lerobot_decode_image(depth_f32.bytes) AS d FROM lerobot_scan('{TEST_DIR}/lerobot_decode_images'));
+----
+6	4	1	true	float32
+
+query I
+SELECT lerobot_decode_image(NULL::BLOB) IS NULL;
+----
+true
+
+# Flat/dictionary input, several chunks, and NULLs alongside real images.
+query II
+SELECT count(d.image), count(*) FILTER (WHERE d.image = from_hex(repeat('14283c', 24)))
+FROM (SELECT lerobot_decode_image(CASE WHEN i % 2 = 0 THEN rgb.bytes ELSE NULL END) AS d
+      FROM lerobot_scan('{TEST_DIR}/lerobot_decode_images'), range(5000) t(i));
+----
+2500	2500
+
+statement error
+SELECT lerobot_decode_image('invalid'::BLOB);
+----
+requires a PNG or TIFF BLOB
+
+statement error
+SELECT lerobot_decode_image(from_hex('89504e470d0a1a0a'));
+----
+Cannot decode LeRobot PNG/TIFF image
+
+# An external image error must not invalidate the database.
+query I
+SELECT 42;
+----
+42
+
+statement error
+SELECT lerobot_decode_image(from_hex('49492a00ffffffff'));
+----
+Truncated LeRobot TIFF image
+
+statement error
+SELECT lerobot_decode_image(from_hex('49492a0008000000ffff'));
+----
+Truncated LeRobot TIFF directory
+
+# Independently generated palette PNG with partial transparency exercises
+# conversion to packed RGBA, including a three-pixel output stride.
+query IIT
+SELECT d.channels, d.width, hex(d.image)
+FROM (SELECT lerobot_decode_image(from_hex('89504e470d0a1a0a0000000d4948445200000003000000010203000000668efc270000000c504c5445ff000000ff000000ff000000fbbe46e40000000374524e53ff80007f6d68780000000a49444154789c63900000001a00192d88f4360000000049454e44ae426082')) d);
+----
+4	3	FF0000FF00FF00800000FF00
+
+# A valid IHDR CRC with enormous dimensions must be rejected before allocation.
+statement error
+SELECT lerobot_decode_image(from_hex('89504e470d0a1a0a0000000d49484452000186a0000186a0080200000027309c9f0000000049454e44ae426082'));
+----
+Cannot decode LeRobot PNG/TIFF image
+
+# Independent Pillow fixtures cover ordinary TIFF channel metadata, including
+# explicit per-channel SampleFormat and compressed/uncompressed RGBA pixels.
+query IIITT
+SELECT d.width, d.height, d.channels, d.dtype, hex(d.image)
+FROM (SELECT lerobot_decode_image(from_hex('49492a00080000000b0000010400010000000200000001010400010000000100000002010300030000009200000003010300010000000100000006010300010000000200000011010400010000009e0000001501030001000000030000001601040001000000010000001701040001000000060000001c010300010000000100000053010300030000009800000000000000080008000800010001000100123456abcdee')) d);
+----
+2	1	3	uint8	123456ABCDEE
+
+query IIITT
+SELECT d.width, d.height, d.channels, d.dtype, hex(d.image)
+FROM (SELECT lerobot_decode_image(from_hex('49492a00080000000b0000010400010000000200000001010400010000000100000002010300040000009200000003010300010000000100000006010300010000000200000011010400010000009a0000001501030001000000040000001601040001000000010000001701040001000000080000001c010300010000000100000052010300010000000200000000000000080008000800080012345680abcdee20')) d);
+----
+2	1	4	uint8	12345680ABCDEE20
+
+query IIITT
+SELECT d.width, d.height, d.channels, d.dtype, hex(d.image)
+FROM (SELECT lerobot_decode_image(from_hex('49492a0018000000789c1332096b587df69d02000d9703a30b000001030001000000020000000101030001000000010000000201030004000000a20000000301030001000000080000000601030001000000020000001101040001000000080000001501030001000000040000001601030001000000010000001701040001000000100000001c0103000100000001000000520103000100000002000000000000000800080008000800')) d);
+----
+2	1	4	uint8	12345680ABCDEE20
+
+# SampleFormat arrays must match the channel count.
+statement error
+SELECT lerobot_decode_image(from_hex('49492a00080000000b0000010400010000000200000001010400010000000100000002010300030000009200000003010300010000000100000006010300010000000200000011010400010000009e0000001501030001000000030000001601040001000000010000001701040001000000060000001c010300010000000100000053010300020000009800000000000000080008000800010001000100123456abcdee'));
+----
+Invalid LeRobot TIFF per-channel field count
+
+# Mixed unsigned and floating channels must not be reinterpreted as RGB bytes.
+statement error
+SELECT lerobot_decode_image(from_hex('49492a00080000000b0000010400010000000200000001010400010000000100000002010300030000009200000003010300010000000100000006010300010000000200000011010400010000009e0000001501030001000000030000001601040001000000010000001701040001000000060000001c010300010000000100000053010300030000009800000000000000080008000800010001000300123456abcdee'));
+----
+requires uniform sample widths and formats
+
+# Compressed float32 samples must not fall through to an unsigned decoder.
+statement error
+SELECT lerobot_decode_image(from_hex('49492a0018000000789c63605860cfc0a0e00000058301400a000001030001000000020000000101030001000000010000000201030001000000200000000301030001000000080000000601030001000000010000001101040001000000080000001601030001000000010000001701040001000000100000001c010300010000000100000053010300010000000300000000000000'));
+----
+float32 TIFF requires uncompressed strips
+
+# Relaxing minor TIFF tag errors must not hide a truncated RGB strip.
+statement error
+SELECT lerobot_decode_image(from_hex('49492a00080000000b0000010400010000000200000001010400010000000100000002010300030000009200000003010300010000000100000006010300010000000200000011010400010000009e0000001501030001000000030000001601040001000000010000001701040001000000060000001c010300010000000100000053010300030000009800000000000000080008000800010001000100123456abcd'));
+----
+Truncated LeRobot TIFF strip
+
+# A damaged compressed payload must still fail.
+statement error
+SELECT lerobot_decode_image(from_hex('49492a0018000000009c1332096b587df69d02000d9703a30b000001030001000000020000000101030001000000010000000201030004000000a20000000301030001000000080000000601030001000000020000001101040001000000080000001501030001000000040000001601030001000000010000001701040001000000100000001c0103000100000001000000520103000100000002000000000000000800080008000800'));
+----
+Cannot decode LeRobot PNG/TIFF image
+
+# Directory normalization preserves big-endian fields and aligns an odd payload.
+query IIITT
+SELECT d.width, d.height, d.channels, d.dtype, hex(d.image)
+FROM (SELECT lerobot_decode_image(from_hex('4d4d002a00000008000b01000004000000010000000101010004000000010000000101020003000000030000009201030003000000010001000001060003000000010002000001110004000000010000009e011500030000000100030000011600040000000100000001011700040000000100000003011c0003000000010001000001530003000000030000009800000000000800080008000100010001123456')) d);
+----
+1	1	3	uint8	123456

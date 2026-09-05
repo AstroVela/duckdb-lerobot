@@ -62,19 +62,25 @@ For large or dynamically generated target sets, the relation form is preferred:
     SELECT *
     FROM lerobot_video_targets(
       root,
-      (SELECT request_id, episode_index, frame_index, video_key, delta_index
+      (SELECT target_id, request_id, episode_index, frame_index, video_key, delta_index
        FROM training_targets
        WHERE split = 'train'),
       delta_timestamps := [-0.2, -0.1, 0.0]
     );
 
-The five named input columns are cast by DuckDB and consumed through unified
-typed vectors. One row selects one camera/delta pair, avoiding the list API's
+The five required input columns and optional `target_id` are cast by DuckDB
+and consumed through unified typed vectors. One row selects one camera/delta
+pair, avoiding the list API's
 bind-time materialization and cross product. Duplicate rows remain duplicate
-decode targets. Physical output is shard/time ordered; `target_ordinal` is a
-unique rejoin key, while `request_id`, `video_key`, and `delta_index` retain the
-caller's semantic identity. Filters and projections inside the input subquery
-are optimized before routing and decode.
+decode targets. Physical output is shard/time ordered. `target_ordinal` comes
+from an atomic counter claimed by parallel consumers, so it is unique within
+one execution but does not encode input order and is not stable across runs.
+The optional non-NULL `BIGINT` `target_id` is passed through unchanged and
+appended to the output schema only when supplied. It may be negative or
+repeated; callers who need to rejoin individual occurrences must assign unique
+IDs. `request_id`, `video_key`, and `delta_index` also retain their semantic
+identity. Filters and projections inside the input subquery are optimized
+before routing and decode.
 
 Non-video temporal features use the corresponding relation operator:
 
@@ -101,7 +107,10 @@ with both video temporal APIs. The operator looks up the requested episode's
 cached `length`, clamps the target into `[0, length - 1]`, and emits
 `is_padding`. It does not read feature values itself, so the following native
 Parquet join keeps projection and filter pushdown for arbitrary state/action
-schemas. `target_ordinal` distinguishes exact duplicate relation rows.
+schemas. `target_ordinal` distinguishes exact duplicate relation rows within
+one execution, with the same lack of ordering guarantees as video targets.
+This operator also accepts and returns an optional `target_id` with the same
+contract, without changing the output schema of existing four-column inputs.
 `lerobot_tasks` directly scans the current v3 `meta/tasks.parquet` schema
 (`task_index`, `task`); no legacy schema inference or fallback is performed.
 
@@ -130,6 +139,15 @@ serialization and scan behavior are retained. For a zero-episode dataset,
 `info.json.features`, while `lerobot_tasks` emits its fixed two-column schema;
 neither attempts to open a nonexistent Parquet file. `lerobot_info` continues
 to scan the one committed `info.json` record.
+
+At `81db162`, these three metadata functions did not register `refresh` as a
+named parameter. DuckDB rejected a call that supplied it at bind time with an
+"Invalid named parameter" error; the `refresh` option-parsing branch could not be
+reached for these functions. `ca5260c` added registration and bind replacement
+that invalidates both route-cache components when `refresh := true` is passed.
+The current metadata readers do not repopulate those caches as a side effect;
+they read their native metadata files. An omitted or false `refresh` leaves
+the route caches alone, and NULL is rejected.
 
 `lerobot_scan` is a bind-replacement table function. It loads the immutable
 base route cache, takes its deduplicated file list resolved from the
@@ -185,6 +203,79 @@ Native LeRobot does not create episode, task, data, statistics, or media files
 until its first episode is saved. `FORMAT lerobot` preserves that layout: a
 zero-row COPY publishes `meta/info.json` with zero totals, and the readers use
 that commit marker rather than manufacturing placeholder Parquet footers.
+
+## Window macro migration
+
+The C++ `lerobot_video_windows` implementation is retained. It records
+zero-based `request_ordinal` and `delta_ordinal` directly from list positions,
+including duplicate requests and duplicate deltas. Its bind-time SQL `VALUES`
+limit is **100,000 request/delta pairs**, before camera expansion. That bounded
+materialization still motivates a relational implementation.
+
+The migration order is:
+
+1. Accept and preserve caller identity in the targets relation. The optional
+   `target_id` now provides this, independently of `target_ordinal`.
+2. Expand requests and deltas with list subscripts before invoking targets.
+   Carry the request subscript as `target_id`, and project it back as
+   `request_ordinal`; `delta_index` becomes `delta_ordinal`.
+3. Match the complete windows defaults, option validation, empty-input and
+   route-error behavior, and output schema before deleting the C++ windows
+   implementation.
+
+The following restricted macro demonstrates step 2 for valid, non-NULL input
+lists with explicitly selected cameras. It is an example, not a replacement
+for the public windows API. It deliberately uses the caller's ID rather than
+deriving any position from `target_ordinal`. Repeated request positions across
+cameras/deltas are identified by `(request_ordinal, video_key, delta_ordinal)`.
+Its metadata output is compared with the C++ implementation in
+`test/sql/lerobot_video_pipeline.test`.
+
+```sql
+CREATE MACRO indexed_video_windows(dataset_root, requests, camera_keys,
+                                   delta_timestamps := [0.0]) AS TABLE
+SELECT decoded.request_id, decoded.target_id AS request_ordinal,
+       decoded.delta_index AS delta_ordinal, decoded.delta_timestamp,
+       decoded.delta_frame_offset, decoded.is_padding, decoded.episode_index,
+       decoded.frame_index, decoded.target_frame_index, decoded.timestamp,
+       decoded.video_key, decoded.video_path, decoded.video_timestamp,
+       decoded.decoded_timestamp, decoded.width, decoded.height,
+       decoded.channels, decoded.image
+FROM lerobot_video_targets(
+    dataset_root,
+    (SELECT r.request.request_id AS request_id,
+            r.request.episode_index AS episode_index,
+            r.request.frame_index AS frame_index,
+            cameras.video_key, deltas.delta_index, r.request_ordinal AS target_id
+     FROM (SELECT unnest(requests) AS request,
+                  generate_subscripts(requests, 1) - 1 AS request_ordinal) r
+     CROSS JOIN (SELECT unnest(list_distinct(camera_keys)) AS video_key) cameras
+     CROSS JOIN (SELECT generate_subscripts(delta_timestamps, 1) - 1 AS delta_index) deltas),
+    delta_timestamps := delta_timestamps
+) decoded;
+```
+
+The existing windows defaults that a full replacement must preserve are:
+
+| Parameter | Default |
+| --- | --- |
+| `video_keys` | All video-valued features from `info.json`; explicit `[]` selects none, NULL is invalid |
+| `delta_timestamps` | `[0.0]`; explicit `[]` produces no targets, NULL is invalid |
+| `width`, `height` | `0`, `0` (native dimensions) |
+| `tolerance` | `1e-4` seconds |
+| `cluster_gap` | `10.0` seconds |
+| `batch_size`, `target_buffer_size` | `16`, `256` |
+| `max_cached_decoders`, `decode_threads` | `8`, `8` |
+| `producer_threads` | `4` (a source-only option, not accepted by targets) |
+| `max_pending_targets` | `0`, resolved to `min(target_buffer_size * decode_threads * 2, 10 * 1024 * 1024)` |
+| `max_output_bytes` | `64 * 1024 * 1024` |
+| `codec_threads`, `depth_output_unit` | `1`, `'mm'` |
+| `refresh` | `false` |
+
+The example inherits decoder defaults from `lerobot_video_targets`, but does
+not implement omitted camera discovery, the full named-option surface, or the
+native bind-time validation contract. In particular, a macro with a NULL
+camera-list default would conflate omission with explicitly invalid NULL.
 
 ## Metadata required for a v3 episode
 
@@ -334,9 +425,11 @@ only the rounded-linspace sample, and submits every video camera to a dedicated
 database-instance codec executor. The executor uses persistent extension-owned
 threads rather than DuckDB pipeline workers. A per-COPY `VIDEO_WORKERS` limit,
 a per-COPY `ENCODER_THREADS` codec budget, and a database-wide admission limit
-bound codec work to DuckDB's configured thread count. They do not reserve
-pipeline capacity, so unrelated queries may execute concurrently. The single
-COPY coordinator waits for the episode batch but does not perform codec CPU
+bound the configured codec budgets within one DatabaseInstance. They do not
+reserve pipeline capacity, so unrelated queries may execute concurrently,
+competing for CPU and memory. Codec-internal helper threads and read-side
+decoders are outside this executor's accounting. The single COPY coordinator
+waits for the episode batch but does not perform codec CPU
 work during that wait. Completed jobs occupy feature-indexed result slots; the
 COPY thread registers them in feature order only after the episode batch
 finishes. Numeric statistics scan the episode's buffer-managed column
@@ -370,10 +463,34 @@ RGB24. A depth feature is marked by `info.is_depth_map` and is either
 little-endian uint16 millimetres or float32 metres, inferred once and enforced
 for the whole dataset. RGB video uses LeRobot's AV1/yuv420p/GOP-2/CRF-30/
 preset-12 defaults. Depth uses the native 12-bit logarithmic quantizer followed
-by lossless HEVC gray12le. Per-episode MP4s are accumulated and stream-copy
-concatenated once when their shard closes. Consequently each fragment is read
+by lossless HEVC gray12le with closed GOPs. Open GOPs in independently encoded
+short episodes can cause missing frames during PyAV random seeks after concat;
+the visual conformance suite covers that boundary. Per-episode MP4s are
+accumulated and stream-copy concatenated once when their shard closes.
+Consequently each fragment is read
 once and each final shard is written once, while cumulative durations remain
 the episode route boundaries.
+
+`RGB_CODEC`, `RGB_CRF`, and `RGB_GOP` configure only the RGB branch. The supported
+encoders are libsvtav1 and libaom-av1; depth remains fixed to lossless x265
+gray12le. `DEPTH_MIN/MAX/SHIFT/USE_LOG` configure the depth quantizer in metres;
+`DEPTH_CLIP` defaults to true to preserve existing behavior and can explicitly
+request strict range validation. Returned encoder codec/pixel-format values are
+retained per feature and must agree between episodes before shard concatenation.
+Metadata is built from those results and the validated quantizer configuration.
+
+`lerobot_stats` binds native JSON objects and `json_each` into a relation with
+fixed `feature VARCHAR, stats JSON` columns. It preserves heterogeneous shapes
+without widening all features into one inferred SQL schema. A zero-episode
+dataset produces a typed empty relation. This helper and the metadata scans
+still read info at bind time: bind replacement does not itself provide info caching.
+
+`lerobot_decode_image` returns typed HWC bytes without interpreting physical
+units or resolving external paths. Its 64 MiB encoded/decoded per-image guards
+bound individual malformed inputs. The native TIFF path preserves uncompressed
+16-bit integer and 32-bit floating samples, including big-endian source data;
+other supported PNG/TIFF formats delegate to FFmpeg. This guard is distinct from
+any future aggregate visual memory budget.
 
 The writer is deliberately strict and create-only. It does not infer legacy
 schemas, append to an existing root, overwrite output, change codecs when an
@@ -385,6 +502,11 @@ commit protocol.
 The first native scanner targets v3. v2.0/v2.1 support is a separate adapter:
 those datasets use `meta/episodes.jsonl` and episode-per-file media, so they
 must not be silently routed through the v3 scanner.
+
+External data and configuration failures must not use `InternalException`.
+Use `InvalidInputException`/`IOException` as appropriate and preserve dedicated
+OOM, cancellation, and missing-capability exceptions. A codec budget that became
+invalid after changing `threads` now produces a recoverable input error.
 
 The implementation follows DuckDB extension conventions and uses DuckDB's
 container and ownership types rather than `std::vector` or `std::unique_ptr`.

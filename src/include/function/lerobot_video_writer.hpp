@@ -18,6 +18,23 @@ class FileSystem;
 
 enum class LerobotRawVisualType : uint8_t { RGB24, DEPTH_UINT16, DEPTH_FLOAT32 };
 
+struct LerobotVideoEncodingConfig {
+	string rgb_codec = "libsvtav1";
+	int rgb_crf = 30;
+	int rgb_gop = 2;
+	double depth_min = 0.01;
+	double depth_max = 10;
+	double depth_shift = 3.5;
+	bool depth_use_log = true;
+	bool depth_clip = true;
+
+	bool operator==(const LerobotVideoEncodingConfig &other) const {
+		return rgb_codec == other.rgb_codec && rgb_crf == other.rgb_crf && rgb_gop == other.rgb_gop &&
+		       depth_min == other.depth_min && depth_max == other.depth_max && depth_shift == other.depth_shift &&
+		       depth_use_log == other.depth_use_log && depth_clip == other.depth_clip;
+	}
+};
+
 struct LerobotVideoEncodeOptions {
 	idx_t width = 0;
 	idx_t height = 0;
@@ -25,6 +42,7 @@ struct LerobotVideoEncodeOptions {
 	optional_idx encoder_threads;
 	LerobotRawVisualType raw_type = LerobotRawVisualType::RGB24;
 	optional_ptr<atomic<bool>> cancelled;
+	LerobotVideoEncodingConfig encoding;
 };
 
 struct LerobotEncodedVideoInfo {

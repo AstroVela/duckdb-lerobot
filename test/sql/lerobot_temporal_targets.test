@@ -204,6 +204,40 @@ ORDER BY targets.request_id, targets.delta_index;
 21	3	1	21	201	1	place
 21	4	1	21	201	1	place
 
+# Caller IDs are independent of request IDs, delta positions and scheduling.
+query IIII
+SELECT target_id, request_id, delta_index, target_frame_index
+FROM lerobot_temporal_targets(
+    '{TEST_DIR}/lerobot_temporal',
+    (SELECT target_id, '0' AS delta_index, '1' AS frame_index,
+            '2' AS episode_index, '42' AS request_id
+     FROM (VALUES ('9223372036854775807'), ('-9223372036854775808'),
+                  ('-9223372036854775808')) requests(target_id))
+)
+ORDER BY target_id;
+----
+-9223372036854775808	42	0	1
+-9223372036854775808	42	0	1
+9223372036854775807	42	0	1
+
+query I
+SELECT target_id
+FROM lerobot_temporal_targets(
+    '{TEST_DIR}/lerobot_temporal',
+    (SELECT 42 AS target_id, 7 AS request_id, 0 AS episode_index, 0 AS frame_index, 0 AS delta_index)
+);
+----
+42
+
+statement error
+SELECT target_id
+FROM lerobot_temporal_targets(
+    '{TEST_DIR}/lerobot_temporal',
+    (SELECT NULL::BIGINT AS target_id, 7 AS request_id, 0 AS episode_index, 0 AS frame_index, 0 AS delta_index)
+);
+----
+input column 'target_id' must not contain NULL
+
 # DuckDB may request only one projected vector while counting every row.
 query I
 SELECT count(*)

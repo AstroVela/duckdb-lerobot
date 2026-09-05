@@ -8,6 +8,7 @@
 #pragma once
 
 #include "duckdb/function/copy_function.hpp"
+#include "function/lerobot_video_writer.hpp"
 
 namespace duckdb {
 
@@ -23,6 +24,7 @@ struct LerobotCopyConfig {
 	string robot_type;
 	bool has_robot_type;
 	string features_json;
+	LerobotVideoEncodingConfig encoding;
 };
 
 LerobotCopyConfig ParseLerobotCopyRequiredConfig(const CopyFunctionBindInput &input);

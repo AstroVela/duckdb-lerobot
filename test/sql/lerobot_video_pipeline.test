@@ -129,6 +129,159 @@ ORDER BY request_ordinal;
 10	0	0	0	0.0
 20	1	1	1	0.5
 
+# A relation with several small Parquet row groups can be consumed by multiple
+# DuckDB workers. Exact duplicate requests retain both their caller ID and a
+# unique (but intentionally unordered) scheduler ordinal.
+statement ok
+CREATE TABLE stable_requests AS
+SELECT 37 * i - 100000 AS target_id, 7::BIGINT AS request_id,
+       (i // 2) % 2 AS episode_index, i % 2 AS frame_index,
+       CASE WHEN i % 3 = 0 THEN 'observation.images.front'
+            ELSE 'observation.images.wrist' END AS video_key,
+       i % 3 AS delta_index
+FROM range(8193) requests(i);
+
+statement ok
+COPY (SELECT requests.* FROM stable_requests requests CROSS JOIN range(2))
+TO '{TEST_DIR}/lerobot_video_pipeline/targets.parquet' (FORMAT PARQUET, ROW_GROUP_SIZE 2048);
+
+foreach workers 1 4
+
+statement ok
+SET threads = ${workers};
+
+query IIII
+SELECT count(*), count(DISTINCT decoded.target_id), count(DISTINCT decoded.target_ordinal),
+       bool_and(decoded.request_id = expected.request_id
+                AND decoded.episode_index = expected.episode_index
+                AND decoded.frame_index = expected.frame_index
+                AND decoded.video_key = expected.video_key
+                AND decoded.delta_index = expected.delta_index
+                AND decoded.target_frame_index = greatest(0, least(1, expected.frame_index + expected.delta_index - 1))
+                AND decoded.is_padding = (expected.frame_index + expected.delta_index - 1 NOT BETWEEN 0 AND 1))
+FROM lerobot_video_targets(
+    '{TEST_DIR}/lerobot_video_pipeline',
+    (SELECT * FROM read_parquet('{TEST_DIR}/lerobot_video_pipeline/targets.parquet')),
+    delta_timestamps := [-0.5, 0.0, 0.5],
+    decode_threads := 4,
+    target_buffer_size := 31,
+    max_pending_targets := 257
+) decoded
+JOIN stable_requests expected USING (target_id);
+----
+16386	8193	16386	true
+
+query IIII
+SELECT count(*), count(DISTINCT decoded.target_id), count(DISTINCT decoded.target_ordinal),
+       bool_and(decoded.request_id = expected.request_id
+                AND decoded.episode_index = expected.episode_index
+                AND decoded.frame_index = expected.frame_index
+                AND decoded.delta_index = expected.delta_index
+                AND decoded.target_frame_index = greatest(0, least(1, expected.frame_index + expected.delta_index - 1)))
+FROM lerobot_temporal_targets(
+    '{TEST_DIR}/lerobot_video_pipeline',
+    (SELECT * EXCLUDE (video_key) FROM read_parquet('{TEST_DIR}/lerobot_video_pipeline/targets.parquet')),
+    delta_timestamps := [-0.5, 0.0, 0.5]
+) decoded
+JOIN stable_requests expected USING (target_id);
+----
+16386	8193	16386	true
+
+endloop
+
+# This restricted macro demonstrates the migration prerequisite: list positions
+# become caller IDs before the relation operator can reorder any work. Camera
+# keys are explicit here; the public C++ windows API still owns its full defaults
+# and validation contract. Keep this example in sync with docs/design.md.
+statement ok
+CREATE MACRO indexed_video_windows(dataset_root, requests, camera_keys, delta_timestamps := [0.0]) AS TABLE
+SELECT decoded.request_id, decoded.target_id AS request_ordinal,
+       decoded.delta_index AS delta_ordinal, decoded.delta_timestamp,
+       decoded.delta_frame_offset, decoded.is_padding, decoded.episode_index,
+       decoded.frame_index, decoded.target_frame_index, decoded.timestamp,
+       decoded.video_key, decoded.video_path, decoded.video_timestamp,
+       decoded.decoded_timestamp, decoded.width, decoded.height, decoded.channels, decoded.image
+FROM lerobot_video_targets(
+    dataset_root,
+    (SELECT r.request.request_id AS request_id,
+            r.request.episode_index AS episode_index, r.request.frame_index AS frame_index,
+            cameras.video_key, deltas.delta_index, r.request_ordinal AS target_id
+     FROM (SELECT unnest(requests) AS request,
+                  generate_subscripts(requests, 1) - 1 AS request_ordinal) r
+     CROSS JOIN (SELECT unnest(list_distinct(camera_keys)) AS video_key) cameras
+     CROSS JOIN (SELECT generate_subscripts(delta_timestamps, 1) - 1 AS delta_index) deltas),
+    delta_timestamps := delta_timestamps
+) decoded;
+
+statement ok
+SET VARIABLE window_requests = [
+    struct_pack(request_id := 7, episode_index := 1, frame_index := 1),
+    struct_pack(request_id := 7, episode_index := 0, frame_index := 0),
+    struct_pack(request_id := 7, episode_index := 1, frame_index := 1)
+];
+
+statement ok
+CREATE TABLE native_windows AS
+SELECT * EXCLUDE (decoded_timestamp, width, height, image)
+FROM lerobot_video_windows(
+    '{TEST_DIR}/lerobot_video_pipeline', getvariable('window_requests'),
+    delta_timestamps := [-0.5, 0.0, 0.0, 0.5]
+);
+
+statement ok
+CREATE TABLE indexed_windows AS
+SELECT * EXCLUDE (decoded_timestamp, width, height, image)
+FROM indexed_video_windows(
+    '{TEST_DIR}/lerobot_video_pipeline', getvariable('window_requests'),
+    ['observation.images.wrist', 'observation.images.front', 'observation.images.wrist'],
+    delta_timestamps := [-0.5, 0.0, 0.0, 0.5]
+);
+
+query I
+SELECT count(*) FROM indexed_windows;
+----
+24
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM native_windows EXCEPT ALL SELECT * FROM indexed_windows)
+    UNION ALL
+    (SELECT * FROM indexed_windows EXCEPT ALL SELECT * FROM native_windows)
+);
+----
+0
+
+# Both forms default to delta_timestamps := [0.0]. The native API also defaults
+# to all cameras and keeps the original zero-based request positions.
+query IIIII
+SELECT request_ordinal, delta_ordinal, delta_frame_offset, target_frame_index, count(*)
+FROM lerobot_video_windows('{TEST_DIR}/lerobot_video_pipeline', getvariable('window_requests'))
+GROUP BY ALL ORDER BY request_ordinal;
+----
+0	0	0	1	2
+1	0	0	0	2
+2	0	0	1	2
+
+query IIIII
+SELECT request_ordinal, delta_ordinal, delta_frame_offset, target_frame_index, count(*)
+FROM indexed_video_windows('{TEST_DIR}/lerobot_video_pipeline', getvariable('window_requests'),
+                           ['observation.images.front', 'observation.images.wrist'])
+GROUP BY ALL ORDER BY request_ordinal;
+----
+0	0	0	1	2
+1	0	0	0	2
+2	0	0	1	2
+
+# The native VALUES limit is 100,000 request/delta pairs, before cameras are
+# expanded. Reject one extra pair without attempting to materialize the query.
+statement error
+SELECT count(*) FROM lerobot_video_windows(
+    '{TEST_DIR}/lerobot_video_pipeline',
+    list_transform(range(100001), i -> struct_pack(request_id := i, episode_index := 0, frame_index := 0))
+);
+----
+expands to more than 100000 frame targets
+
 statement ok
 PRAGMA enable_profiling='json';
 

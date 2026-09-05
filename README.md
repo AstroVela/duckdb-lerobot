@@ -66,9 +66,10 @@ lerobot` delegates data, episode metadata, and task tables to DuckDB's native
 Parquet writer, while the extension owns LeRobot's episode boundaries, shard
 rotation, statistics, visual encoding, and final metadata commit. The writer
 uses a sibling staging directory and publishes the dataset root only after all
-Parquet, image/video, `stats.json`, and `info.json` work succeeds. Like the
-current LeRobot recorder, it is create-only and requires contiguous episodes
-ordered from zero.
+Parquet, image/video, `stats.json`, and `info.json` work succeeds. It is
+create-only and requires contiguous episodes ordered from zero. Official
+LeRobot also supports resuming recording;
+that append workflow is outside this COPY contract.
 
 `lerobot_video_windows` is the training-oriented entry point. It accepts an
 ordered list of `(request_id, episode_index, frame_index)` structs plus LeRobot
@@ -79,23 +80,34 @@ mapping it into the MP4 shard. Request and delta ordinals survive the internal
 shard/time reorder, so callers can restore the requested tensor order without
 discarding duplicates.
 
+The current C++ implementation materializes at most 100,000 request/delta
+pairs as SQL `VALUES` during binding, before camera expansion. A full macro
+replacement must preserve these positions and the existing defaults; see the
+[migration prerequisites](docs/design.md#window-macro-migration).
+
 `lerobot_video_targets` is the scalable relation entry point. Its second
-argument is a DuckDB relation with exactly `request_id`, `episode_index`,
-`frame_index`, `video_key`, and `delta_index`. Each row selects one camera and
-one element of the named `delta_timestamps` list, so upstream joins, duplicate
+argument is a DuckDB relation with `request_id`, `episode_index`,
+`frame_index`, `video_key`, and `delta_index`, plus an optional `target_id`.
+Each row selects one camera and one element of the named `delta_timestamps`
+list, so upstream joins, duplicate
 requests, and filters remain relational instead of being boxed into a bind-time
 list or expanded into a camera/window Cartesian product. The semantic keys
 survive shard/time scheduling, and `target_ordinal` keeps even exact duplicates
-distinct. Use an order-bearing `request_id` together with `delta_index` and
-`target_ordinal` to restore the caller's tensor order. Padding and the resolved
-target frame are returned explicitly.
+distinct within a query. `target_ordinal` is assigned by an atomic counter as
+parallel workers consume input; it is neither an input position nor stable
+across executions. To restore caller order, provide an order-bearing
+`target_id`. This non-NULL `BIGINT` is returned unchanged as an additional
+output column, including repeated IDs; choose unique IDs when individual
+occurrences need a rejoin key. Omitting it preserves the original output
+schema. Padding and the resolved target frame are returned explicitly.
 
 `lerobot_temporal_targets` applies the same LeRobot FPS validation,
 Python-compatible ties-to-even integer frame-offset conversion,
 episode-boundary clamp, and padding semantics without opening video. Its input
-relation has exactly `request_id`, `episode_index`, `frame_index`, and
-`delta_index`. Join the returned `target_frame_index` to `lerobot_scan` to
-fetch any state, action, or other non-video feature.
+relation has `request_id`, `episode_index`, `frame_index`, and `delta_index`,
+with the same optional `target_id` contract and unordered `target_ordinal`.
+Join the returned `target_frame_index` to `lerobot_scan` to fetch any state,
+action, or other non-video feature.
 `lerobot_tasks` scans the current v3 `meta/tasks.parquet` contract directly, so
 joining a frame's `task_index` yields its `task` string while retaining native
 Parquet projection and filter pushdown. Legacy task layouts are not inferred.
@@ -177,31 +189,31 @@ ORDER BY request_ordinal, delta_ordinal;
 -- exactly one camera and one delta.
 WITH targets AS (
   SELECT * FROM (VALUES
-    (1001::BIGINT, 12::BIGINT, 45::BIGINT,
+    (0::BIGINT, 1001::BIGINT, 12::BIGINT, 45::BIGINT,
      'observation.images.wrist'::VARCHAR, 0::BIGINT),
-    (1001::BIGINT, 12::BIGINT, 45::BIGINT,
+    (1::BIGINT, 1001::BIGINT, 12::BIGINT, 45::BIGINT,
      'observation.images.wrist'::VARCHAR, 1::BIGINT),
-    (1002::BIGINT, 12::BIGINT, 90::BIGINT,
+    (2::BIGINT, 1002::BIGINT, 12::BIGINT, 90::BIGINT,
      'observation.images.front'::VARCHAR, 2::BIGINT)
-  ) t(request_id, episode_index, frame_index, video_key, delta_index)
+  ) t(target_id, request_id, episode_index, frame_index, video_key, delta_index)
 )
-SELECT request_id, target_ordinal, video_key, delta_index, is_padding,
+SELECT request_id, target_id, video_key, delta_index, is_padding,
        target_frame_index, decoded_timestamp, image
 FROM lerobot_video_targets(
   'hf://datasets/lerobot/droid_1.0.1',
   (SELECT * FROM targets),
   delta_timestamps := [-0.2, -0.1, 0.0]
 )
-ORDER BY target_ordinal;
+ORDER BY target_id;
 
 -- Resolve temporal state/action targets without decoding video. Every input
--- row chooses one delta; exact duplicates remain distinct via target_ordinal.
+-- row chooses one delta and carries a stable caller-provided target_id.
 WITH requests AS (
   SELECT * FROM (VALUES
-    (1001::BIGINT, 12::BIGINT, 45::BIGINT, 0::BIGINT),
-    (1001::BIGINT, 12::BIGINT, 45::BIGINT, 1::BIGINT),
-    (1001::BIGINT, 12::BIGINT, 45::BIGINT, 2::BIGINT)
-  ) t(request_id, episode_index, frame_index, delta_index)
+    (0::BIGINT, 1001::BIGINT, 12::BIGINT, 45::BIGINT, 0::BIGINT),
+    (1::BIGINT, 1001::BIGINT, 12::BIGINT, 45::BIGINT, 1::BIGINT),
+    (2::BIGINT, 1001::BIGINT, 12::BIGINT, 45::BIGINT, 2::BIGINT)
+  ) t(target_id, request_id, episode_index, frame_index, delta_index)
 ), targets AS (
   SELECT *
   FROM lerobot_temporal_targets(
@@ -217,13 +229,55 @@ JOIN lerobot_scan('hf://datasets/lerobot/droid_1.0.1') frames
   ON frames.episode_index = targets.episode_index
  AND frames.frame_index = targets.target_frame_index
 JOIN lerobot_tasks('hf://datasets/lerobot/droid_1.0.1') tasks USING (task_index)
-ORDER BY targets.request_id, targets.delta_index, targets.target_ordinal;
+ORDER BY targets.target_id;
 
 -- Inspect existing route-cache entries without loading or validating either
 -- component as a side effect.
 SELECT *
 FROM lerobot_cache_info('hf://datasets/lerobot/droid_1.0.1');
 ```
+
+## Dataset statistics and embedded images
+
+`lerobot_stats(root, refresh := false)` reads `meta/stats.json` as
+`feature VARCHAR, stats JSON`, one row per feature. JSON preserves differing
+feature shapes and exact integer extrema. Empty datasets return the same
+two-column schema with zero rows without requiring a stats file. A missing or
+malformed stats file in a nonempty dataset is an error.
+
+```sql
+SELECT feature, stats->'$.mean' AS mean, stats->'$.std' AS std
+FROM lerobot_stats('my_dataset');
+
+SELECT decoded.width, decoded.height, decoded.channels, decoded.dtype, decoded.image
+FROM (
+  SELECT lerobot_decode_image("observation.images.front".bytes) AS decoded
+  FROM lerobot_scan('my_dataset')
+);
+
+-- External image paths must be resolved explicitly by the caller.
+SELECT lerobot_decode_image(content) FROM read_blob('my_dataset/images/frame-000000.png');
+```
+
+`lerobot_decode_image(blob)` returns a struct containing `image BLOB`, `width`,
+`height`, `channels`, and `dtype`. Bytes are contiguous HWC; supported output
+dtypes are `uint8`, little-endian `uint16`, and little-endian `float32`. RGB
+and RGBA retain their channels. The first TIFF page is decoded; uncompressed
+uint16/float32 grayscale TIFF strips have a native precision-preserving path,
+while other supported PNG/TIFF formats use FFmpeg. TIFF sample widths and formats
+must be uniform across channels; RGBA TIFF uses unassociated alpha. Signed
+integer and compressed float TIFFs are rejected. Non-NULL input requires an
+FFmpeg-enabled build; NULL returns NULL.
+Encoded input and decoded image sizes each
+have a 64 MiB hard limit; these are per-image guards, not a shared memory budget.
+Units are not inferred from pixel values: consult the feature's `depth_unit`
+metadata. The function consumes bytes and does not follow a feature's `path`.
+
+Video projection also has a precise contract: `image` requires decoding and
+pixel conversion; `decoded_timestamp` requires decoding; `width` and `height`
+require decoding only when output dimensions were not both supplied. `channels`
+comes from feature metadata. Projection of metadata-only columns does not open
+MP4 files.
 
 ## Native LeRobot v3 write
 
@@ -272,7 +326,9 @@ exactly `height * width * 3` uint8 bytes. Depth features set
 `info.is_depth_map` to true and require either little-endian uint16 millimetres
 or float32 metres. Image features are embedded as PNG/TIFF structs in Parquet.
 Video features use LeRobot's current defaults: AV1/yuv420p for RGB and
-lossless HEVC/gray12le after 12-bit logarithmic quantization for depth.
+lossless HEVC/gray12le after 12-bit logarithmic quantization for depth. Depth
+uses closed GOPs so independently encoded episodes remain seekable after
+concatenation. The writer records the encoder's returned codec and pixel format.
 Episode fragments are retained until a video shard closes and then
 stream-copy concatenated once. Episode metadata records the resulting
 `[from_timestamp, to_timestamp)` routes without repeatedly rewriting a growing
@@ -287,10 +343,12 @@ whole episode batch completes. `VIDEO_WORKERS` limits active camera encoders;
 `ENCODER_THREADS` is the total codec-thread budget for one COPY and is divided
 across those workers. Both default to `min(4, DuckDB's thread limit)` and cannot
 exceed that limit. Concurrent COPY statements share a database-wide admission
-limit, so codec work alone cannot exceed DuckDB's configured thread count.
+limit for the configured codec budgets within that DatabaseInstance.
 Codec work deliberately does not occupy DuckDB pipeline workers; unrelated
-queries can still consume their own pipeline budget at the same time. The
-single COPY coordinator waits for each episode batch, but performs no codec
+queries can still consume their own pipeline budget at the same time. These
+threads still compete for CPU and memory; this is not admission control for
+all read/write queries or an exact cap on threads created internally by codecs.
+The single COPY coordinator waits for each episode batch, but performs no codec
 CPU work while it waits.
 Integer `min`/`max` statistics use LeRobot's native-compatible `BIGINT` leaf in
 episode Parquet metadata (`UBIGINT` for the complete `uint64` domain) and retain
@@ -316,13 +374,34 @@ inferred.
 The destination must be a new local path. There is intentionally no append,
 overwrite, legacy-layout inference, or codec fallback in this strict writer.
 
+The following encoding options are independent of worker budgets:
+
+| COPY option | Default | Contract |
+| --- | --- | --- |
+| `RGB_CODEC` | `'libsvtav1'` | `'libsvtav1'` or `'libaom-av1'`; RGB AV1/yuv420p only; no automatic fallback |
+| `RGB_CRF` | `30` | Integer 0–63 |
+| `RGB_GOP` | `2` | Positive 32-bit integer |
+| `DEPTH_MIN`, `DEPTH_MAX` | `0.01`, `10` | Finite metres, `0 <= min < max` |
+| `DEPTH_SHIFT` | `3.5` | Finite metres; logarithmic mapping requires `min + shift > 0` |
+| `DEPTH_USE_LOG` | `true` | Select logarithmic or linear 12-bit quantization |
+| `DEPTH_CLIP` | `true` | Existing saturation behavior; `false` rejects values outside the configured range |
+
+Depth remains lossless HEVC/gray12le and is unaffected by the RGB options.
+NaN/infinite input and invalid logarithm domains are rejected even when clipping
+is enabled. Quantizer parameters must remain representable in float32 in both
+supported input units and pass the reader's float32 dequantization checks.
+They are persisted in `info.json` for dequantization.
+Selecting libaom at runtime does not change the license of the linked FFmpeg
+build; distribution must be assessed against its actual enabled dependencies.
+
 ## Roadmap
 
-1. Vane-side tensor layout and image-transform materialization.
-2. Optional adaptive seek clustering if cross-storage benchmarks beat the
-   fixed 10-second policy materially.
-3. Optional hardware-accelerated FFmpeg backends after the CPU contract is
-   stable.
+See the [review decisions and remaining work](docs/review-followups.md).
+The first-release gate is correctness and tested read/write compatibility.
+V2 adapters, a full windows macro replacement, shared resource governance,
+timestamp caching, append/remote COPY, and hardware acceleration remain
+separate projects with explicit acceptance criteria. Execution controls remain
+available as named parameters; moving them into SET alone is not resource governance.
 
 ## Metadata and Parquet caching
 
@@ -333,6 +412,13 @@ of `meta/info.json` invalidates stale entries automatically; `refresh := true`
 invalidates both entries for non-versioned or manually edited datasets, after
 which a cache-consuming query rebuilds only what it needs. Versioned Hugging
 Face revisions should normally need no explicit refresh.
+
+`lerobot_info`, `lerobot_episodes`, and `lerobot_tasks` register `refresh` in
+the current API. Passing `true` invalidates both routing caches at bind time
+without rebuilding them; the metadata itself is read by the native scan.
+This support was added in `ca5260c`. At `81db162`, these three functions did
+not register the parameter: DuckDB rejected it during binding as an invalid
+named parameter, and the option-parsing branch was unreachable.
 
 `lerobot_cache_info(root)` always returns one `data` row and one `video` row
 with the stable columns `root`, `component`, `cached`, `entries`, and `bytes`.

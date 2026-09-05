@@ -315,7 +315,7 @@ FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_depth');
 query IIII
 SELECT contains(content, '"video.codec":"hevc"'),
        contains(content, '"video.pix_fmt":"gray12le"'),
-       contains(content, '"x265-params":"lossless=1"'),
+       contains(content, '"x265-params":"lossless=1:open-gop=0"'),
        contains(content, '"depth_unit":"mm"')
 FROM read_text('{TEST_DIR}/lerobot_copy_depth/meta/info.json');
 ----

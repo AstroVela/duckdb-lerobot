@@ -406,6 +406,7 @@ struct LerobotCopyBindData : public FunctionData {
 	idx_t max_visual_frame_bytes = 0;
 	idx_t video_workers = 1;
 	idx_t encoder_threads = 1;
+	LerobotVideoEncodingConfig encoding;
 	string robot_type;
 	bool has_robot_type = false;
 	string features_json;
@@ -430,6 +431,7 @@ struct LerobotCopyBindData : public FunctionData {
 		result->max_visual_frame_bytes = max_visual_frame_bytes;
 		result->video_workers = video_workers;
 		result->encoder_threads = encoder_threads;
+		result->encoding = encoding;
 		result->robot_type = robot_type;
 		result->has_robot_type = has_robot_type;
 		result->features_json = features_json;
@@ -444,7 +446,7 @@ struct LerobotCopyBindData : public FunctionData {
 		       metadata_buffer_size == other.metadata_buffer_size &&
 		       max_visual_frame_bytes == other.max_visual_frame_bytes && video_workers == other.video_workers &&
 		       encoder_threads == other.encoder_threads && has_robot_type == other.has_robot_type &&
-		       robot_type == other.robot_type;
+		       robot_type == other.robot_type && encoding == other.encoding;
 	}
 };
 
@@ -497,6 +499,7 @@ unique_ptr<FunctionData> LerobotCopyBind(ClientContext &context, CopyFunctionBin
 	result->max_visual_frame_bytes = config.max_visual_frame_bytes;
 	result->video_workers = config.video_workers;
 	result->encoder_threads = config.encoder_threads;
+	result->encoding = config.encoding;
 	result->robot_type = std::move(config.robot_type);
 	result->has_robot_type = config.has_robot_type;
 
@@ -1599,6 +1602,7 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 		visual_raw_types.resize(bind.features.size(), LerobotRawVisualType::RGB24);
 		visual_raw_types_present.resize(bind.features.size(), false);
 		video_shards.resize(bind.features.size());
+		encoded_video_info.resize(bind.features.size());
 		for (idx_t feature_index = 0; feature_index < bind.features.size(); feature_index++) {
 			const auto &feature = bind.features[feature_index];
 			if ((feature.is_image || feature.is_video) && !feature.is_depth) {
@@ -1878,9 +1882,15 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 			throw InternalException("LeRobot codec executor returned an invalid feature index");
 		}
 		if (result.encoded.frame_count != current_episode_frames) {
-			throw InternalException("LeRobot video encoder wrote %llu frames for a %llu-frame episode",
-			                        result.encoded.frame_count, current_episode_frames);
+			throw IOException("LeRobot video encoder wrote %llu frames for a %llu-frame episode",
+			                  result.encoded.frame_count, current_episode_frames);
 		}
+		auto &encoded_info = encoded_video_info[feature_index];
+		if (!encoded_info.codec.empty() &&
+		    (encoded_info.codec != result.encoded.codec || encoded_info.pixel_format != result.encoded.pixel_format)) {
+			throw IOException("LeRobot encoder changed the stream format between episodes");
+		}
+		encoded_info = result.encoded;
 		const auto episode_bytes = GetLocalFileSize(result.output_path);
 		auto &shard = video_shards[feature_index];
 		if (!shard.initialized) {
@@ -1928,6 +1938,7 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 			options.height = feature.shape[0];
 			options.fps = bind.fps;
 			options.raw_type = visual_raw_types[feature_index];
+			options.encoding = bind.encoding;
 			const auto &spool = current_visual_spools[feature_index];
 			if (spool.frame_count != current_episode_frames) {
 				throw InternalException("LeRobot video spool has %llu frames for a %llu-frame episode",
@@ -2219,6 +2230,14 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 		return result + '}';
 	}
 
+	string DepthQuantizerJSON() const {
+		const auto &config = bind.encoding;
+		return "\"video.depth_min\":" + JsonNumber(config.depth_min) +
+		       ",\"video.depth_max\":" + JsonNumber(config.depth_max) +
+		       ",\"video.shift\":" + JsonNumber(config.depth_shift) +
+		       ",\"video.use_log\":" + (config.depth_use_log ? "true" : "false");
+	}
+
 	string VisualInfoJSON(idx_t feature_index) const {
 		const auto &feature = bind.features[feature_index];
 		if (!feature.is_image && !feature.is_video) {
@@ -2233,28 +2252,32 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 			}
 			// No row is available to infer the raw depth unit, but video
 			// quantization itself always uses this canonical metre-space contract.
-			return "{\"video.pix_fmt\":\"gray12le\",\"video.depth_min\":0.01,"
-			       "\"video.depth_max\":10,\"video.shift\":3.5,\"video.use_log\":true,"
-			       "\"is_depth_map\":true}";
+			return "{\"video.pix_fmt\":\"gray12le\"," + DepthQuantizerJSON() + ",\"is_depth_map\":true}";
 		}
 		const auto depth = feature.is_depth;
 		const auto depth_unit = visual_raw_types[feature_index] == LerobotRawVisualType::DEPTH_UINT16 ? "mm" : "m";
 		if (feature.is_image) {
 			return depth ? "{\"is_depth_map\":true,\"depth_unit\":" + JsonEscape(depth_unit) + '}' : string();
 		}
+		const auto &encoded = encoded_video_info[feature_index];
+		if (encoded.codec.empty()) {
+			// Empty RGB datasets have no encoder result to report.
+			return string();
+		}
+		const auto is_svt = bind.encoding.rgb_codec == "libsvtav1";
 		string result =
 		    "{\"video.height\":" + std::to_string(feature.shape[0]) +
-		    ",\"video.width\":" + std::to_string(feature.shape[1]) +
-		    ",\"video.codec\":" + JsonEscape(depth ? "hevc" : "av1") +
-		    ",\"video.pix_fmt\":" + JsonEscape(depth ? "gray12le" : "yuv420p") +
-		    ",\"video.fps\":" + std::to_string(bind.fps) + ",\"video.channels\":" + std::to_string(feature.shape[2]) +
-		    ",\"has_audio\":false,\"video.g\":2,\"video.crf\":30,\"video.preset\":" + (depth ? "null" : "12") +
+		    ",\"video.width\":" + std::to_string(feature.shape[1]) + ",\"video.codec\":" + JsonEscape(encoded.codec) +
+		    ",\"video.pix_fmt\":" + JsonEscape(encoded.pixel_format) + ",\"video.fps\":" + std::to_string(bind.fps) +
+		    ",\"video.channels\":" + std::to_string(feature.shape[2]) +
+		    ",\"has_audio\":false,\"video.g\":" + std::to_string(depth ? 2 : bind.encoding.rgb_gop) +
+		    ",\"video.crf\":" + std::to_string(depth ? 30 : bind.encoding.rgb_crf) +
+		    ",\"video.preset\":" + (depth || !is_svt ? "null" : "12") +
 		    ",\"video.fast_decode\":0,\"video.video_backend\":\"pyav\",\"video.extra_options\":" +
-		    (depth ? "{\"x265-params\":\"lossless=1\"}" : "{}") + ",\"is_depth_map\":" + (depth ? "true" : "false");
+		    (depth ? "{\"x265-params\":\"lossless=1:open-gop=0\"}" : (is_svt ? "{}" : "{\"cpu-used\":8,\"b\":0}")) +
+		    ",\"is_depth_map\":" + (depth ? "true" : "false");
 		if (depth) {
-			result += ",\"video.depth_min\":0.01,\"video.depth_max\":10,\"video.shift\":3.5,"
-			          "\"video.use_log\":true,\"depth_unit\":" +
-			          JsonEscape(depth_unit);
+			result += ',' + DepthQuantizerJSON() + ",\"depth_unit\":" + JsonEscape(depth_unit);
 		}
 		return result + '}';
 	}
@@ -2340,6 +2363,7 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 	vector<bool> visual_raw_types_present;
 	vector<LerobotVideoRoute> current_video_routes;
 	vector<LerobotVideoShardState> video_shards;
+	vector<LerobotEncodedVideoInfo> encoded_video_info;
 	idx_t total_episodes = 0;
 	idx_t total_frames = 0;
 	int64_t current_episode = -1;

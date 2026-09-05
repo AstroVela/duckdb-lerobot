@@ -4,6 +4,7 @@ set(EXTENSION_SOURCES
     compat/lerobot_bind_replace.cpp
     function/lerobot_functions.cpp
     function/lerobot_schema.cpp
+    function/image/lerobot_decode_image.cpp
     function/copy/lerobot_codec_executor.cpp
     function/copy/lerobot_copy.cpp
     function/copy/lerobot_copy_options.cpp

@@ -15,9 +15,11 @@ WHERE function_name LIKE 'lerobot_%'
 ORDER BY function_name;
 ----
 lerobot_cache_info
+lerobot_decode_image
 lerobot_episodes
 lerobot_info
 lerobot_scan
+lerobot_stats
 lerobot_tasks
 lerobot_temporal_targets
 lerobot_video_frames
@@ -38,6 +40,16 @@ WHERE function_name IN (
 );
 ----
 0
+
+query TI
+SELECT function_name, list_contains(parameters, 'refresh')
+FROM duckdb_functions()
+WHERE function_name IN ('lerobot_info', 'lerobot_episodes', 'lerobot_tasks')
+ORDER BY function_name;
+----
+lerobot_episodes	true
+lerobot_info	true
+lerobot_tasks	true
 
 # Diagnostics are storage-passive: even a nonexistent root produces only the
 # two absent-cache rows and does not try to read info or episode metadata.

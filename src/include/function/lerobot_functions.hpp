@@ -14,11 +14,13 @@ namespace duckdb {
 class LerobotFunctions {
 public:
 	static vector<TableFunctionSet> GetTableFunctions();
+	static ScalarFunctionSet GetDecodeImageFunction();
 
 private:
 	static TableFunctionSet GetInfoFunction();
 	static TableFunctionSet GetEpisodesFunction();
 	static TableFunctionSet GetTasksFunction();
+	static TableFunctionSet GetStatsFunction();
 	static TableFunctionSet GetScanFunction();
 	static TableFunctionSet GetCacheInfoFunction();
 	static TableFunctionSet GetVideoRoutesFunction();
