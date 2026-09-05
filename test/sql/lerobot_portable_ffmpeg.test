@@ -56,6 +56,33 @@ FROM read_text('{TEST_DIR}/lerobot_portable_ffmpeg/meta/info.json');
 ----
 true	true	true
 
+# Encoder metadata must reflect the libaom fallback when RGB_CODEC is omitted.
+query TTT
+SELECT json_extract_string(features, '$."observation.images.front".info."video.preset"') IS NULL,
+       json_extract_string(features, '$."observation.images.front".info."video.extra_options"."cpu-used"'),
+       json_extract_string(features, '$."observation.images.front".info."video.extra_options".b')
+FROM lerobot_info('{TEST_DIR}/lerobot_portable_ffmpeg');
+----
+true	8	0
+
+# An explicit SQL codec choice must not fall back to another encoder.
+statement error
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'explicit SVT'::VARCHAR AS task,
+           from_hex(repeat('14283c', 4096)) AS rgb
+) TO '{TEST_DIR}/lerobot_portable_svt_failed' (
+    FORMAT lerobot, FPS 10,
+    FEATURES '{"rgb":{"dtype":"video","shape":[64,64,3]}}',
+    RGB_CODEC 'libsvtav1', ENCODER_THREADS 1
+);
+----
+no libsvtav1 encoder required by FORMAT lerobot
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/lerobot_portable_svt_failed*');
+----
+0
+
 # The distribution manifest intentionally excludes x265 and therefore cannot
 # write the GPL-backed, lossless Main12 depth representation.
 statement error

@@ -735,12 +735,13 @@ unique_ptr<FunctionData> LerobotVideoTargetsBind(ClientContext &context, TableFu
 	if (input.input_table_types.size() == 6) {
 		if (std::find(input.input_table_names.begin(), input.input_table_names.end(), "target_id") ==
 		    input.input_table_names.end()) {
-			throw BinderException("lerobot_video_targets input relation must contain exactly request_id, episode_index, "
-			                      "frame_index, video_key, and delta_index, with an optional target_id");
+			throw BinderException(
+			    "lerobot_video_targets input relation must contain exactly request_id, episode_index, "
+			    "frame_index, video_key, and delta_index, with an optional target_id");
 		}
 		input_columns.push_back(FindTargetInputColumn(input, "target_id"));
 	}
-	const LogicalType required_types[] = {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
+	const LogicalType required_types[] = {LogicalType::BIGINT,  LogicalType::BIGINT, LogicalType::BIGINT,
 	                                      LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT};
 	for (idx_t required = 0; required < input_columns.size(); required++) {
 		// Let DuckDB add a typed projection/cast between the input relation and
@@ -1847,10 +1848,10 @@ void BuildTargetBuffers(ClientContext &context, const LerobotVideoTargetsBindDat
 		    ReadUnifiedValue<string_t>(local_state.input_formats, bind_data.input_columns[3], row, input_names[3]);
 		const auto delta_index =
 		    ReadUnifiedInteger(local_state.input_formats, bind_data.input_columns[4], row, input_names[4]);
-		const auto target_id = bind_data.input_columns.size() == 6
-		                           ? ReadUnifiedInteger(local_state.input_formats, bind_data.input_columns[5], row,
-		                                                "target_id")
-		                           : 0;
+		const auto target_id =
+		    bind_data.input_columns.size() == 6
+		        ? ReadUnifiedInteger(local_state.input_formats, bind_data.input_columns[5], row, "target_id")
+		        : 0;
 		if (episode_index < 0 || frame_index < 0) {
 			throw InvalidInputException("lerobot_video_targets episode_index and frame_index must be non-negative");
 		}

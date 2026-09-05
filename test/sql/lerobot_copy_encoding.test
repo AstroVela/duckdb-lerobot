@@ -1,6 +1,6 @@
 # name: test/sql/lerobot_copy_encoding.test
 # description: Depth quantizers, strict range checks and bounded RGB codec options
-# group: [lerobot]
+# group: [sql]
 
 require-env LEROBOT_FFMPEG_TESTS
 

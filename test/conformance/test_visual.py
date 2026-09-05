@@ -84,9 +84,7 @@ def create_extension(duckdb: Path, extension: Path, root: Path, quantizer: dict,
         f"DEPTH_MIN {quantizer['depth_min']}, DEPTH_MAX {quantizer['depth_max']}, "
         f"DEPTH_SHIFT {quantizer['shift']}, DEPTH_USE_LOG {str(quantizer['use_log']).lower()});"
     )
-    subprocess.run(
-        [str(duckdb), "-unsigned", "-batch"], input=sql, text=True, capture_output=True, check=True
-    )
+    subprocess.run([str(duckdb), "-unsigned", "-batch"], input=sql, text=True, capture_output=True, check=True)
 
 
 def compare_readers(duckdb: Path, extension: Path, root: Path, quantizer: dict) -> None:
@@ -124,9 +122,7 @@ def compare_readers(duckdb: Path, extension: Path, root: Path, quantizer: dict) 
                 # The dataset reader dequantizes Torch float32 tensors. The
                 # separate NumPy branch promotes uint16 multiplication through
                 # float64 and can differ by one millimetre when rounding.
-                physical = dequantize_depth(
-                    torch.from_numpy(codes), **quantizer, output_unit=unit, output_tensor=False
-                )
+                physical = dequantize_depth(torch.from_numpy(codes), **quantizer, output_unit=unit, output_tensor=False)
                 np.testing.assert_allclose(
                     actual[..., 0],
                     physical.reshape(SIZE, SIZE),
@@ -161,9 +157,7 @@ def compare_readers(duckdb: Path, extension: Path, root: Path, quantizer: dict) 
             delta = int(delta)
             assert (padding == "true") == bool(item["depth_is_pad"][delta])
             actual = np.frombuffer(bytes.fromhex(blob), dtype="<f4").reshape(SIZE, SIZE)
-            np.testing.assert_allclose(
-                actual, item["depth"][delta, 0].numpy(), rtol=0, atol=1e-6 if unit == "m" else 0
-            )
+            np.testing.assert_allclose(actual, item["depth"][delta, 0].numpy(), rtol=0, atol=1e-6 if unit == "m" else 0)
 
 
 def compare_images(duckdb: Path, extension: Path, workspace: Path) -> None:
@@ -211,9 +205,7 @@ def compare_images(duckdb: Path, extension: Path, workspace: Path) -> None:
         f"from_hex('{raw['depth'].astype('<u2').tobytes().hex()}') depth) "
         f"TO {sql_quote(root)} (FORMAT lerobot, FPS 10, FEATURES {sql_quote(json.dumps(features))});"
     )
-    subprocess.run(
-        [str(duckdb), "-unsigned", "-batch"], input=sql, text=True, capture_output=True, check=True
-    )
+    subprocess.run([str(duckdb), "-unsigned", "-batch"], input=sql, text=True, capture_output=True, check=True)
     dataset = LeRobotDataset(repo_id="conformance/images", root=root, video_backend="pyav")
     item = dataset[0]
     np.testing.assert_allclose(item["rgb"].numpy().transpose(1, 2, 0), raw["rgb"] / 255, atol=1e-7)

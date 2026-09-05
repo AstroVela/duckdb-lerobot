@@ -178,11 +178,11 @@ jobs:
       - name: Run pinned LeRobot visual conformance
         if: matrix.id == 'release-ffmpeg'
         env:
-          BUILD_DIR: build/${{ matrix.id }}
+          BUILD_DIR: ${{ matrix.build_dir }}
         run: |
           "${BUILD_DIR}/conformance-venv/bin/python" test/conformance/test_visual.py \
             --duckdb "${BUILD_DIR}/duckdb" \
-            --extension "${BUILD_DIR}/extension/lerobot/src/lerobot.duckdb_extension"
+            --extension "${BUILD_DIR}/extension/lerobot/lerobot.duckdb_extension"
 
       - name: Reject generated or build files outside ignored paths
         run: |

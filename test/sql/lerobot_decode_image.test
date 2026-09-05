@@ -1,6 +1,6 @@
 # name: test/sql/lerobot_decode_image.test
 # description: PNG/TIFF decode preserves HWC dtype and handles NULL, corrupt and vector inputs
-# group: [lerobot]
+# group: [sql]
 
 require-env LEROBOT_FFMPEG_TESTS
 
