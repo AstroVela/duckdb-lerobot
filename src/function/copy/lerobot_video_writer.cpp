@@ -1,9 +1,11 @@
 #include "function/lerobot_video_writer.hpp"
+#include "function/lerobot_video_io.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/common/string_util.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -34,7 +36,11 @@ string FFmpegWriteError(int error_code) {
 	return buffer;
 }
 
-void ThrowOnFFmpegError(int status, const string &operation, const string &path) {
+void ThrowOnFFmpegError(int status, const string &operation, const string &path,
+                        optional_ptr<LerobotVideoIO> io = nullptr) {
+	if (io) {
+		io->ThrowIfError();
+	}
 	if (status < 0) {
 		throw IOException("FFmpeg failed to %s LeRobot visual '%s': %s", operation, path, FFmpegWriteError(status));
 	}
@@ -98,21 +104,30 @@ struct SwsContextDeleter {
 };
 
 struct AVFormatInputDeleter {
-	void operator()(AVFormatContext *context) const {
-		avformat_close_input(&context);
+	explicit AVFormatInputDeleter(LerobotVideoIO &io_p) : io(io_p) {
 	}
-};
-
-struct AVFormatOutputDeleter {
 	void operator()(AVFormatContext *context) const {
 		if (!context) {
 			return;
 		}
-		if (context->pb) {
-			avio_closep(&context->pb);
+		auto pb = context->pb;
+		avformat_close_input(&context);
+		io.Close(pb);
+	}
+	LerobotVideoIO &io;
+};
+
+struct AVFormatOutputDeleter {
+	explicit AVFormatOutputDeleter(LerobotVideoIO &io_p) : io(io_p) {
+	}
+	void operator()(AVFormatContext *context) const {
+		if (!context) {
+			return;
 		}
+		io.Close(context->pb);
 		avformat_free_context(context);
 	}
+	LerobotVideoIO &io;
 };
 
 typedef unique_ptr<AVPacket, AVPacketDeleter> PacketPtr;
@@ -200,61 +215,21 @@ void FillDepthFrame(const string &raw, LerobotRawVisualType raw_type, idx_t widt
 }
 
 void DrainEncoder(AVCodecContext &codec_context, AVFormatContext &format_context, AVStream &stream, AVPacket &packet,
-                  const string &path, bool short_depth_video) {
+                  const string &path, LerobotVideoIO &io) {
 	while (true) {
 		auto status = avcodec_receive_packet(&codec_context, &packet);
 		if (status == AVERROR(EAGAIN) || status == AVERROR_EOF) {
 			return;
 		}
 		ThrowOnFFmpegError(status, "receive an encoded packet for", path);
-		// x265 uses a two-frame DTS reorder window by default. For clips shorter
-		// than that window there is no actual reordering, but older x265 releases
-		// can return an uninitialized DTS while flushing. Native LeRobot/PyAV
-		// produces DTS == PTS for the same one- and two-frame clips.
-		if (short_depth_video) {
-			packet.dts = packet.pts;
-		}
 		if (packet.duration <= 0) {
 			packet.duration = 1;
 		}
 		av_packet_rescale_ts(&packet, codec_context.time_base, stream.time_base);
 		packet.stream_index = stream.index;
-		ThrowOnFFmpegError(av_interleaved_write_frame(&format_context, &packet), "mux", path);
+		ThrowOnFFmpegError(av_interleaved_write_frame(&format_context, &packet), "mux", path, &io);
 		av_packet_unref(&packet);
 	}
-}
-
-string EncodeStillImageWithFFmpeg(const string &raw_frame, idx_t width, idx_t height) {
-	const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_PNG);
-	if (!codec) {
-		throw MissingExtensionException("FFmpeg has no PNG encoder required by FORMAT lerobot");
-	}
-	CodecContextPtr codec_context(avcodec_alloc_context3(codec));
-	if (!codec_context) {
-		throw OutOfMemoryException("Failed to allocate the LeRobot PNG encoder");
-	}
-	codec_context->width = NumericCast<int>(width);
-	codec_context->height = NumericCast<int>(height);
-	codec_context->pix_fmt = AV_PIX_FMT_RGB24;
-	codec_context->time_base = AVRational {1, 1};
-	ThrowOnFFmpegError(avcodec_open2(codec_context.get(), codec, nullptr), "open the PNG encoder for", "memory");
-
-	FramePtr frame(av_frame_alloc());
-	PacketPtr packet(av_packet_alloc());
-	if (!frame || !packet) {
-		throw OutOfMemoryException("Failed to allocate a LeRobot PNG frame");
-	}
-	frame->format = codec_context->pix_fmt;
-	frame->width = codec_context->width;
-	frame->height = codec_context->height;
-	ThrowOnFFmpegError(av_frame_get_buffer(frame.get(), 1), "allocate a PNG frame for", "memory");
-	for (idx_t y = 0; y < height; y++) {
-		memcpy(frame->data[0] + y * frame->linesize[0], raw_frame.data() + y * width * 3, width * 3);
-	}
-	frame->pts = 0;
-	ThrowOnFFmpegError(avcodec_send_frame(codec_context.get(), frame.get()), "submit a PNG frame for", "memory");
-	ThrowOnFFmpegError(avcodec_receive_packet(codec_context.get(), packet.get()), "encode a PNG frame for", "memory");
-	return string(reinterpret_cast<const char *>(packet->data), packet->size);
 }
 
 void AppendUInt16(string &result, uint16_t value) {
@@ -402,13 +377,14 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 	}
 	const auto is_svt = !is_depth && strcmp(codec->name, "libsvtav1") == 0;
 
+	LerobotVideoIO io(fs, path, true, options.cancelled);
 	AVFormatContext *raw_output = nullptr;
-	ThrowOnFFmpegError(avformat_alloc_output_context2(&raw_output, nullptr, "mp4", path.c_str()),
+	ThrowOnFFmpegError(avformat_alloc_output_context2(&raw_output, nullptr, "mp4", LerobotVideoIO::URL()),
 	                   "allocate the output container for", path);
 	if (!raw_output) {
 		throw OutOfMemoryException("Failed to allocate a LeRobot MP4 container");
 	}
-	FormatOutputPtr output(raw_output);
+	FormatOutputPtr output(raw_output, AVFormatOutputDeleter(io));
 	auto stream = avformat_new_stream(output.get(), nullptr);
 	if (!stream) {
 		throw OutOfMemoryException("Failed to allocate a LeRobot MP4 stream");
@@ -424,7 +400,11 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 	codec_context->pix_fmt = is_depth ? AV_PIX_FMT_GRAY12LE : AV_PIX_FMT_YUV420P;
 	codec_context->time_base = AVRational {1, NumericCast<int>(options.fps)};
 	codec_context->framerate = AVRational {NumericCast<int>(options.fps), 1};
-	codec_context->gop_size = is_depth ? 2 : options.encoding.rgb_gop;
+	// x265 3.5 and 4.1 can corrupt even lossless samples when a reference
+	// picture has only one CTU column: its top/bottom right padding is missing.
+	// A CTU is at most 64 pixels wide. Intra-only coding avoids that reference
+	// path for narrow depth images without changing the process-wide CTU size.
+	codec_context->gop_size = is_depth ? (options.width <= 64 ? 1 : 2) : options.encoding.rgb_gop;
 	if (options.encoder_threads.IsValid()) {
 		codec_context->thread_count = NumericCast<int>(options.encoder_threads.GetIndex());
 	}
@@ -438,6 +418,9 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 	if (is_depth) {
 		// Each episode is encoded independently then stream-concatenated. Closed
 		// GOPs keep keyframe seeks independently decodable at episode boundaries.
+		// GOPs of one or two frames need no B-frames. Disable x265's default
+		// reorder delay so short and long fragments have consistent DTS offsets.
+		codec_context->max_b_frames = 0;
 		string x265_parameters = "lossless=1:open-gop=0";
 		if (options.encoder_threads.IsValid()) {
 			const auto encoder_threads = options.encoder_threads.GetIndex();
@@ -475,13 +458,11 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 	                   "copy encoder parameters for", path);
 	stream->time_base = codec_context->time_base;
 
-	if (!(output->oformat->flags & AVFMT_NOFILE)) {
-		ThrowOnFFmpegError(avio_open(&output->pb, path.c_str(), AVIO_FLAG_WRITE), "open", path);
-	}
+	io.Open(*output);
 	AVDictionary *raw_format_options = nullptr;
 	av_dict_set(&raw_format_options, "movflags", "faststart", 0);
 	DictionaryGuard format_options_guard(raw_format_options);
-	ThrowOnFFmpegError(avformat_write_header(output.get(), &raw_format_options), "write the MP4 header for", path);
+	ThrowOnFFmpegError(avformat_write_header(output.get(), &raw_format_options), "write the MP4 header for", path, &io);
 	ThrowOnUnusedOptions(raw_format_options, "container", path);
 	throw_if_cancelled();
 
@@ -525,13 +506,15 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 		}
 		target_frame->pts = NumericCast<int64_t>(frame_index);
 		ThrowOnFFmpegError(avcodec_send_frame(codec_context.get(), target_frame.get()), "submit a frame for", path);
-		DrainEncoder(*codec_context, *output, *stream, *packet, path, is_depth && frame_count <= 2);
+		DrainEncoder(*codec_context, *output, *stream, *packet, path, io);
 	}
 	throw_if_cancelled();
 	ThrowOnFFmpegError(avcodec_send_frame(codec_context.get(), nullptr), "flush the encoder for", path);
-	DrainEncoder(*codec_context, *output, *stream, *packet, path, is_depth && frame_count <= 2);
+	DrainEncoder(*codec_context, *output, *stream, *packet, path, io);
 	throw_if_cancelled();
-	ThrowOnFFmpegError(av_write_trailer(output.get()), "write the MP4 trailer for", path);
+	ThrowOnFFmpegError(av_write_trailer(output.get()), "write the MP4 trailer for", path, &io);
+	io.Close(output->pb);
+	io.ThrowIfError();
 
 	LerobotEncodedVideoInfo result;
 	result.encoder = codec->name;
@@ -541,13 +524,14 @@ LerobotEncodedVideoInfo LerobotVisualWriter::EncodeVideo(FileSystem &fs, const s
 		throw IOException("LeRobot encoder returned an unknown pixel format");
 	}
 	result.pixel_format = pixel_format;
+	result.gop = codec_context->gop_size;
 	result.duration = static_cast<double>(frame_count) / static_cast<double>(options.fps);
 	result.frame_count = frame_count;
 	return result;
 #endif
 }
 
-void LerobotVisualWriter::ConcatenateVideos(const vector<string> &input_paths, const string &list_path,
+void LerobotVisualWriter::ConcatenateVideos(ClientContext &context, FileSystem &fs, const vector<string> &input_paths,
                                             const string &output_path) {
 #ifndef LEROBOT_HAVE_FFMPEG
 	throw MissingExtensionException("FORMAT lerobot video writing requires FFmpeg development libraries");
@@ -555,109 +539,195 @@ void LerobotVisualWriter::ConcatenateVideos(const vector<string> &input_paths, c
 	if (input_paths.empty()) {
 		throw InvalidInputException("Cannot concatenate an empty LeRobot video list");
 	}
-	AVDictionary *raw_input_options = nullptr;
-	av_dict_set(&raw_input_options, "safe", "0", 0);
-	struct DictionaryGuard {
-		explicit DictionaryGuard(AVDictionary *&dictionary_p) : dictionary(dictionary_p) {
+	for (const auto &path : input_paths) {
+		if (path == output_path || StringUtil::GetFilePath(path) != StringUtil::GetFilePath(output_path)) {
+			throw InvalidInputException("LeRobot concat fragments must be files in the concat staging directory");
 		}
-		~DictionaryGuard() {
-			av_dict_free(&dictionary);
-		}
-		AVDictionary *&dictionary;
-	} input_options_guard(raw_input_options);
-	AVFormatContext *raw_input = nullptr;
-	auto concat_format = av_find_input_format("concat");
-	if (!concat_format) {
-		throw MissingExtensionException("FFmpeg concat demuxer is unavailable");
 	}
-	ThrowOnFFmpegError(avformat_open_input(&raw_input, list_path.c_str(), concat_format, &raw_input_options),
-	                   "open the concat list for", output_path);
-	FormatInputPtr input(raw_input);
-	ThrowOnUnusedOptions(raw_input_options, "concat input", output_path);
-	ThrowOnFFmpegError(avformat_find_stream_info(input.get(), nullptr), "inspect concat streams for", output_path);
-
+	// FFmpeg 6's concat demuxer opens its children without inheriting custom
+	// I/O. Remux our single-video fragments directly, so every access uses
+	// DuckDB and no filesystem path is interpreted as a URL or concat text.
+	LerobotVideoIO output_io(fs, output_path, true, nullptr, &context);
 	AVFormatContext *raw_output = nullptr;
-	ThrowOnFFmpegError(avformat_alloc_output_context2(&raw_output, nullptr, "mp4", output_path.c_str()),
+	ThrowOnFFmpegError(avformat_alloc_output_context2(&raw_output, nullptr, "mp4", LerobotVideoIO::URL()),
 	                   "allocate the concatenated container for", output_path);
 	if (!raw_output) {
 		throw OutOfMemoryException("Failed to allocate a concatenated LeRobot MP4 container");
 	}
-	FormatOutputPtr output(raw_output);
-	vector<int> stream_map(input->nb_streams, -1);
-	for (idx_t input_index = 0; input_index < input->nb_streams; input_index++) {
-		auto input_stream = input->streams[input_index];
-		if (input_stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO &&
-		    input_stream->codecpar->codec_type != AVMEDIA_TYPE_AUDIO &&
-		    input_stream->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
-			continue;
-		}
-		auto output_stream = avformat_new_stream(output.get(), nullptr);
-		if (!output_stream) {
-			throw OutOfMemoryException("Failed to allocate a concatenated LeRobot stream");
-		}
-		ThrowOnFFmpegError(avcodec_parameters_copy(output_stream->codecpar, input_stream->codecpar),
-		                   "copy concatenated stream parameters for", output_path);
-		output_stream->codecpar->codec_tag = 0;
-		output_stream->time_base = input_stream->time_base;
-		stream_map[input_index] = NumericCast<int>(output_stream->index);
-	}
-	if (!(output->oformat->flags & AVFMT_NOFILE)) {
-		ThrowOnFFmpegError(avio_open(&output->pb, output_path.c_str(), AVIO_FLAG_WRITE), "open", output_path);
-	}
-	AVDictionary *raw_output_options = nullptr;
-	av_dict_set(&raw_output_options, "movflags", "faststart", 0);
-	DictionaryGuard output_options_guard(raw_output_options);
-	ThrowOnFFmpegError(avformat_write_header(output.get(), &raw_output_options), "write the MP4 header for",
-	                   output_path);
-	ThrowOnUnusedOptions(raw_output_options, "concat container", output_path);
-
+	FormatOutputPtr output(raw_output, AVFormatOutputDeleter(output_io));
+	AVStream *output_stream = nullptr;
 	PacketPtr packet(av_packet_alloc());
 	if (!packet) {
 		throw OutOfMemoryException("Failed to allocate a concatenated LeRobot packet");
 	}
-	while (true) {
-		auto status = av_read_frame(input.get(), packet.get());
-		if (status == AVERROR_EOF) {
-			break;
+	auto add_timestamp = [&](int64_t left, int64_t right) {
+		if ((right > 0 && left > NumericLimits<int64_t>::Maximum() - right) ||
+		    (right < 0 && left < NumericLimits<int64_t>::Minimum() - right)) {
+			throw IOException("LeRobot video timestamps overflow while concatenating '%s'", output_path);
 		}
-		ThrowOnFFmpegError(status, "read a concatenated packet for", output_path);
-		const auto input_index = packet->stream_index;
-		if (input_index < 0 || static_cast<idx_t>(input_index) >= stream_map.size()) {
-			throw IOException("FFmpeg returned an invalid stream index while concatenating LeRobot video '%s'",
-			                  output_path);
+		return left + right;
+	};
+	int64_t offset = 0;
+	for (const auto &path : input_paths) {
+		LerobotVideoIO input_io(fs, path, false, nullptr, &context);
+		FormatInputPtr input(avformat_alloc_context(), AVFormatInputDeleter(input_io));
+		if (!input) {
+			throw OutOfMemoryException("Failed to allocate a LeRobot fragment reader");
 		}
-		if (stream_map[input_index] < 0) {
+		input_io.Open(*input);
+		auto raw_input = input.release();
+		auto status = avformat_open_input(&raw_input, LerobotVideoIO::URL(), nullptr, nullptr);
+		input.reset(raw_input);
+		ThrowOnFFmpegError(status, "open a video fragment for", output_path, &input_io);
+		ThrowOnFFmpegError(avformat_find_stream_info(input.get(), nullptr), "inspect a video fragment for", output_path,
+		                   &input_io);
+		if (input->nb_streams != 1 || input->streams[0]->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) {
+			throw IOException("LeRobot video fragment '%s' must contain exactly one video stream", path);
+		}
+		auto source = input->streams[0];
+		if (source->duration == AV_NOPTS_VALUE || source->duration <= 0 || source->time_base.num <= 0 ||
+		    source->time_base.den <= 0) {
+			throw IOException("LeRobot video fragment '%s' has no valid duration or time base", path);
+		}
+		if (!output_stream) {
+			output_stream = avformat_new_stream(output.get(), nullptr);
+			if (!output_stream) {
+				throw OutOfMemoryException("Failed to allocate a concatenated LeRobot stream");
+			}
+			ThrowOnFFmpegError(avcodec_parameters_copy(output_stream->codecpar, source->codecpar),
+			                   "copy concatenated stream parameters for", output_path);
+			output_stream->codecpar->codec_tag = 0;
+			output_stream->time_base = source->time_base;
+			output_io.Open(*output);
+			AVDictionary *options = nullptr;
+			av_dict_set(&options, "movflags", "faststart", 0);
+			status = avformat_write_header(output.get(), &options);
+			av_dict_free(&options);
+			ThrowOnFFmpegError(status, "write the MP4 header for", output_path, &output_io);
+		} else if (source->codecpar->codec_id != output_stream->codecpar->codec_id ||
+		           source->codecpar->format != output_stream->codecpar->format ||
+		           source->codecpar->width != output_stream->codecpar->width ||
+		           source->codecpar->height != output_stream->codecpar->height) {
+			throw IOException("LeRobot video fragment '%s' changes the stream format", path);
+		}
+		// Accumulate in the output stream's time base. Going through integer
+		// microseconds per episode would introduce drift at rates such as 30 fps.
+		const auto duration = av_rescale_q(source->duration, source->time_base, output_stream->time_base);
+		const auto start = source->start_time == AV_NOPTS_VALUE
+		                       ? 0
+		                       : av_rescale_q(source->start_time, source->time_base, output_stream->time_base);
+		if (duration <= 0 || start == NumericLimits<int64_t>::Minimum()) {
+			throw IOException("LeRobot video fragment '%s' has unrepresentable timestamps", path);
+		}
+		const auto delta = add_timestamp(offset, -start);
+		while (true) {
+			status = av_read_frame(input.get(), packet.get());
+			input_io.ThrowIfError();
+			if (status == AVERROR_EOF) {
+				break;
+			}
+			ThrowOnFFmpegError(status, "read a video fragment for", output_path);
+			if (packet->stream_index != 0 || packet->pts == AV_NOPTS_VALUE || packet->dts == AV_NOPTS_VALUE) {
+				throw IOException("LeRobot video fragment '%s' returned an invalid packet", path);
+			}
+			av_packet_rescale_ts(packet.get(), source->time_base, output_stream->time_base);
+			if (packet->pts == AV_NOPTS_VALUE || packet->dts == AV_NOPTS_VALUE) {
+				throw IOException("LeRobot video fragment '%s' has unrepresentable packet timestamps", path);
+			}
+			packet->pts = add_timestamp(packet->pts, delta);
+			packet->dts = add_timestamp(packet->dts, delta);
+			packet->stream_index = output_stream->index;
+			packet->pos = -1;
+			ThrowOnFFmpegError(av_interleaved_write_frame(output.get(), packet.get()), "mux a concatenated packet for",
+			                   output_path, &output_io);
 			av_packet_unref(packet.get());
-			continue;
 		}
-		if (packet->pts == AV_NOPTS_VALUE || packet->dts == AV_NOPTS_VALUE) {
-			throw IOException("LeRobot video packet has no PTS or DTS while concatenating '%s'", output_path);
-		}
-		auto input_stream = input->streams[input_index];
-		auto output_stream = output->streams[stream_map[input_index]];
-		av_packet_rescale_ts(packet.get(), input_stream->time_base, output_stream->time_base);
-		packet->stream_index = output_stream->index;
-		packet->pos = -1;
-		ThrowOnFFmpegError(av_interleaved_write_frame(output.get(), packet.get()), "mux a concatenated packet for",
-		                   output_path);
-		av_packet_unref(packet.get());
+		offset = add_timestamp(offset, duration);
+		input.reset();
+		input_io.ThrowIfError();
 	}
-	ThrowOnFFmpegError(av_write_trailer(output.get()), "write the MP4 trailer for", output_path);
+	ThrowOnFFmpegError(av_write_trailer(output.get()), "write the MP4 trailer for", output_path, &output_io);
+	output_io.Close(output->pb);
+	output_io.ThrowIfError();
 #endif
 }
 
-string LerobotVisualWriter::EncodeImage(const string &raw_frame, idx_t width, idx_t height,
-                                        LerobotRawVisualType raw_type) {
+struct LerobotImageWriter::Impl {
+#ifdef LEROBOT_HAVE_FFMPEG
+	Impl(idx_t width, idx_t height) {
+		const auto codec = avcodec_find_encoder(AV_CODEC_ID_PNG);
+		if (!codec) {
+			throw MissingExtensionException("FFmpeg has no PNG encoder required by FORMAT lerobot");
+		}
+		codec_context.reset(avcodec_alloc_context3(codec));
+		if (!codec_context) {
+			throw OutOfMemoryException("Failed to allocate the LeRobot PNG encoder");
+		}
+		codec_context->width = NumericCast<int>(width);
+		codec_context->height = NumericCast<int>(height);
+		codec_context->pix_fmt = AV_PIX_FMT_RGB24;
+		codec_context->time_base = AVRational {1, 1};
+		// Each input must immediately produce one independent PNG. Frame
+		// threading would introduce delay and retain additional input buffers.
+		codec_context->thread_count = 1;
+		ThrowOnFFmpegError(avcodec_open2(codec_context.get(), codec, nullptr), "open the PNG encoder for", "memory");
+		frame.reset(av_frame_alloc());
+		packet.reset(av_packet_alloc());
+		if (!frame || !packet) {
+			throw OutOfMemoryException("Failed to allocate a LeRobot PNG frame");
+		}
+		frame->format = codec_context->pix_fmt;
+		frame->width = codec_context->width;
+		frame->height = codec_context->height;
+		frame->pts = 0;
+		ThrowOnFFmpegError(av_frame_get_buffer(frame.get(), 1), "allocate a PNG frame for", "memory");
+	}
+
+	string Encode(const string &raw_frame, idx_t width, idx_t height) {
+		// send_frame may retain a reference even after receive_packet. Never
+		// overwrite a referenced buffer when encoding the next still image.
+		ThrowOnFFmpegError(av_frame_make_writable(frame.get()), "reuse a PNG frame for", "memory");
+		for (idx_t y = 0; y < height; y++) {
+			memcpy(frame->data[0] + y * frame->linesize[0], raw_frame.data() + y * width * 3, width * 3);
+		}
+		ThrowOnFFmpegError(avcodec_send_frame(codec_context.get(), frame.get()), "submit a PNG frame for", "memory");
+		ThrowOnFFmpegError(avcodec_receive_packet(codec_context.get(), packet.get()), "encode a PNG frame for",
+		                   "memory");
+		string result(reinterpret_cast<const char *>(packet->data), packet->size);
+		av_packet_unref(packet.get());
+		return result;
+	}
+
+	CodecContextPtr codec_context;
+	FramePtr frame;
+	PacketPtr packet;
+#endif
+};
+
+LerobotImageWriter::LerobotImageWriter(idx_t width_p, idx_t height_p, LerobotRawVisualType raw_type_p)
+    : width(width_p), height(height_p), raw_type(raw_type_p),
+      expected_size(LerobotVisualWriter::ExpectedFrameBytes(width, height, raw_type)) {
 #ifndef LEROBOT_HAVE_FFMPEG
 	throw MissingExtensionException("FORMAT lerobot image writing requires FFmpeg development libraries");
 #else
-	const auto expected_size = ExpectedFrameBytes(width, height, raw_type);
+	if (raw_type == LerobotRawVisualType::RGB24) {
+		impl = make_uniq<Impl>(width, height);
+	}
+#endif
+}
+
+LerobotImageWriter::~LerobotImageWriter() = default;
+
+string LerobotImageWriter::Encode(const string &raw_frame) {
+#ifndef LEROBOT_HAVE_FFMPEG
+	throw MissingExtensionException("FORMAT lerobot image writing requires FFmpeg development libraries");
+#else
 	if (raw_frame.size() != expected_size) {
 		throw InvalidInputException("LeRobot visual frame has %llu bytes; expected %llu", raw_frame.size(),
 		                            expected_size);
 	}
 	if (raw_type == LerobotRawVisualType::RGB24) {
-		return EncodeStillImageWithFFmpeg(raw_frame, width, height);
+		return impl->Encode(raw_frame, width, height);
 	}
 	return EncodeDepthTiff(raw_frame, width, height, raw_type);
 #endif

@@ -1,0 +1,72 @@
+# name: test/sql/lerobot_copy_numeric.test
+# description: Numeric COPY statistics preserve array shapes across chunks and dimension batches
+# group: [sql]
+
+require parquet
+
+require json
+
+require lerobot
+
+statement ok
+SET threads = 1;
+
+# 2050 rows cross the scan chunk boundary; 65 values cross the statistics
+# dimension batch boundary. All sums here are exactly representable.
+statement ok
+COPY (
+    SELECT 0::BIGINT AS episode_index, 'numeric' AS task,
+           list_transform(range(65), d -> (i + d)::FLOAT / 8)::FLOAT[65] AS wide,
+           array_value(array_value(i::DOUBLE, i + 0.25::DOUBLE),
+                       array_value(i + 0.5::DOUBLE, i + 0.75::DOUBLE)) AS matrix,
+           array_value(i % 2 = 0, i % 2 = 1) AS mask
+    FROM range(2050) t(i) ORDER BY i
+) TO '{TEST_DIR}/lerobot_copy_numeric' (
+    FORMAT lerobot, FPS 30,
+    FEATURES '{"wide":{"dtype":"float32","shape":[65]},"matrix":{"dtype":"float64","shape":[2,2]},"mask":{"dtype":"bool","shape":[2]}}'
+);
+
+query RRRIII
+SELECT "stats/wide/mean"[65], "stats/matrix/mean"[2][2], "stats/mask/mean"[1],
+       "stats/wide/count"[1], "stats/matrix/min"[1][1], "stats/matrix/max"[1][1]
+FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_numeric');
+----
+136.0625	1025.25	0.5	2050	0	2049
+
+query III
+SELECT count(*), bool_and(len(wide) = 65 AND len(matrix) = 2 AND len(matrix[1]) = 2),
+       bool_and(wide[65] = (frame_index + 64)::FLOAT / 8)
+FROM lerobot_scan('{TEST_DIR}/lerobot_copy_numeric');
+----
+2050	true	true
+
+statement error
+COPY (SELECT 0::BIGINT AS episode_index, 'null' AS task,
+      array_value(array_value(1::DOUBLE, NULL::DOUBLE), array_value(2::DOUBLE, 3::DOUBLE)) AS matrix)
+TO '{TEST_DIR}/lerobot_copy_numeric_null_leaf' (
+    FORMAT lerobot, FPS 30, FEATURES '{"matrix":{"dtype":"float64","shape":[2,2]}}'
+);
+----
+LeRobot feature values must not be NULL
+
+statement error
+COPY (SELECT 0::BIGINT AS episode_index, 'null' AS task,
+      array_value(NULL::DOUBLE[2], array_value(2::DOUBLE, 3::DOUBLE)) AS matrix)
+TO '{TEST_DIR}/lerobot_copy_numeric_null_array' (
+    FORMAT lerobot, FPS 30, FEATURES '{"matrix":{"dtype":"float64","shape":[2,2]}}'
+);
+----
+LeRobot feature values must not be NULL
+
+statement error
+COPY (SELECT 0::BIGINT AS episode_index, 'nonfinite' AS task, array_value(1::FLOAT, 'NaN'::FLOAT) AS wide)
+TO '{TEST_DIR}/lerobot_copy_numeric_nan' (
+    FORMAT lerobot, FPS 30, FEATURES '{"wide":{"dtype":"float32","shape":[2]}}'
+);
+----
+LeRobot numeric features cannot contain NaN or infinity
+
+query I
+SELECT 42;
+----
+42

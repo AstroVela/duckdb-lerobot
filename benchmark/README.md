@@ -191,6 +191,7 @@ hash equivalence before its timing is accepted.
 ```bash
 python benchmark/lerobot_copy_write.py \
   --duckdb-cli build/release/duckdb \
+  --extension build/release/extension/lerobot/lerobot.duckdb_extension \
   --work-dir build/write-benchmark-data \
   --output build/write-benchmark.json \
   --threads 4 \
@@ -199,13 +200,21 @@ python benchmark/lerobot_copy_write.py \
   --repeats 3
 ```
 
-The result records wall time, peak RSS, Linux `/proc/<pid>/io` counters, output
-size, and the serial/parallel median ratio. It also doubles the episode count
-for the 4-camera parallel case. With one-pass shard materialization, `rchar`
-and `wchar` should scale approximately 2x rather than with the quadratic
-episode-prefix rewrite pattern. Treat process-I/O ratios as a diagnostic, not a
-portable pass/fail threshold: filesystems and DuckDB versions account bytes
-differently. Use `--keep-output` to retain all validated datasets.
+Result schema v2 records wall time, per-child peak RSS, kernel filesystem block
+counters, output size, and the serial/parallel median ratio. On systems with
+`wait4`, accounting covers the entire CLI process, including shard assembly,
+metadata publication and shutdown; validation runs separately. Linux and macOS
+RSS values are normalized to bytes. These block counters replace the old sampled
+`rchar`/`wchar` fields, whose final writes could be missed. They measure filesystem
+I/O and depend on the page cache; they do not measure logical bytes transferred
+by read/write calls. On Linux, each block unit represents 512 bytes.
+
+The 4-camera case doubles the episode count and reports block-counter ratios.
+Unavailable metrics and ratios with zero denominators are `null`, never assumed
+zero. Treat these ratios as diagnostics: cached reads can produce zero blocks,
+and the ratios alone cannot establish an algorithm's I/O complexity. Systems
+without `wait4` retain wall time with unknown resource metrics. Use `--keep-output`
+to retain all validated datasets.
 
 ## Daft reference scale
 
@@ -243,3 +252,102 @@ timestamp lookups and preloading an explicit SQL table. It uses the supplied
 DuckDB CLI and checks result equivalence before reporting timings. See
 [scope and interpretation](../docs/review-followups.md#timestamp-experiment).
 It does not add or benchmark an extension-owned timestamp cache.
+
+`video_target_timestamps.py` measures the real `lerobot_video_targets` operator
+on generated local shards, including multiple input chunks, sparse/dense
+requests and repeated targets. Its metadata projection consumes every timestamp
+and works with deliberately absent MP4 files. A native join checks count and
+timestamp-sum equivalence. For example, run the same command with the before
+and after extensions and separate output paths:
+
+```bash
+python3 benchmark/video_target_timestamps.py \
+  --duckdb build/release/duckdb \
+  --extension build/release/extension/lerobot/lerobot.duckdb_extension \
+  --rows 1000000 --shards 1 4 --targets 4 4096 32768 --repeats 5 \
+  --output build/video-target-timestamps.json
+```
+
+Use `--batch-size`, `--threads` and `--memory-limit` to vary batching and memory
+pressure. `--video clip.mp4` also measures decoding and records an untimed pixel
+hash aggregate for comparisons with the same pinned DuckDB build. The supplied
+clip must be 32 fps and contain at least `rows / shards` frames for every shard
+count tested. This is separate from external codec conformance.
+
+Each scenario uses a fresh database; repeats share route/footer caches but each
+target query constructs and releases its own timestamp indexes. OS caches are
+not flushed, and the join runs before the target queries. Buffer-memory values
+are cumulative connection high-water marks, including native query memory, not
+isolated index residency or RSS. DuckDB 1.5.5 does not export dynamic metrics for
+table-in/out operators; the report leaves these metrics unavailable. Controlled
+C++ tests check query counts, data reads and the index memory cap directly.
+Neither local benchmark measures HTTP/Hugging Face latency or bandwidth.
+
+## Numeric COPY
+
+`lerobot_copy_numeric.py` measures COPY of synthetic state/action arrays with
+float32, float64 and int64 elements. The defaults cover 14, 64, 65 and 256
+dimensions, including the statistics batch boundary. Every run checks every
+written frame with a native Parquet scan, then hashes all episode and dataset
+statistics; compare these hashes before interpreting timings across binaries.
+
+```bash
+python3 benchmark/lerobot_copy_numeric.py \
+  --duckdb build/release/duckdb \
+  --extension build/release/extension/lerobot/lerobot.duckdb_extension \
+  --frames 10000 --episodes 2 --repeats 3 --threads 1 \
+  --widths 14 64 65 256 --dtypes float32 float64 int64 \
+  --memory-limit 256MB --output build/numeric-copy.json
+```
+
+Each repeat starts a fresh process. Input-table generation precedes profiling;
+`copy_seconds` measures the COPY statement, while `process_seconds` also
+includes setup and validation. The connection buffer high-water mark is
+cumulative. Linux runs with `/usr/bin/time` additionally record the process
+RSS high-water mark, including validation and shutdown; other environments
+leave RSS unavailable. Neither metric is a hard RSS bound imposed by
+`memory_limit`. Temporary spill files use a separate directory per run.
+OS caches are not flushed. This is a numeric workload with no codec work.
+
+The local Linux x86_64 comparison in
+[`results/numeric-copy-20260906.json`](results/numeric-copy-20260906.json)
+records both extension hashes and per-repeat timings/memory. It also includes
+a 96 MB memory configuration that spills to disk. The same 256-dimensional
+fixture fails at 64 MB in both implementations; this benchmark does not
+establish support below DuckDB's allocation requirements for the workload.
+
+## Image COPY
+
+`lerobot_copy_image.py` measures RGB `image` COPY, using the independent NumPy
+fixtures and Pillow validator from `test/conformance/test_image_copy.py`.
+It needs NumPy, PyArrow and Pillow; the conformance environment provides them.
+Defaults cover 16×16, 160×120 and 640×480 images, a noisy VGA case, and two
+cameras with different resolutions. There are two episodes per dataset.
+
+```bash
+build/conformance-venv/bin/python benchmark/lerobot_copy_image.py \
+  --duckdb build/release/duckdb \
+  --extension build/release/extension/lerobot/lerobot.duckdb_extension \
+  --baseline-extension /path/to/before/lerobot.duckdb_extension \
+  --repeats 4 --output build/image-copy.json
+```
+
+Omit `--baseline-extension` to measure one binary. When supplied, the script
+alternates before/after run order on successive repeats and requires equal PNG
+and statistics hashes across both binaries. Each image is also decoded with a
+fresh Pillow instance and compared pixel by pixel to the input. Compressed-byte
+equality is a check for the same FFmpeg build, not a portable bitstream promise.
+
+DuckDB profiling measures COPY after input materialization; Python fixture
+generation and validation are outside that timer. Each run uses a fresh process
+and temporary directory. Linux GNU time measures DuckDB's peak RSS including
+input load and shutdown, excluding the Python process. Native buffer/spill
+metrics are cumulative connection peaks; `memory_limit` does not bound RSS or
+FFmpeg allocations. OS caches are not flushed.
+
+[`results/image-copy-20260906.json`](results/image-copy-20260906.json) records
+the local comparison, binary/source hashes and all repeats, including a second
+measurement with alternating run order for the noisy VGA workload. The small
+image case benefits from encoder reuse; compressing high-entropy large images
+remains expensive. These are whole-COPY measurements, not isolated PNG encoder
+timings or results for other platforms.

@@ -25,7 +25,7 @@ all been reproduced or resolved.
 | --- | --- |
 | Complete windows macro replacement | Indexed request and delta expansion; exact defaults, schemas, duplicate, empty-input, invalid-input and projection behavior. The C++ path is retained. Its limit is **100,000 request/delta pairs before camera expansion**. A 12-row expansion test alone is insufficient. |
 | Shared resource governance | Separate producer I/O, decoder sessions, decode workers, per-codec threads and write workers. Admission must be shared by concurrent queries in one DatabaseInstance, cancelable and deadlock-free. Retain per-frame hard bounds independently of any aggregate budget; define which buffers/codec allocations the budget covers. SET is still public API. |
-| Timestamp cache | Compare cold construction, repeated reuse, sparse/dense requests, remote I/O and eviction pressure. Preserve missing/duplicate-frame validation, cancellation and concurrent-load behavior. Define shard identity and invalidation; info.json fingerprints alone do not detect independent shard edits. |
+| Database-wide timestamp cache | The query-local bounded index and real-operator benchmark are documented in README and `benchmark/README.md`. Cross-query reuse remains deferred: compare cold construction, remote I/O and eviction pressure, and define credentials/session isolation, shard identity and invalidation. info.json fingerprints alone do not detect independent shard edits. |
 | V2.0/V2.1 read adapters | Start with explicit target datasets and separate fixtures for each version's tasks, statistics and path contracts. Normalize to the common route model; do not send old layouts into the v3 parser. Write support stays v3. |
 | Append and remote COPY | Define writer exclusion, immutable files versus tail reuse, commit/recovery protocol, reader snapshots and cache invalidation. A final meta-directory rename is not a complete transaction protocol. Timestamp caching is not a prerequisite. |
 | Broader codec/platform support | Test each codec/pixel-format/depth combination and official readback. Selecting a runtime encoder does not alter the license of the linked FFmpeg build. Community distribution templates and Linux ARM/macOS/Windows jobs require their own build validation. |
@@ -78,8 +78,15 @@ one-off, remote or memory-constrained queries.
 
 The original six nested Connection construction sites consist of three
 metadata sites, two video sites and one COPY FEATURES parser. Replacing the
-video sites would leave four, before considering how a cache loads its data.
-Removing SQL text construction and reducing storage work are separate goals.
+video queries alone would leave the metadata and COPY sites. The metadata,
+target timestamp and COPY FEATURES queries now use the scoped cancellation
+helper; the video producer retains its own connection registration and
+interruption path. These remain independent connections with their own
+transactions. Both paths now inherit explicit session overrides of extension
+settings, including HTTPFS credentials and endpoints; this is verified with
+native reads against a loopback S3 fixture. They do not copy the full session
+or its profiling configuration. Removing SQL text construction and
+reducing storage work are separate goals.
 
 ## Local validation
 

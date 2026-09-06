@@ -103,8 +103,20 @@ public:
 		string version_tag;
 	};
 
+	struct MetadataFile {
+		MetadataFile(string path_p, FileFingerprint fingerprint_p)
+		    : path(std::move(path_p)), fingerprint(std::move(fingerprint_p)) {
+		}
+		bool operator==(const MetadataFile &other) const {
+			return path == other.path && fingerprint == other.fingerprint;
+		}
+		string path;
+		FileFingerprint fingerprint;
+	};
+
 	LerobotDatasetMetadata(string root_p, LerobotDatasetInfo info_p, vector<LerobotEpisodeRoute> routes_p,
-	                       vector<string> data_files_p, FileFingerprint info_fingerprint_p);
+	                       vector<string> data_files_p, FileFingerprint info_fingerprint_p,
+	                       vector<MetadataFile> episode_files_p = {});
 
 	static shared_ptr<LerobotDatasetMetadata> Get(ClientContext &context, const string &root, bool refresh);
 	//! Return an existing cache entry without reading dataset storage or creating
@@ -144,16 +156,21 @@ public:
 	const FileFingerprint &GetInfoFingerprint() const {
 		return info_fingerprint;
 	}
+	const vector<MetadataFile> &GetEpisodeFiles() const {
+		return episode_files;
+	}
 	idx_t GetEpisodeCount() const {
 		return static_cast<idx_t>(info.total_episodes);
 	}
 
 private:
-	static string CacheKey(const string &root);
+	static string CacheKey(ClientContext &context, const string &root);
 	static FileFingerprint ReadInfoFingerprint(ClientContext &context, const string &root);
+	static vector<MetadataFile> ReadEpisodeFiles(ClientContext &context, const string &root);
 	static shared_ptr<LerobotDatasetMetadata> Load(ClientContext &context, const string &root,
 	                                               const FileFingerprint &info_fingerprint);
 	bool IsValid(ClientContext &context) const;
+	bool EpisodeFilesAreValid(ClientContext &context) const;
 
 private:
 	string root;
@@ -161,6 +178,7 @@ private:
 	vector<LerobotEpisodeRoute> routes;
 	vector<string> data_files;
 	FileFingerprint info_fingerprint;
+	vector<MetadataFile> episode_files;
 };
 
 //! Lazily loaded video control plane. Keeping this separate prevents ordinary
@@ -170,7 +188,8 @@ public:
 	LerobotVideoMetadata(string root_p, string video_path_template_p, int64_t fps_p, vector<string> video_keys_p,
 	                     vector<LerobotVideoFeatureMetadata> video_feature_metadata_p,
 	                     vector<LerobotVideoRoute> routes_p, vector<string> video_files_p,
-	                     LerobotDatasetMetadata::FileFingerprint info_fingerprint_p);
+	                     LerobotDatasetMetadata::FileFingerprint info_fingerprint_p,
+	                     vector<LerobotDatasetMetadata::MetadataFile> episode_files_p = {});
 
 	static shared_ptr<LerobotVideoMetadata> Get(ClientContext &context, const string &root, bool refresh);
 	//! Return an existing cache entry without reading dataset storage or creating
@@ -205,7 +224,7 @@ public:
 	}
 
 private:
-	static string CacheKey(const string &root);
+	static string CacheKey(ClientContext &context, const string &root);
 	static shared_ptr<LerobotVideoMetadata> Load(ClientContext &context, const LerobotDatasetMetadata &dataset);
 	bool IsValid(const LerobotDatasetMetadata &dataset) const;
 
@@ -218,6 +237,7 @@ private:
 	vector<LerobotVideoRoute> routes;
 	vector<string> video_files;
 	LerobotDatasetMetadata::FileFingerprint info_fingerprint;
+	vector<LerobotDatasetMetadata::MetadataFile> episode_files;
 };
 
 } // namespace duckdb

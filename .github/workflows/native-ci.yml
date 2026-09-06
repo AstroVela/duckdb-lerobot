@@ -43,6 +43,7 @@ jobs:
             build_dir: build/release
             ffmpeg: true
             sanitizers: false
+            rgb_codec: libaom-av1
             cmake_options: >-
               -DLEROBOT_ENABLE_FFMPEG=ON
               -DLEROBOT_AV1_ENCODER=libaom
@@ -55,6 +56,7 @@ jobs:
             build_dir: build/reldebug
             ffmpeg: true
             sanitizers: true
+            rgb_codec: libsvtav1
             cmake_options: >-
               -DLEROBOT_ENABLE_FFMPEG=ON
               -DLEROBOT_AV1_ENCODER=svt
@@ -73,10 +75,19 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
+      - name: Apply the pinned test-host EOF fix
+        run: |
+          test "$(git -C duckdb rev-parse HEAD)" = d8cdaa33fda8df955cc76ef58a280f68f4cd43fa
+          git -C duckdb apply --check ../test/patches/duckdb-1.5.5-cached-eof.patch
+          git -C duckdb apply ../test/patches/duckdb-1.5.5-cached-eof.patch
+
       - name: Install build tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ccache ninja-build pkg-config python3-venv
+
+      - name: Check benchmark process accounting
+        run: python3 -m unittest discover -s test/python -p 'test_*.py' -v
 
       - name: Install FFmpeg development packages
         if: matrix.ffmpeg
@@ -121,6 +132,92 @@ jobs:
           make "${{ matrix.build_target }}" GEN="${GEN}" EXT_FLAGS="${EXT_FLAGS}"
           make "${{ matrix.test_target }}"
           ccache --show-stats
+
+      - name: Check codec executor growth, budgets and cancellation
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          timeout 60s "${{ matrix.build_dir }}/extension/lerobot/test/lerobot_codec_executor_test"
+
+      - name: Check decoder lifetime with LeakSanitizer
+        if: matrix.sanitizers
+        env:
+          LEROBOT_FFMPEG_TESTS: '1'
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          "${{ matrix.build_dir }}/test/unittest" 'test/sql/lerobot_video_frames.test'
+
+      - name: Check concurrent mixed-resolution video against FFmpeg
+        if: matrix.ffmpeg
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          python3 test/conformance/test_mixed_video.py \
+            --duckdb "${{ matrix.build_dir }}/duckdb" \
+            --extension "${{ matrix.build_dir }}/extension/lerobot/lerobot.duckdb_extension" \
+            --codec "${{ matrix.rgb_codec }}" \
+            --workdir "${{ matrix.build_dir }}/mixed-video-conformance"
+          python3 test/conformance/test_mixed_video.py \
+            --duckdb "${{ matrix.build_dir }}/duckdb" \
+            --extension "${{ matrix.build_dir }}/extension/lerobot/lerobot.duckdb_extension" \
+            --codec "${{ matrix.rgb_codec }}" \
+            --fps 30 --episode-lengths 1 2 3 6 \
+            --workdir "${{ matrix.build_dir }}/video-timing-conformance"
+
+      - name: Check video I/O failures, rollback and retry
+        if: matrix.ffmpeg
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          timeout 180s "${{ matrix.build_dir }}/extension/lerobot/test/lerobot_video_io_test"
+
+      - name: Check numeric statistics, COPY binding cancellation and cleanup
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          timeout 60s "${{ matrix.build_dir }}/extension/lerobot/test/lerobot_video_io_test" '[numeric_stats],[copy_bind],[copy_cleanup]'
+
+      - name: Check custom video I/O lifetime with LeakSanitizer
+        if: matrix.sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          timeout 60s "${{ matrix.build_dir }}/extension/lerobot/test/lerobot_video_io_test" '[video_io],[video_copy_cancel]'
+
+      - name: Check PNG reuse, COPY cancellation and cleanup with LeakSanitizer
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          timeout 60s "${{ matrix.build_dir }}/extension/lerobot/test/lerobot_video_io_test" '[image_writer],[image_copy]'
+
+      - name: Check video producer cancellation and ownership
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          timeout 60s "${{ matrix.build_dir }}/extension/lerobot/test/lerobot_video_producer_test"
+
+      - name: Check routing caches, timestamp indexes and nested reader lifetime
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          timeout 60s "${{ matrix.build_dir }}/extension/lerobot/test/lerobot_nested_query_test"
+
+      - name: Check S3 cache isolation and session settings on loopback
+        if: matrix.id == 'release-ffmpeg'
+        run: |
+          "${{ matrix.build_dir }}/duckdb" -c 'INSTALL httpfs;'
+          python3 test/conformance/test_session_settings.py \
+            --duckdb "${{ matrix.build_dir }}/duckdb" \
+            --extension "${{ matrix.build_dir }}/extension/lerobot/lerobot.duckdb_extension"
 
       - name: Verify pinned build configuration
         env:
@@ -174,6 +271,10 @@ jobs:
             test/conformance/test_bidirectional.py \
             --duckdb "${BUILD_DIR}/duckdb" \
             --extension "${BUILD_DIR}/extension/lerobot/lerobot.duckdb_extension"
+          "${BUILD_DIR}/conformance-venv/bin/python" \
+            test/conformance/test_numeric_stats.py \
+            --duckdb "${BUILD_DIR}/duckdb" \
+            --extension "${BUILD_DIR}/extension/lerobot/lerobot.duckdb_extension"
 
       - name: Run pinned LeRobot visual conformance
         if: matrix.id == 'release-ffmpeg'
@@ -183,6 +284,17 @@ jobs:
           "${BUILD_DIR}/conformance-venv/bin/python" test/conformance/test_visual.py \
             --duckdb "${BUILD_DIR}/duckdb" \
             --extension "${BUILD_DIR}/extension/lerobot/lerobot.duckdb_extension"
+          "${BUILD_DIR}/conformance-venv/bin/python" test/conformance/test_image_copy.py \
+            --duckdb "${BUILD_DIR}/duckdb" \
+            --extension "${BUILD_DIR}/extension/lerobot/lerobot.duckdb_extension"
+          "${BUILD_DIR}/conformance-venv/bin/python" test/conformance/test_video_shards.py \
+            --duckdb "${BUILD_DIR}/duckdb" \
+            --extension "${BUILD_DIR}/extension/lerobot/lerobot.duckdb_extension"
+
+      - name: Restore the pinned test-host source after testing
+        run: |
+          git -C duckdb apply --reverse --check ../test/patches/duckdb-1.5.5-cached-eof.patch
+          git -C duckdb apply --reverse ../test/patches/duckdb-1.5.5-cached-eof.patch
 
       - name: Reject generated or build files outside ignored paths
         run: |

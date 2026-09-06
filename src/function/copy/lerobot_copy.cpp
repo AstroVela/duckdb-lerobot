@@ -1,12 +1,16 @@
 #include "function/lerobot_copy.hpp"
 #include "function/lerobot_codec_executor.hpp"
 #include "function/lerobot_copy_options.hpp"
+#include "function/lerobot_numeric_stats.hpp"
 #include "function/lerobot_schema.hpp"
 #include "function/lerobot_video_writer.hpp"
+#include "lerobot_path.hpp"
+#include "lerobot_query.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
@@ -16,7 +20,8 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/main/connection.hpp"
+#include "duckdb/main/query_result.hpp"
+#include "duckdb/logging/logger.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -183,21 +188,22 @@ void ThrowQueryError(const char *description, const QueryResult &result) {
 }
 
 vector<LerobotFeature> ParseUserFeatures(ClientContext &context, const string &features_json) {
-	Connection connection(*context.db);
-	auto result = connection.Query("SELECT CAST(key AS VARCHAR), json_extract_string(value, '$.dtype'), "
-	                               "CAST(json_extract(value, '$.shape') AS BIGINT[]), CAST(value AS VARCHAR), "
-	                               "COALESCE(TRY_CAST(json_extract(value, '$.info.is_depth_map') AS BOOLEAN), false), "
-	                               "COALESCE(CAST(json_extract(value, '$.names') AS VARCHAR), 'null') "
-	                               "FROM json_each(json(" +
-	                               Value(features_json).ToSQLString() + ")) ORDER BY id");
-	if (result->HasError()) {
-		ThrowQueryError("FEATURES JSON", *result);
+	LerobotNestedQuery query(context,
+	                         "SELECT CAST(key AS VARCHAR), json_extract_string(value, '$.dtype'), "
+	                         "CAST(json_extract(value, '$.shape') AS BIGINT[]), CAST(value AS VARCHAR), "
+	                         "COALESCE(TRY_CAST(json_extract(value, '$.info.is_depth_map') AS BOOLEAN), false), "
+	                         "COALESCE(CAST(json_extract(value, '$.names') AS VARCHAR), 'null') "
+	                         "FROM json_each(json(" +
+	                             Value(features_json).ToSQLString() + ")) ORDER BY id");
+	auto &result = query.GetResult();
+	if (result.HasError()) {
+		ThrowQueryError("FEATURES JSON", result);
 	}
 
 	vector<LerobotFeature> features;
 	case_insensitive_set_t names;
 	while (true) {
-		auto chunk = result->Fetch();
+		auto chunk = query.Fetch();
 		if (!chunk) {
 			break;
 		}
@@ -227,12 +233,7 @@ vector<LerobotFeature> ParseUserFeatures(ClientContext &context, const string &f
 				}
 				feature.shape.push_back(static_cast<idx_t>(value));
 			}
-			if (feature.name.empty()) {
-				throw BinderException("LeRobot feature names cannot be empty");
-			}
-			if (feature.name.find('/') != string::npos) {
-				throw BinderException("LeRobot feature names must not contain '/': '%s'", feature.name);
-			}
+			ValidateLerobotFeatureName(feature.name);
 			if (feature.shape.empty() || feature.shape.size() > 5) {
 				throw BinderException("LeRobot feature '%s' requires a shape with one to five dimensions",
 				                      feature.name);
@@ -358,8 +359,7 @@ string TasksPandasMetadataJSON() {
 	       "\"pandas_type\":\"unicode\",\"numpy_type\":\"object\",\"metadata\":{\"encoding\":\"UTF-8\"}}],"
 	       "\"columns\":[{\"name\":\"task_index\",\"field_name\":\"task_index\",\"pandas_type\":\"int64\","
 	       "\"numpy_type\":\"int64\",\"metadata\":null},{\"name\":\"task\",\"field_name\":\"task\","
-	       "\"pandas_type\":\"unicode\",\"numpy_type\":\"object\",\"metadata\":null}],\"attributes\":{},"
-	       "\"creator\":{\"library\":\"pyarrow\",\"version\":\"25.0.1\"},\"pandas_version\":\"2.3.3\"}";
+	       "\"pandas_type\":\"unicode\",\"numpy_type\":\"object\",\"metadata\":null}],\"attributes\":{}}";
 }
 
 CopyFunction GetParquetCopyFunction(ClientContext &context) {
@@ -1122,28 +1122,6 @@ void MergeStats(LerobotFeatureStats &target, const LerobotFeatureStats &source, 
 	target.stddev_is_float32 = false;
 }
 
-void FlattenNumericValue(const Value &value, vector<double> &result, vector<Value> *exact_result) {
-	if (value.IsNull()) {
-		throw InvalidInputException("LeRobot feature values must not be NULL");
-	}
-	if (value.type().id() == LogicalTypeId::ARRAY) {
-		for (const auto &child : ArrayValue::GetChildren(value)) {
-			FlattenNumericValue(child, result, exact_result);
-		}
-		return;
-	}
-	if (value.type().id() == LogicalTypeId::LIST) {
-		for (const auto &child : ListValue::GetChildren(value)) {
-			FlattenNumericValue(child, result, exact_result);
-		}
-		return;
-	}
-	result.push_back(value.DefaultCastAs(LogicalType::DOUBLE).GetValue<double>());
-	if (exact_result) {
-		exact_result->push_back(value);
-	}
-}
-
 vector<idx_t> SampleVisualFrameIndices(idx_t frame_count) {
 	if (frame_count == 0) {
 		return {};
@@ -1241,11 +1219,12 @@ struct LerobotVisualSpool {
 	}
 
 	void Close() {
-		if (!write_handle) {
-			return;
+		// Release our ownership even when explicit Close reports an error. The
+		// FileHandle destructor runs before staging cleanup can remove its file.
+		auto handle = std::move(write_handle);
+		if (handle) {
+			handle->Close();
 		}
-		write_handle->Close();
-		write_handle.reset();
 	}
 
 	void Remove(FileSystem &fs) {
@@ -1294,8 +1273,9 @@ struct LerobotCollectionStatsReader : public LerobotStatsRowReader {
 				throw InternalException("LeRobot statistics collection ended early");
 			}
 			chunk_position = 0;
+			numeric.Initialize(chunk.data[0], chunk.size());
 		}
-		FlattenNumericValue(chunk.GetValue(0, chunk_position++), row, exact_row);
+		numeric.AppendRow(chunk_position++, row, exact_row);
 		if (row.size() != width) {
 			throw InvalidInputException("LeRobot feature '%s' has %llu values; expected %llu", feature.name, row.size(),
 			                            width);
@@ -1310,6 +1290,7 @@ struct LerobotCollectionStatsReader : public LerobotStatsRowReader {
 	bool generated_timestamp;
 	ColumnDataScanState scan_state;
 	DataChunk chunk;
+	LerobotNumericStatsVector numeric;
 	idx_t chunk_position = 0;
 	idx_t position = 0;
 };
@@ -1547,7 +1528,10 @@ void WriteStringFile(FileSystem &fs, const string &path, const string &content) 
 	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW |
 	                                    FileFlags::FILE_FLAGS_EXCLUSIVE_CREATE);
 	if (!content.empty()) {
-		handle->Write(const_cast<char *>(content.data()), content.size());
+		const auto written = handle->Write(const_cast<char *>(content.data()), content.size());
+		if (written < 0 || static_cast<idx_t>(written) != content.size()) {
+			throw IOException("Failed to write complete LeRobot metadata to '%s'", path);
+		}
 	}
 	handle->Close();
 }
@@ -1568,9 +1552,73 @@ struct LerobotVideoShardState {
 	vector<string> fragments;
 };
 
+// Construct this before the file-owning members and create the directory only
+// after the guard is fully constructed. It then covers partial construction,
+// and runs after all file-owning members have been destroyed during rollback.
+struct LerobotStagingDirectory {
+	LerobotStagingDirectory(FileSystem &fs_p, shared_ptr<Logger> logger_p) : fs(fs_p), logger(std::move(logger_p)) {
+	}
+	LerobotStagingDirectory(const LerobotStagingDirectory &) = delete;
+	LerobotStagingDirectory &operator=(const LerobotStagingDirectory &) = delete;
+	~LerobotStagingDirectory() noexcept {
+		if (!owned) {
+			return;
+		}
+		Cleanup("remove staging directory", path, [&]() {
+			if (fs.DirectoryExists(path)) {
+				fs.RemoveDirectory(path);
+			}
+		});
+	}
+
+	void Create(const string &root) {
+		path = root + ".tmp-" + UUID::ToString(UUID::GenerateRandomUUID());
+		if (fs.FileExists(path) || fs.DirectoryExists(path)) {
+			throw IOException("LeRobot staging root already exists: '%s'", path);
+		}
+		// A filesystem can create the directory and then report failure.
+		owned = true;
+		fs.CreateDirectoriesRecursive(path);
+	}
+
+	void Publish(const string &root) {
+		fs.MoveFile(path, root);
+		owned = false;
+	}
+
+	template <class ACTION>
+	void Cleanup(const char *operation, const string &resource, ACTION action) const noexcept {
+		try {
+			action();
+		} catch (const std::exception &error) {
+			Report(operation, resource, &error);
+		} catch (...) {
+			Report(operation, resource, nullptr);
+		}
+	}
+
+	void Report(const char *operation, const string &resource, const std::exception *error) const noexcept {
+		try {
+			// Logging may allocate, use a failing storage backend, or be configured
+			// with warnings_as_errors. It must never stop the remaining cleanup or
+			// replace the original COPY error.
+			const auto reason = error ? ErrorData(*error).Message() : string("unknown exception");
+			DUCKDB_LOG_WARNING(logger, "LeRobot cleanup failed to %s '%s' (staging directory '%s'): %s", operation,
+			                   resource, path, reason);
+		} catch (...) { // NOLINT: cleanup diagnostics cannot throw
+		}
+	}
+
+	FileSystem &fs;
+	shared_ptr<Logger> logger;
+	string path;
+	bool owned = false;
+};
+
 struct LerobotCopyGlobalData : public GlobalFunctionData {
 	LerobotCopyGlobalData(ClientContext &context_p, const LerobotCopyBindData &bind_p, string root_p)
 	    : context(context_p), bind(bind_p), root(std::move(root_p)), fs(FileSystem::GetFileSystem(context)),
+	      staging(fs, context.logger),
 	      data_writer(bind.parquet_function,
 	                  BindParquet(context, bind.parquet_function, bind.data_names, bind.data_types, "huggingface",
 	                              HuggingFaceMetadataJSON(bind.features))),
@@ -1579,7 +1627,11 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 	      tasks_writer(bind.parquet_function,
 	                   BindParquet(context, bind.parquet_function, {"task_index", "task"},
 	                               {LogicalType::BIGINT, LogicalType::VARCHAR}, "pandas", TasksPandasMetadataJSON())) {
-		StringUtil::RTrim(root, fs.PathSeparator(root));
+		// DuckDB 1.5's StringUtil::RTrim also removes trailing UTF-8 bytes.
+		const auto separator = fs.PathSeparator(root);
+		while (!root.empty() && StringUtil::EndsWith(root, separator)) {
+			root.resize(root.size() - separator.size());
+		}
 		if (root.empty()) {
 			throw IOException("LeRobot dataset root cannot be empty");
 		}
@@ -1589,11 +1641,7 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 		if (fs.FileExists(root) || fs.DirectoryExists(root)) {
 			throw IOException("LeRobot dataset root already exists: '%s'", root);
 		}
-		stage_root = root + ".tmp-" + UUID::ToString(UUID::GenerateRandomUUID());
-		if (fs.FileExists(stage_root) || fs.DirectoryExists(stage_root)) {
-			throw IOException("LeRobot staging root already exists: '%s'", stage_root);
-		}
-		fs.CreateDirectoriesRecursive(stage_root);
+		staging.Create(root);
 		metadata_buffer = make_uniq<ColumnDataCollection>(context, bind.episode_types,
 		                                                  ColumnDataAllocatorType::BUFFER_MANAGER_ALLOCATOR);
 		metadata_buffer->InitializeAppend(metadata_append_state);
@@ -1603,6 +1651,7 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 		visual_raw_types_present.resize(bind.features.size(), false);
 		video_shards.resize(bind.features.size());
 		encoded_video_info.resize(bind.features.size());
+		image_writers.resize(bind.features.size());
 		for (idx_t feature_index = 0; feature_index < bind.features.size(); feature_index++) {
 			const auto &feature = bind.features[feature_index];
 			if ((feature.is_image || feature.is_video) && !feature.is_depth) {
@@ -1612,21 +1661,11 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 	}
 
 	~LerobotCopyGlobalData() override {
-		if (published || stage_root.empty()) {
-			return;
+		for (auto &spool : current_visual_spools) {
+			staging.Cleanup("close visual spool", spool.path, [&]() { spool.Close(); });
 		}
-		try {
-			for (auto &spool : current_visual_spools) {
-				spool.Close();
-			}
-			data_writer.global_data.reset();
-			episodes_writer.global_data.reset();
-			tasks_writer.global_data.reset();
-			if (fs.DirectoryExists(stage_root)) {
-				fs.RemoveDirectory(stage_root);
-			}
-		} catch (...) { // NOLINT
-		}
+		// The native Parquet states and all remaining file handles are destroyed
+		// before the staging guard, including during partial construction.
 	}
 
 	void StartEpisode(int64_t episode_index) {
@@ -1650,8 +1689,8 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 				continue;
 			}
 			current_visual_spools[feature_index].Initialize(
-			    fs.JoinPath(stage_root, ".tmp/raw/" + std::to_string(feature_index) + "/episode-" +
-			                                std::to_string(current_episode) + ".raw"));
+			    fs.JoinPath(staging.path, ".tmp/raw/" + std::to_string(feature_index) + "/episode-" +
+			                                  std::to_string(current_episode) + ".raw"));
 		}
 		current_video_routes.clear();
 		current_video_routes.resize(bind.features.size());
@@ -1725,9 +1764,12 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 				const auto raw_type = ResolveRawVisualType(feature_index, raw_value.GetSize());
 				current_visual_spools[feature_index].Append(fs, raw_value.GetData(), raw_value.GetSize());
 				if (feature.is_image) {
+					auto &writer = image_writers[feature_index];
+					if (!writer) {
+						writer = make_uniq<LerobotImageWriter>(feature.shape[1], feature.shape[0], raw_type);
+					}
 					string raw_frame(raw_value.GetData(), raw_value.GetSize());
-					auto encoded =
-					    LerobotVisualWriter::EncodeImage(raw_frame, feature.shape[1], feature.shape[0], raw_type);
+					auto encoded = writer->Encode(raw_frame);
 					output.data[feature.output_index].SetValue(
 					    row, Value::STRUCT(
 					             {{"bytes", Value::BLOB_RAW(encoded)},
@@ -1745,8 +1787,11 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 			const auto global_index = total_frames + frame_index;
 			for (const auto &feature : bind.features) {
 				if (feature.name == "timestamp") {
+					// LeRobot divides Python integers before Arrow converts the
+					// timestamp to float32. Do not round the operands to float first.
 					output.data[feature.output_index].SetValue(
-					    row, Value::FLOAT(static_cast<float>(frame_index) / static_cast<float>(bind.fps)));
+					    row, Value::FLOAT(
+					             static_cast<float>(static_cast<double>(frame_index) / static_cast<double>(bind.fps))));
 				} else if (feature.name == "frame_index") {
 					output.data[feature.output_index].SetValue(row, Value::BIGINT(NumericCast<int64_t>(frame_index)));
 				} else if (feature.name == "episode_index") {
@@ -1808,7 +1853,7 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 			}
 		}
 		if (!data_writer.global_data) {
-			auto path = fs.JoinPath(stage_root, DataRelativePath(data_chunk_index, data_file_index));
+			auto path = fs.JoinPath(staging.path, DataRelativePath(data_chunk_index, data_file_index));
 			fs.CreateDirectoriesRecursive(StringUtil::GetFilePath(path));
 			data_writer.Open(context, path);
 		}
@@ -1819,28 +1864,14 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 		return handle->GetFileSize();
 	}
 
-	string AbsoluteLocalPath(const string &path) {
-		if (fs.IsPathAbsolute(path)) {
-			return path;
-		}
-		return fs.JoinPath(FileSystem::GetWorkingDirectory(), path);
-	}
-
-	void ValidateConcatPath(const string &path) {
-		if (path.find('\n') != string::npos || path.find('\r') != string::npos || path.find('\\') != string::npos ||
-		    path.find('\'') != string::npos) {
-			throw InvalidInputException(
-			    "LeRobot video output paths cannot contain newlines, backslashes, or single quotes");
-		}
-	}
-
 	void MaterializeVideoShard(idx_t feature_index) {
 		auto &shard = video_shards[feature_index];
 		if (shard.fragments.empty()) {
 			return;
 		}
 		const auto &feature = bind.features[feature_index];
-		auto shard_path = fs.JoinPath(stage_root, VideoRelativePath(feature.name, shard.chunk_index, shard.file_index));
+		auto shard_path =
+		    fs.JoinPath(staging.path, VideoRelativePath(feature.name, shard.chunk_index, shard.file_index));
 		fs.CreateDirectoriesRecursive(StringUtil::GetFilePath(shard_path));
 		if (fs.FileExists(shard_path)) {
 			throw InternalException("LeRobot video shard already exists before materialization: '%s'", shard_path);
@@ -1852,26 +1883,14 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 			return;
 		}
 
-		auto temporary_dir = fs.JoinPath(stage_root, ".tmp/videos/" + std::to_string(feature_index));
-		vector<string> absolute_fragments;
-		absolute_fragments.reserve(shard.fragments.size());
-		string concat_contents = "ffconcat version 1.0\n";
-		for (const auto &fragment : shard.fragments) {
-			auto absolute_fragment = AbsoluteLocalPath(fragment);
-			ValidateConcatPath(absolute_fragment);
-			absolute_fragments.push_back(absolute_fragment);
-			concat_contents += "file '" + absolute_fragment + "'\n";
-		}
+		auto temporary_dir = fs.JoinPath(staging.path, ".tmp/videos/" + std::to_string(feature_index));
 		auto shard_id = std::to_string(shard.chunk_index) + "-" + std::to_string(shard.file_index);
-		auto concat_list = fs.JoinPath(temporary_dir, "shard-" + shard_id + ".ffconcat");
 		auto concat_output = fs.JoinPath(temporary_dir, "shard-" + shard_id + ".mp4");
-		WriteStringFile(fs, concat_list, concat_contents);
-		LerobotVisualWriter::ConcatenateVideos(absolute_fragments, concat_list, concat_output);
+		LerobotVisualWriter::ConcatenateVideos(context, fs, shard.fragments, concat_output);
 		fs.MoveFile(concat_output, shard_path);
 		for (const auto &fragment : shard.fragments) {
 			fs.RemoveFile(fragment);
 		}
-		fs.RemoveFile(concat_list);
 		shard.fragments.clear();
 		shard.fragment_bytes = 0;
 	}
@@ -1931,7 +1950,7 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 			if (!visual_raw_types_present[feature_index]) {
 				throw InternalException("LeRobot video feature '%s' has no resolved raw dtype", feature.name);
 			}
-			auto temporary_dir = fs.JoinPath(stage_root, ".tmp/videos/" + std::to_string(feature_index));
+			auto temporary_dir = fs.JoinPath(staging.path, ".tmp/videos/" + std::to_string(feature_index));
 			fs.CreateDirectoriesRecursive(temporary_dir);
 			auto episode_path = fs.JoinPath(temporary_dir, "episode-" + std::to_string(current_episode) + ".mp4");
 			LerobotVideoEncodeOptions options;
@@ -2157,7 +2176,7 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 			return;
 		}
 		if (!episodes_writer.global_data) {
-			auto path = fs.JoinPath(stage_root, EpisodesRelativePath(metadata_chunk_index, metadata_file_index));
+			auto path = fs.JoinPath(staging.path, EpisodesRelativePath(metadata_chunk_index, metadata_file_index));
 			fs.CreateDirectoriesRecursive(StringUtil::GetFilePath(path));
 			episodes_writer.Open(context, path);
 		}
@@ -2190,7 +2209,7 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 			collection->Append(append_state, chunk);
 			offset += count;
 		}
-		auto path = fs.JoinPath(stage_root, "meta/tasks.parquet");
+		auto path = fs.JoinPath(staging.path, "meta/tasks.parquet");
 		fs.CreateDirectoriesRecursive(StringUtil::GetFilePath(path));
 		tasks_writer.Open(context, path);
 		tasks_writer.Flush(context, std::move(collection));
@@ -2271,11 +2290,12 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 		    ",\"video.width\":" + std::to_string(feature.shape[1]) + ",\"video.codec\":" + JsonEscape(encoded.codec) +
 		    ",\"video.pix_fmt\":" + JsonEscape(encoded.pixel_format) + ",\"video.fps\":" + std::to_string(bind.fps) +
 		    ",\"video.channels\":" + std::to_string(feature.shape[2]) +
-		    ",\"has_audio\":false,\"video.g\":" + std::to_string(depth ? 2 : bind.encoding.rgb_gop) +
+		    ",\"has_audio\":false,\"video.g\":" + std::to_string(encoded.gop) +
 		    ",\"video.crf\":" + std::to_string(depth ? 30 : bind.encoding.rgb_crf) +
 		    ",\"video.preset\":" + (depth || !is_svt ? "null" : "12") +
 		    ",\"video.fast_decode\":0,\"video.video_backend\":\"pyav\",\"video.extra_options\":" +
-		    (depth ? "{\"x265-params\":\"lossless=1:open-gop=0\"}" : (is_svt ? "{}" : "{\"cpu-used\":8,\"b\":0}")) +
+		    (depth ? "{\"bf\":0,\"x265-params\":\"lossless=1:open-gop=0\"}"
+		           : (is_svt ? "{}" : "{\"cpu-used\":8,\"b\":0}")) +
 		    ",\"is_depth_map\":" + (depth ? "true" : "false");
 		if (depth) {
 			result += ',' + DepthQuantizerJSON() + ",\"depth_unit\":" + JsonEscape(depth_unit);
@@ -2321,29 +2341,34 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 	}
 
 	void Finalize() {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
 		FinishEpisode();
 		MaterializeVideoShards();
 		FlushMetadataBuffer();
 		data_writer.Close(context);
 		episodes_writer.Close(context);
 		WriteTasks();
-		auto temporary_root = fs.JoinPath(stage_root, ".tmp");
+		auto temporary_root = fs.JoinPath(staging.path, ".tmp");
 		if (fs.DirectoryExists(temporary_root)) {
 			fs.RemoveDirectory(temporary_root);
 		}
 		if (total_episodes > 0) {
-			WriteStringFile(fs, fs.JoinPath(stage_root, "meta/stats.json"), StatsJSON());
+			WriteStringFile(fs, fs.JoinPath(staging.path, "meta/stats.json"), StatsJSON());
 		}
-		WriteStringFile(fs, fs.JoinPath(stage_root, "meta/info.json"), InfoJSON());
-		fs.MoveFile(stage_root, root);
-		published = true;
+		WriteStringFile(fs, fs.JoinPath(staging.path, "meta/info.json"), InfoJSON());
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		staging.Publish(root);
 	}
 
 	ClientContext &context;
 	const LerobotCopyBindData &bind;
 	string root;
-	string stage_root;
 	FileSystem &fs;
+	LerobotStagingDirectory staging;
 	shared_ptr<LerobotCodecExecutor> codec_executor;
 	DelegatedParquetWriter data_writer;
 	DelegatedParquetWriter episodes_writer;
@@ -2365,6 +2390,7 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 	vector<LerobotVideoRoute> current_video_routes;
 	vector<LerobotVideoShardState> video_shards;
 	vector<LerobotEncodedVideoInfo> encoded_video_info;
+	vector<unique_ptr<LerobotImageWriter>> image_writers;
 	idx_t total_episodes = 0;
 	idx_t total_frames = 0;
 	int64_t current_episode = -1;
@@ -2375,7 +2401,6 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 	idx_t metadata_chunk_index = 0;
 	idx_t metadata_file_index = 0;
 	bool has_current_episode = false;
-	bool published = false;
 };
 
 unique_ptr<LocalFunctionData> LerobotCopyInitializeLocal(ExecutionContext &, FunctionData &) {
