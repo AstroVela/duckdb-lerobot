@@ -75,6 +75,12 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
+      - name: Apply the pinned test-host EOF fix
+        run: |
+          test "$(git -C duckdb rev-parse HEAD)" = d8cdaa33fda8df955cc76ef58a280f68f4cd43fa
+          git -C duckdb apply --check ../test/patches/duckdb-1.5.5-cached-eof.patch
+          git -C duckdb apply ../test/patches/duckdb-1.5.5-cached-eof.patch
+
       - name: Install build tools
         run: |
           sudo apt-get update -qq

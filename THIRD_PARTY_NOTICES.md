@@ -10,6 +10,10 @@ Python distribution remain subject to that distribution's own notices.
   `d8cdaa33fda8df955cc76ef58a280f68f4cd43fa`. DuckDB is licensed under the
   MIT License; its license is included at `duckdb/LICENSE` after submodule
   initialization.
+  Native CI applies the locally authored zero-byte-read fix documented in
+  [test/patches/README.md](test/patches/README.md) to its test host. The patch
+  includes a small context excerpt from this MIT-licensed source; the
+  distribution pipeline uses the unmodified pinned DuckDB revision.
 
 ## Optional native multimedia dependencies
 

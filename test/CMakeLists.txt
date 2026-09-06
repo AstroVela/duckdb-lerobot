@@ -1,3 +1,29 @@
+# These tests compile selected LeRobot implementations (and a controlled codec)
+# into their executables. Link DuckDB's static core so Windows does not require
+# internal symbols that are absent from duckdb.dll's export table. Use a loader
+# containing only the native readers to avoid linking a second LeRobot copy.
+add_library(lerobot_test_duckdb INTERFACE)
+if(BUILD_MAIN_DUCKDB_LIBRARY)
+  add_library(lerobot_test_extension_loader OBJECT
+              cpp/test_extension_loader.cpp)
+  target_include_directories(
+    lerobot_test_extension_loader
+    PRIVATE "${DUCKDB_MODULE_BASE_DIR}/extension/core_functions/include"
+            "${DUCKDB_MODULE_BASE_DIR}/extension/json/include"
+            "${DUCKDB_MODULE_BASE_DIR}/extension/parquet/include")
+  target_compile_definitions(lerobot_test_extension_loader
+                             PRIVATE DUCKDB_STATIC_BUILD)
+  target_compile_definitions(lerobot_test_duckdb INTERFACE DUCKDB_STATIC_BUILD)
+  target_sources(lerobot_test_duckdb
+                 INTERFACE $<TARGET_OBJECTS:lerobot_test_extension_loader>)
+  target_link_libraries(
+    lerobot_test_duckdb INTERFACE duckdb_static core_functions_extension
+                                  json_extension parquet_extension)
+else()
+  # Support the small local harness that imports an existing DuckDB library.
+  target_link_libraries(lerobot_test_duckdb INTERFACE duckdb)
+endif()
+
 # Compile the real executor with a controlled encoder, so cancellation tests can
 # hold workers at exact boundaries without depending on FFmpeg timing.
 add_executable(
@@ -6,7 +32,7 @@ add_executable(
 target_include_directories(
   lerobot_codec_executor_test
   PRIVATE ../src/include "${DUCKDB_MODULE_BASE_DIR}/third_party/catch")
-target_link_libraries(lerobot_codec_executor_test PRIVATE duckdb)
+target_link_libraries(lerobot_codec_executor_test PRIVATE lerobot_test_duckdb)
 # Keep the test encoder separate from any LeRobot symbols linked into DuckDB.
 set_target_properties(
   lerobot_codec_executor_test PROPERTIES CXX_VISIBILITY_PRESET hidden
@@ -34,7 +60,7 @@ add_executable(
 target_include_directories(
   lerobot_video_producer_test
   PRIVATE ../src/include "${DUCKDB_MODULE_BASE_DIR}/third_party/catch")
-target_link_libraries(lerobot_video_producer_test PRIVATE duckdb)
+target_link_libraries(lerobot_video_producer_test PRIVATE lerobot_test_duckdb)
 set_target_properties(
   lerobot_video_producer_test PROPERTIES CXX_VISIBILITY_PRESET hidden
                                          VISIBILITY_INLINES_HIDDEN ON)
@@ -58,7 +84,7 @@ add_executable(
 target_include_directories(
   lerobot_nested_query_test
   PRIVATE ../src/include "${DUCKDB_MODULE_BASE_DIR}/third_party/catch")
-target_link_libraries(lerobot_nested_query_test PRIVATE duckdb)
+target_link_libraries(lerobot_nested_query_test PRIVATE lerobot_test_duckdb)
 set_target_properties(
   lerobot_nested_query_test PROPERTIES CXX_VISIBILITY_PRESET hidden
                                        VISIBILITY_INLINES_HIDDEN ON)
@@ -89,7 +115,7 @@ add_executable(
 target_include_directories(
   lerobot_video_io_test PRIVATE ../src/include
                                 "${DUCKDB_MODULE_BASE_DIR}/third_party/catch")
-target_link_libraries(lerobot_video_io_test PRIVATE duckdb)
+target_link_libraries(lerobot_video_io_test PRIVATE lerobot_test_duckdb)
 if(LEROBOT_MEDIA_LIBRARIES)
   if(LEROBOT_MEDIA_INCLUDE_DIRS)
     target_include_directories(lerobot_video_io_test SYSTEM
