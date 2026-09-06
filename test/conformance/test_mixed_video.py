@@ -24,8 +24,7 @@ LAYOUTS = (
 # Narrow depth clips also use gradients spanning all 4096 codes. A width of
 # 66 checks the boundary where inter prediction remains enabled.
 CASES = tuple((layout, "tiles") for layout in LAYOUTS) + tuple(
-    ({"depth": shape}, "ramp")
-    for shape in ((64, 16, 1), (64, 32, 1), (96, 64, 1), (96, 66, 1))
+    ({"depth": shape}, "ramp") for shape in ((64, 16, 1), (64, 32, 1), (96, 64, 1), (96, 66, 1))
 )
 
 
@@ -33,9 +32,7 @@ def quote(value: str | Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def run(
-    command: list[str], payload: bytes | None = None, log: Path | None = None
-) -> bytes:
+def run(command: list[str], payload: bytes | None = None, log: Path | None = None) -> bytes:
     result = subprocess.run(command, input=payload, capture_output=True, timeout=180)
     if log is not None:
         log.write_bytes(result.stderr)
@@ -64,23 +61,13 @@ def little_endian_shorts(values: list[int]) -> bytes:
 def depth_values(shape: tuple[int, int, int], index: int, pattern: str) -> list[int]:
     height, width, _ = shape
     if pattern == "ramp":
-        return [
-            (x * 37 + y * 11 + index * 137) % 4096
-            for y in range(height)
-            for x in range(width)
-        ]
+        return [(x * 37 + y * 11 + index * 137) % 4096 for y in range(height) for x in range(width)]
     # Quarter-metre inputs have exact binary normalization in [1, 5] metres.
     # Each of the 12 frames differs, with an asymmetric spatial pattern.
-    return [
-        1000 + 250 * (1 + (x // 8 + 3 * (y // 8) + index) % 15)
-        for y in range(height)
-        for x in range(width)
-    ]
+    return [1000 + 250 * (1 + (x // 8 + 3 * (y // 8) + index) % 15) for y in range(height) for x in range(width)]
 
 
-def raw_frame(
-    key: str, shape: tuple[int, int, int], index: int, depth_pattern: str
-) -> bytes:
+def raw_frame(key: str, shape: tuple[int, int, int], index: int, depth_pattern: str) -> bytes:
     if key == "depth":
         return little_endian_shorts(depth_values(shape, index, depth_pattern))
     height, width, _ = shape
@@ -129,15 +116,10 @@ def write_datasets(
             for key, shape in layout.items()
         }
         rows = []
-        identities = [
-            (episode, frame)
-            for episode, length in enumerate(episode_lengths)
-            for frame in range(length)
-        ]
+        identities = [(episode, frame) for episode, length in enumerate(episode_lengths) for frame in range(length)]
         for index, (episode, frame) in enumerate(identities):
             blobs = [
-                f"from_hex('{raw_frame(key, shape, index, depth_pattern).hex()}')"
-                for key, shape in layout.items()
+                f"from_hex('{raw_frame(key, shape, index, depth_pattern).hex()}')" for key, shape in layout.items()
             ]
             rows.append(f"({episode}, {frame}, {','.join(blobs)})")
         columns = ", ".join(layout)
@@ -287,9 +269,7 @@ def validate_dataset(
     episode_lengths: list[int],
 ) -> dict:
     frame_count = sum(episode_lengths)
-    episode_starts = [
-        sum(episode_lengths[:episode]) for episode in range(len(episode_lengths))
-    ]
+    episode_starts = [sum(episode_lengths[:episode]) for episode in range(len(episode_lengths))]
     info = json.loads((root / "meta/info.json").read_text())
     assert (info["total_episodes"], info["total_frames"], info["fps"]) == (
         len(episode_lengths),
@@ -320,9 +300,7 @@ def validate_dataset(
             assert video_info["video.g"] == (1 if shape[1] <= 64 else 2), video_info
             assert video_info["video.extra_options"]["bf"] == 0, video_info
         else:
-            assert video_info["video.preset"] == (
-                12 if codec == "libsvtav1" else None
-            ), video_info
+            assert video_info["video.preset"] == (12 if codec == "libsvtav1" else None), video_info
             assert video_info["video.g"] == 2, video_info
         files = list((root / "videos" / key).rglob("*.mp4"))
         assert len(files) == 1, (root, key, files)
@@ -347,10 +325,7 @@ def validate_dataset(
                 key,
                 routes,
             )
-            assert (
-                abs(float(end) - (episode_starts[index] + episode_lengths[index]) / fps)
-                < 1e-6
-            ), (
+            assert abs(float(end) - (episode_starts[index] + episode_lengths[index]) / fps) < 1e-6, (
                 key,
                 routes,
             )
@@ -424,14 +399,8 @@ def main() -> None:
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
     args = parser.parse_args()
-    if (
-        args.fps <= 0
-        or any(length <= 0 for length in args.episode_lengths)
-        or sum(args.episode_lengths) != 12
-    ):
-        parser.error(
-            "FPS and episode lengths must be positive, and episode lengths must total 12"
-        )
+    if args.fps <= 0 or any(length <= 0 for length in args.episode_lengths) or sum(args.episode_lengths) != 12:
+        parser.error("FPS and episode lengths must be positive, and episode lengths must total 12")
     duckdb, extension, workspace = (
         args.duckdb.resolve(),
         args.extension.resolve(),
@@ -447,9 +416,7 @@ def main() -> None:
         "ffprobe": run([args.ffprobe, "-version"]).decode().splitlines()[0],
     }
     (workspace / "versions.json").write_text(json.dumps(versions, indent=2) + "\n")
-    roots = write_datasets(
-        duckdb, extension, workspace, args.codec, args.fps, args.episode_lengths
-    )
+    roots = write_datasets(duckdb, extension, workspace, args.codec, args.fps, args.episode_lengths)
     results = [
         validate_dataset(
             duckdb,

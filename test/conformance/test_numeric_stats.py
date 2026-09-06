@@ -28,9 +28,7 @@ SQL_TYPES = {
 }
 
 
-def scenario(
-    root: Path, width: int, rows: int, dtypes: list[str]
-) -> tuple[str, dict, dict]:
+def scenario(root: Path, width: int, rows: int, dtypes: list[str]) -> tuple[str, dict, dict]:
     features = {dtype: {"dtype": dtype, "shape": [width]} for dtype in dtypes}
     data = {}
     columns = []
@@ -49,9 +47,7 @@ def scenario(
             else:
                 expression = "((i + {d}) % 7) - 3"
         data[dtype] = values.astype(dtype)
-        leaves = [
-            f"({expression.format(d=d)})::{SQL_TYPES[dtype]}" for d in range(width)
-        ]
+        leaves = [f"({expression.format(d=d)})::{SQL_TYPES[dtype]}" for d in range(width)]
         value = leaves[0] if width == 1 else "array_value(" + ",".join(leaves) + ")"
         columns.append(f'{value} AS "{dtype}"')
     sql = (
@@ -65,9 +61,7 @@ def scenario(
 
 def check(root: Path, data: dict, features: dict) -> int:
     reference = compute_episode_stats(data, features)
-    episode = pq.read_table(
-        next((root / "meta/episodes").rglob("*.parquet"))
-    ).to_pylist()[0]
+    episode = pq.read_table(next((root / "meta/episodes").rglob("*.parquet"))).to_pylist()[0]
     dataset = json.loads((root / "meta/stats.json").read_text())
     checks = 0
     for feature, stats in reference.items():
@@ -76,9 +70,7 @@ def check(root: Path, data: dict, features: dict) -> int:
             # exercises shape/chunk/pairwise boundaries without masking a
             # changed reader behind a floating-point tolerance.
             for actual in (episode[f"stats/{feature}/{name}"], dataset[feature][name]):
-                np.testing.assert_array_equal(
-                    actual, expected, err_msg=f"{root.name}/{feature}/{name}"
-                )
+                np.testing.assert_array_equal(actual, expected, err_msg=f"{root.name}/{feature}/{name}")
                 checks += 1
     return checks
 
@@ -91,11 +83,7 @@ def main() -> None:
     for name, version in (("lerobot", LEROBOT_VERSION), ("numpy", "2.2.6")):
         if importlib.metadata.version(name) != version:
             raise RuntimeError(f"expected {name}=={version}")
-    cases = [
-        (width, rows, ["float32", "float64"])
-        for width in (1, 14, 64, 65, 256)
-        for rows in (1, 7, 8, 129, 2050)
-    ]
+    cases = [(width, rows, ["float32", "float64"]) for width in (1, 14, 64, 65, 256) for rows in (1, 7, 8, 129, 2050)]
     cases += [(65, 1, list(SQL_TYPES)), (65, 129, list(SQL_TYPES))]
     checks = 0
     with tempfile.TemporaryDirectory(prefix="lerobot-stats-oracle-") as directory:
@@ -104,9 +92,7 @@ def main() -> None:
             sql, data, features = scenario(root, width, rows, dtypes)
             run_duckdb(args.duckdb, args.extension, "SET threads=1; " + sql)
             checks += check(root, data, features)
-    print(
-        f"Pinned LeRobot numeric statistics: {len(cases)} cases, {checks} exact array comparisons passed"
-    )
+    print(f"Pinned LeRobot numeric statistics: {len(cases)} cases, {checks} exact array comparisons passed")
 
 
 if __name__ == "__main__":

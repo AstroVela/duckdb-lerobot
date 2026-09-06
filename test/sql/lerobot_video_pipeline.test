@@ -96,8 +96,11 @@ SET threads = 4;
 
 # Two data files create two independently owned source queries. A one-target
 # bound exercises producer deschedule/reschedule and multi-producer fan-in.
+# Resolved paths are absolute; compare from TEST_DIR onward for runners using
+# either a relative or an absolute temporary directory.
 query IIRRT rowsort
-SELECT episode_index, frame_index, timestamp, video_timestamp, video_path
+SELECT episode_index, frame_index, timestamp, video_timestamp,
+       substr(video_path, strpos(video_path, '{TEST_DIR}/')) AS video_path
 FROM lerobot_video_frames(
     '{TEST_DIR}/lerobot_video_pipeline',
     [0, 1],

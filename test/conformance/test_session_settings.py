@@ -62,9 +62,7 @@ def make_objects(args: argparse.Namespace, directory: Path) -> dict[str, bytes]:
         "dataset/meta/info.json": json.dumps(info).encode(),
         "dataset/meta/episodes/chunk-000/file-000.parquet": episodes.read_bytes(),
         "dataset/data.parquet": data.read_bytes(),
-        "dataset/video.mp4": (
-            Path(__file__).resolve().parents[1] / "data/lerobot/long-20701.mp4"
-        ).read_bytes(),
+        "dataset/video.mp4": (Path(__file__).resolve().parents[1] / "data/lerobot/long-20701.mp4").read_bytes(),
     }
 
 
@@ -95,13 +93,10 @@ def s3_server(
             parsed = urlsplit(self.path)
             authorized = not deny_all and (
                 unquote(parsed.path) in public_paths
-                or "Credential=fixture-session-id/"
-                in self.headers.get("Authorization", "")
+                or "Credential=fixture-session-id/" in self.headers.get("Authorization", "")
             )
             if request_access:
-                authorized = request_access(
-                    self.command, unquote(parsed.path), authorized
-                )
+                authorized = request_access(self.command, unquote(parsed.path), authorized)
             with counts_lock:
                 counts["accepted" if authorized else "denied"] += 1
             if not authorized:
@@ -109,9 +104,7 @@ def s3_server(
                 return
             query = parse_qs(parsed.query)
             if "list-type" in query:
-                root = ET.Element(
-                    "ListBucketResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/"
-                )
+                root = ET.Element("ListBucketResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
                 ET.SubElement(root, "IsTruncated").text = "false"
                 prefix = query.get("prefix", [""])[0]
                 for key, value in objects.items():
@@ -119,12 +112,8 @@ def s3_server(
                         entry = ET.SubElement(root, "Contents")
                         ET.SubElement(entry, "Key").text = key
                         ET.SubElement(entry, "Size").text = str(len(value))
-                        ET.SubElement(entry, "LastModified").text = (
-                            "2026-01-01T00:00:00.000Z"
-                        )
-                        ET.SubElement(entry, "ETag").text = (
-                            '"' + hashlib.sha256(value).hexdigest() + '"'
-                        )
+                        ET.SubElement(entry, "LastModified").text = "2026-01-01T00:00:00.000Z"
+                        ET.SubElement(entry, "ETag").text = '"' + hashlib.sha256(value).hexdigest() + '"'
                 payload = ET.tostring(root)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/xml")
@@ -142,9 +131,7 @@ def s3_server(
                     end = min(int(last) if last else len(value) - 1, len(value) - 1)
                     payload = value[start : end + 1]
                     self.send_response(206)
-                    self.send_header(
-                        "Content-Range", f"bytes {start}-{end}/{len(value)}"
-                    )
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{len(value)}")
                 else:
                     self.send_response(200)
                 self.send_header("Accept-Ranges", "bytes")
@@ -203,8 +190,7 @@ def check_endpoint_cache(args, directory, original_objects, base):
         }
         for scope in ("SESSION", "GLOBAL", *secret_scopes):
             setup = base + (
-                f"SET GLOBAL s3_endpoint={sql_string(first)};"
-                "SET GLOBAL s3_access_key_id='fixture-session-id';"
+                f"SET GLOBAL s3_endpoint={sql_string(first)};" "SET GLOBAL s3_access_key_id='fixture-session-id';"
             )
             root = "s3://fixture-bucket/dataset"
 
@@ -221,8 +207,7 @@ def check_endpoint_cache(args, directory, original_objects, base):
 
             scan = f"SELECT sum(action)::BIGINT FROM lerobot_scan({sql_string(root)});"
             video = (
-                f"SELECT min(video_path) FROM lerobot_video_frames({sql_string(root)}, "
-                "[0], frame_indices := [0]);"
+                f"SELECT min(video_path) FROM lerobot_video_frames({sql_string(root)}, " "[0], frame_indices := [0]);"
             )
             sql = setup + change_endpoint(first) + scan
             expected = ([["true"]] if "SECRET" in scope else []) + [["1"]]
@@ -245,18 +230,13 @@ def check_endpoint_cache(args, directory, original_objects, base):
                 assert native.returncode != 0 and "ETag" in native.stderr, native.stderr
                 result = run_sql(args, sql + scan)
                 assert result.returncode != 0 and "ETag" in result.stderr, result.stderr
-                assert (
-                    list(csv.reader(io.StringIO(result.stdout))) == expected
-                ), result.stdout
+                assert list(csv.reader(io.StringIO(result.stdout))) == expected, result.stdout
                 print(
                     "PASS FILE_SECRET endpoint conflict matches native ETag error",
                     flush=True,
                 )
                 continue
-            sql += (
-                "SELECT sum(action)::BIGINT FROM read_parquet('s3://fixture-bucket/dataset/data-1.parquet');"
-                + scan
-            )
+            sql += "SELECT sum(action)::BIGINT FROM read_parquet('s3://fixture-bucket/dataset/data-1.parquet');" + scan
             expected += [["22"], ["22"]]
             if not args.skip_video:
                 sql += video
@@ -278,12 +258,9 @@ def check_endpoint_cache(args, directory, original_objects, base):
         # secret must not evict this dataset's warmed route cache.
         result = run_sql(
             args,
-            setup
-            + scan
-            + "CREATE SECRET fixture_neighbor (TYPE s3, KEY_ID 'fixture-neighbor', "
+            setup + scan + "CREATE SECRET fixture_neighbor (TYPE s3, KEY_ID 'fixture-neighbor', "
             "SECRET 'fixture-neighbor-key', SCOPE 's3://fixture-bucket/dataset-neighbor/');"
-            "SELECT cached FROM lerobot_cache_info('s3://fixture-bucket/dataset') WHERE component='data';"
-            + scan,
+            "SELECT cached FROM lerobot_cache_info('s3://fixture-bucket/dataset') WHERE component='data';" + scan,
         )
         assert result.returncode == 0, result.stderr
         assert list(csv.reader(io.StringIO(result.stdout))) == [
@@ -330,8 +307,7 @@ def check_metadata_changes(args, directory, first, second, base):
 
         with s3_server(objects, request_access=access) as (endpoint, _):
             setup = base + (
-                f"SET GLOBAL s3_endpoint={sql_string(endpoint)};"
-                "SET GLOBAL s3_access_key_id='fixture-session-id';"
+                f"SET GLOBAL s3_endpoint={sql_string(endpoint)};" "SET GLOBAL s3_access_key_id='fixture-session-id';"
             )
             scan = "SELECT sum(action)::BIGINT FROM lerobot_scan('s3://fixture-bucket/dataset');"
             video = (
@@ -339,11 +315,7 @@ def check_metadata_changes(args, directory, first, second, base):
                 "[0], frame_indices := [0]);"
             )
             sql = setup + scan + (video if not args.skip_video else "")
-            expected = [["1"]] + (
-                [["s3://fixture-bucket/dataset/video-0.mp4"]]
-                if not args.skip_video
-                else []
-            )
+            expected = [["1"]] + ([["s3://fixture-bucket/dataset/video-0.mp4"]] if not args.skip_video else [])
             # The manifest bytes, ETag and timestamp stay identical. Replacing
             # a file, changing the visible file set, or filling an empty shard
             # must invalidate data and video routes together.
@@ -351,9 +323,7 @@ def check_metadata_changes(args, directory, first, second, base):
             sql += "SELECT max(\"data/file_index\") FROM read_parquet('s3://fixture-bucket/dataset/meta/episodes/**/*.parquet');"
             sql += scan + (video if not args.skip_video else "")
             expected += [["changed"], ["1"], ["22"]] + (
-                [["s3://fixture-bucket/dataset/video-1.mp4"]]
-                if not args.skip_video
-                else []
+                [["s3://fixture-bucket/dataset/video-1.mp4"]] if not args.skip_video else []
             )
             result = run_sql(args, sql)
             assert result.returncode == 0, (mutation, result.stdout, result.stderr)
@@ -390,14 +360,12 @@ def check_empty_transition(args, original_objects, base, *, file_cache=False):
 
     with s3_server(objects, request_access=access) as (endpoint, _):
         setup = base + (
-            f"SET GLOBAL s3_endpoint={sql_string(endpoint)};"
-            "SET GLOBAL s3_access_key_id='fixture-session-id';"
+            f"SET GLOBAL s3_endpoint={sql_string(endpoint)};" "SET GLOBAL s3_access_key_id='fixture-session-id';"
         )
         setup += f"SET enable_external_file_cache={'true' if file_cache else 'false'};"
         scan = "SELECT count(*) FROM lerobot_scan('s3://fixture-bucket/dataset');"
         video = (
-            "SELECT count(*) FROM lerobot_video_frames('s3://fixture-bucket/dataset', "
-            "[0], frame_indices := [0]);"
+            "SELECT count(*) FROM lerobot_video_frames('s3://fixture-bucket/dataset', " "[0], frame_indices := [0]);"
         )
         result = run_sql(
             args,
@@ -426,15 +394,12 @@ def check_empty_transition(args, original_objects, base, *, file_cache=False):
 def check_revoked_metadata_access(args, objects, base):
     # The manifest and payloads are public; only episode metadata requires the
     # fixture key. A successful info.json stat alone cannot authorize a cache hit.
-    public = [
-        "/fixture-bucket/" + key for key in objects if "/meta/episodes/" not in key
-    ] + [
+    public = ["/fixture-bucket/" + key for key in objects if "/meta/episodes/" not in key] + [
         "/fixture-bucket/"
     ]  # Listing is public too; the Parquet object is not.
     with s3_server(objects, public_paths=public) as (endpoint, counts):
         setup = base + (
-            f"SET GLOBAL s3_endpoint={sql_string(endpoint)};"
-            "SET GLOBAL s3_access_key_id='fixture-global-denied';"
+            f"SET GLOBAL s3_endpoint={sql_string(endpoint)};" "SET GLOBAL s3_access_key_id='fixture-global-denied';"
         )
         queries = [
             (
@@ -491,16 +456,12 @@ def check_revoked_metadata_access(args, objects, base):
                     warm.stdout,
                     warm.stderr,
                 )
-                assert (
-                    list(csv.reader(io.StringIO(warm.stdout))) == expected
-                ), warm.stdout
+                assert list(csv.reader(io.StringIO(warm.stdout))) == expected, warm.stdout
                 print(f"PASS {scope} revocation rejects warm {label} cache", flush=True)
         assert counts["denied"] > 0
 
 
-def check_server_revocation(
-    args, original_objects, base, *, manifest=False, empty=False
-):
+def check_server_revocation(args, original_objects, base, *, manifest=False, empty=False):
     # The same process, credentials, endpoint and object bytes remain in use.
     # Only the server's policy changes, between two queries in one connection.
     revoked = threading.Event()
@@ -519,28 +480,21 @@ def check_server_revocation(
             return True
         if revoked.is_set():
             if manifest:
-                return allowed and not (
-                    path.endswith("/meta/info.json") and method == "GET"
-                )
+                return allowed and not (path.endswith("/meta/info.json") and method == "GET")
             if revoke_kind == "listing" and path == "/fixture-bucket/":
                 return False
             if "/meta/episodes/" in path:
-                if revoke_kind == "object" or (
-                    revoke_kind == "get" and method == "GET"
-                ):
+                if revoke_kind == "object" or (revoke_kind == "get" and method == "GET"):
                     return False
         return allowed
 
-    public = [
-        "/fixture-bucket/" + key for key in objects if "/meta/episodes/" not in key
-    ] + ["/fixture-bucket/"]
+    public = ["/fixture-bucket/" + key for key in objects if "/meta/episodes/" not in key] + ["/fixture-bucket/"]
     with s3_server(objects, public_paths=public, request_access=access) as (
         endpoint,
         _,
     ):
         setup = base + (
-            f"SET GLOBAL s3_endpoint={sql_string(endpoint)};"
-            "SET GLOBAL s3_access_key_id='fixture-session-id';"
+            f"SET GLOBAL s3_endpoint={sql_string(endpoint)};" "SET GLOBAL s3_access_key_id='fixture-session-id';"
         )
         revoke = f"SELECT content FROM read_text('http://{endpoint}/fixture-bucket/control/revoke.txt');"
         queries = [
@@ -572,16 +526,8 @@ def check_server_revocation(
                     "0" if empty else "1",
                 )
             )
-        queries += [
-            (label + "-file-cache", query, value)
-            for label, query, value in queries
-            if label != "native"
-        ]
-        kinds = (
-            ("manifest-empty-get" if empty else "manifest-get",)
-            if manifest
-            else ("object", "get", "listing")
-        )
+        queries += [(label + "-file-cache", query, value) for label, query, value in queries if label != "native"]
+        kinds = ("manifest-empty-get" if empty else "manifest-get",) if manifest else ("object", "get", "listing")
         for revoke_kind in kinds:
             for label, query, value in queries:
                 revoked.clear()
@@ -590,14 +536,8 @@ def check_server_revocation(
                     if label != "native"
                     else ""
                 )
-                cache_setting = (
-                    "SET enable_external_file_cache=true;"
-                    if label.endswith("-file-cache")
-                    else ""
-                )
-                result = run_sql(
-                    args, setup + cache_setting + query + revoke + passive + query
-                )
+                cache_setting = "SET enable_external_file_cache=true;" if label.endswith("-file-cache") else ""
+                result = run_sql(args, setup + cache_setting + query + revoke + passive + query)
                 assert result.returncode != 0 and "403" in result.stderr, (
                     revoke_kind,
                     label,
@@ -605,9 +545,7 @@ def check_server_revocation(
                     result.stderr,
                 )
                 expected = [[value], ["revoked"]] + ([["true"]] if passive else [])
-                assert (
-                    list(csv.reader(io.StringIO(result.stdout))) == expected
-                ), result.stdout
+                assert list(csv.reader(io.StringIO(result.stdout))) == expected, result.stdout
                 print(
                     f"PASS server-side {revoke_kind} revocation rejects warm {label} reads",
                     flush=True,
@@ -705,11 +643,7 @@ def main() -> None:
             # session's access after the caller explicitly removes it.
             result = run_sql(
                 args,
-                base
-                + setups["session-auth"]
-                + queries[2][1]
-                + "RESET SESSION s3_access_key_id;"
-                + queries[2][1],
+                base + setups["session-auth"] + queries[2][1] + "RESET SESSION s3_access_key_id;" + queries[2][1],
             )
             assert result.returncode != 0 and "403" in result.stderr, result
             assert counts["denied"] > 0, counts

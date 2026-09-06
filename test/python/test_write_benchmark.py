@@ -27,9 +27,7 @@ class WriteBenchmarkTest(unittest.TestCase):
         self.cli.write_text(f"#!{sys.executable}\n" + body)
         self.cli.chmod(0o700)
 
-    @unittest.skipUnless(
-        sys.platform == "linux" and hasattr(os, "wait4"), "Linux process accounting"
-    )
+    @unittest.skipUnless(sys.platform == "linux" and hasattr(os, "wait4"), "Linux process accounting")
     def test_includes_last_write_before_immediate_exit(self):
         self.script(
             "import os, sys\n"
@@ -50,9 +48,7 @@ class WriteBenchmarkTest(unittest.TestCase):
         # prefix of this final write, whereas wait4 includes the full lifetime.
         self.assertGreaterEqual(counters["fs_output_blocks"], 8 * 1024 * 1024 // 512)
 
-    @unittest.skipUnless(
-        sys.platform == "linux" and hasattr(os, "wait4"), "Linux peak RSS accounting"
-    )
+    @unittest.skipUnless(sys.platform == "linux" and hasattr(os, "wait4"), "Linux peak RSS accounting")
     def test_peak_rss_is_per_child_not_previous_child_maximum(self):
         self.script(
             "import sys\n"
@@ -61,23 +57,17 @@ class WriteBenchmarkTest(unittest.TestCase):
         )
         _, large = benchmark.run_sql_measured(self.cli, str(64 * 1024 * 1024))
         _, small = benchmark.run_sql_measured(self.cli, "1")
-        self.assertGreater(
-            large["peak_rss_bytes"] - small["peak_rss_bytes"], 32 * 1024 * 1024
-        )
+        self.assertGreater(large["peak_rss_bytes"] - small["peak_rss_bytes"], 32 * 1024 * 1024)
 
     @unittest.skipUnless(os.name == "posix", "executable fixture uses a POSIX shebang")
     def test_nonzero_exit_preserves_diagnostic_and_can_retry(self):
         self.script("import sys\nprint('fixture close failed')\nsys.exit(7)\n")
-        with self.assertRaisesRegex(
-            RuntimeError, "(?s)exited with 7.*fixture close failed"
-        ):
+        with self.assertRaisesRegex(RuntimeError, "(?s)exited with 7.*fixture close failed"):
             benchmark.run_sql_measured(self.cli, "")
         self.script("pass\n")
         benchmark.run_sql_measured(self.cli, "")
 
-    @unittest.skipUnless(
-        os.name == "posix" and hasattr(os, "wait4"), "POSIX child interruption"
-    )
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "wait4"), "POSIX child interruption")
     def test_interrupted_wait_reaps_child_before_raising(self):
         self.script("import time\ntime.sleep(30)\n")
         child_pid = None
@@ -108,9 +98,7 @@ class WriteBenchmarkTest(unittest.TestCase):
 
     def test_ratios_do_not_convert_missing_samples_to_zero(self):
         def sample(reads, writes):
-            return {
-                "process_io": {"fs_input_blocks": reads, "fs_output_blocks": writes}
-            }
+            return {"process_io": {"fs_input_blocks": reads, "fs_output_blocks": writes}}
 
         result = benchmark.io_scaling([sample(0, 2), sample(0, 4)], sample(0, 6))
         self.assertEqual(result["small_fs_input_blocks_median"], 0)

@@ -81,8 +81,11 @@ SELECT action::INTEGER FROM lerobot_scan('dataset');
 ----
 1
 
+# Resolved paths are absolute; compare from TEST_DIR onward for runners using
+# either a relative or an absolute temporary directory.
 query T
-SELECT video_path FROM lerobot_video_routes('dataset', [0]);
+SELECT substr(video_path, strpos(video_path, '{TEST_DIR}/')) AS video_path
+FROM lerobot_video_routes('dataset', [0]);
 ----
 {TEST_DIR}/lerobot_search_path/1/dataset/video-001.mp4
 
@@ -99,7 +102,8 @@ SELECT target_frame_index, timestamp FROM lerobot_video_windows('dataset',
 0	0
 
 query IIT
-SELECT target_frame_index, timestamp, video_path FROM lerobot_video_targets('dataset',
+SELECT target_frame_index, timestamp, substr(video_path, strpos(video_path, '{TEST_DIR}/')) AS video_path
+FROM lerobot_video_targets('dataset',
     (SELECT 1 AS request_id, 0 AS episode_index, 0 AS frame_index, 'camera' AS video_key, 0 AS delta_index),
     delta_timestamps := [0.0]);
 ----
@@ -128,7 +132,8 @@ SELECT action::INTEGER FROM lerobot_scan('dataset');
 2
 
 query T other
-SELECT video_path FROM lerobot_video_routes('dataset', [0]);
+SELECT substr(video_path, strpos(video_path, '{TEST_DIR}/')) AS video_path
+FROM lerobot_video_routes('dataset', [0]);
 ----
 {TEST_DIR}/lerobot_search_path/2/dataset/video-002.mp4
 
@@ -138,7 +143,8 @@ SELECT action::INTEGER FROM lerobot_scan('dataset');
 1
 
 query T
-SELECT video_path FROM lerobot_video_routes('dataset', [0]);
+SELECT substr(video_path, strpos(video_path, '{TEST_DIR}/')) AS video_path
+FROM lerobot_video_routes('dataset', [0]);
 ----
 {TEST_DIR}/lerobot_search_path/1/dataset/video-001.mp4
 

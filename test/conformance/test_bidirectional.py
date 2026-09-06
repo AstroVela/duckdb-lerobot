@@ -82,8 +82,7 @@ def assert_duckdb_reads_reference(duckdb: Path, extension: Path, root: Path) -> 
     rows = run_duckdb(
         duckdb,
         extension,
-        'SELECT episode_index, frame_index, "index" '
-        f"FROM lerobot_scan({root_sql}, episode_indices := [1]);",
+        'SELECT episode_index, frame_index, "index" ' f"FROM lerobot_scan({root_sql}, episode_indices := [1]);",
     )
     assert rows == [["1", "0", "2"]], rows
 
@@ -109,9 +108,7 @@ def assert_duckdb_reads_reference(duckdb: Path, extension: Path, root: Path) -> 
     assert rows == [["0", "2"], ["1", "1"]], rows
 
 
-def create_duckdb_dataset(
-    duckdb: Path, extension: Path, root: Path, fps: int = 10
-) -> None:
+def create_duckdb_dataset(duckdb: Path, extension: Path, root: Path, fps: int = 10) -> None:
     features_json = (
         '{"observation.state":{"dtype":"float32","shape":[2],'
         '"names":["x","y"]},"action":{"dtype":"float32",'
@@ -196,20 +193,10 @@ def main() -> None:
             actual_root = workspace / f"duckdb-fps-{fps}"
             create_reference_dataset(reference, fps)
             create_duckdb_dataset(args.duckdb, args.extension, actual_root, fps)
-            expected = (
-                pq.read_table(sorted((reference / "data").rglob("*.parquet")))
-                .column("timestamp")
-                .to_numpy()
-            )
-            actual = (
-                pq.read_table(sorted((actual_root / "data").rglob("*.parquet")))
-                .column("timestamp")
-                .to_numpy()
-            )
+            expected = pq.read_table(sorted((reference / "data").rglob("*.parquet"))).column("timestamp").to_numpy()
+            actual = pq.read_table(sorted((actual_root / "data").rglob("*.parquet"))).column("timestamp").to_numpy()
             assert actual.dtype == expected.dtype == np.float32
-            np.testing.assert_array_equal(
-                actual.view(np.uint32), expected.view(np.uint32)
-            )
+            np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
 
 
 if __name__ == "__main__":

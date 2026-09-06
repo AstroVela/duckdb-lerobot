@@ -35,15 +35,11 @@ def frame(episode: int, index: int) -> np.ndarray:
     return np.repeat(grey[..., None], 3, axis=2)
 
 
-def create_duckdb(
-    args: argparse.Namespace, root: Path, source_episodes: list[int], limit_bytes: int
-) -> None:
+def create_duckdb(args: argparse.Namespace, root: Path, source_episodes: list[int], limit_bytes: int) -> None:
     values = []
     for episode, source in enumerate(source_episodes):
         for index in range(2):
-            values.append(
-                f"({episode}, {index}, from_hex('{frame(source, index).tobytes().hex()}'))"
-            )
+            values.append(f"({episode}, {index}, from_hex('{frame(source, index).tobytes().hex()}'))")
     sql = (
         f"LOAD {sql_quote(args.extension)}; SET threads=2;"
         "COPY (SELECT episode::BIGINT AS episode_index, 'shard fixture' AS task, camera "
@@ -85,27 +81,18 @@ def create_reference(root: Path, fragments: list[Path], limit_bytes: int) -> Non
     # Substitute only the encoder output. Official save_episode still writes
     # Parquet/metadata, decides rollover, stats the growing shard and remuxes it.
     # Exact same bytes isolate this policy difference from codec/version noise.
-    with patch.object(
-        dataset.writer, "_encode_temporary_episode_video", side_effect=existing_fragment
-    ):
+    with patch.object(dataset.writer, "_encode_temporary_episode_video", side_effect=existing_fragment):
         for episode in range(len(fragments)):
             for index in range(2):
-                dataset.add_frame(
-                    {"task": "shard fixture", "camera": frame(episode, index)}
-                )
+                dataset.add_frame({"task": "shard fixture", "camera": frame(episode, index)})
             dataset.save_episode(parallel_encoding=False)
     dataset.finalize()
 
 
 def route_files(root: Path) -> list[tuple[int, int]]:
-    rows = pq.read_table(
-        sorted((root / "meta/episodes").rglob("*.parquet"))
-    ).to_pylist()
+    rows = pq.read_table(sorted((root / "meta/episodes").rglob("*.parquet"))).to_pylist()
     rows.sort(key=lambda row: row["episode_index"])
-    return [
-        (row["videos/camera/chunk_index"], row["videos/camera/file_index"])
-        for row in rows
-    ]
+    return [(row["videos/camera/chunk_index"], row["videos/camera/file_index"]) for row in rows]
 
 
 def check_frames(args: argparse.Namespace, root: Path, episodes: int) -> None:
@@ -126,16 +113,10 @@ def check_frames(args: argparse.Namespace, root: Path, episodes: int) -> None:
     for ordinal, (episode, index, encoded) in enumerate(rows):
         episode, index = int(episode), int(index)
         assert (episode, index) == divmod(ordinal, 2)
-        actual = np.frombuffer(bytes.fromhex(encoded), dtype=np.uint8).reshape(
-            SIZE, SIZE, 3
-        )
+        actual = np.frombuffer(bytes.fromhex(encoded), dtype=np.uint8).reshape(SIZE, SIZE, 3)
         item = dataset[ordinal]
-        assert (
-            int(item["episode_index"]) == episode and int(item["frame_index"]) == index
-        )
-        expected = np.rint(item["camera"].numpy().transpose(1, 2, 0) * 255).astype(
-            np.uint8
-        )
+        assert int(item["episode_index"]) == episode and int(item["frame_index"]) == index
+        expected = np.rint(item["camera"].numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
         source = frame(episode, index)
         assert np.abs(actual.astype(int) - expected.astype(int)).max() <= 2
         assert np.abs(expected.astype(int) - source.astype(int)).max() <= 8

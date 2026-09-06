@@ -19,18 +19,14 @@ def quote(value: str | Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def pixels(
-    height: int, width: int, camera: int, index: int, noise: bool = False
-) -> np.ndarray:
+def pixels(height: int, width: int, camera: int, index: int, noise: bool = False) -> np.ndarray:
     if noise:
         return np.random.default_rng(1000 + camera * 100000 + index).integers(
             0, 256, (height, width, 3), dtype=np.uint8
         )
     y, x, channel = np.indices((height, width, 3))
     # Every frame/camera differs; spatially asymmetric, with all byte values.
-    return ((x * 13 + y * 29 + channel * 71 + index * 17 + camera * 53) % 256).astype(
-        np.uint8
-    )
+    return ((x * 13 + y * 29 + channel * 71 + index * 17 + camera * 53) % 256).astype(np.uint8)
 
 
 def write_input(
@@ -57,9 +53,7 @@ def write_input(
                     "task": "PNG reference",
                 }
                 for camera, (height, width) in enumerate(shapes):
-                    row[f"camera_{camera}"] = pixels(
-                        height, width, camera, index, noise
-                    ).tobytes()
+                    row[f"camera_{camera}"] = pixels(height, width, camera, index, noise).tobytes()
                 rows.append(row)
             writer.write_table(pa.Table.from_pylist(rows, schema=writer.schema))
 
@@ -118,11 +112,7 @@ def validate(
     stats = []
     for path in sorted((root / "meta/episodes").rglob("*.parquet")):
         stats.extend(
-            {
-                key: value
-                for key, value in row.items()
-                if key.startswith("stats/") or key == "episode_index"
-            }
+            {key: value for key, value in row.items() if key.startswith("stats/") or key == "episode_index"}
             for row in pq.read_table(path).to_pylist()
         )
     stats.sort(key=lambda row: row["episode_index"])
@@ -131,9 +121,7 @@ def validate(
         "validated_frames": count,
         "validated_images": count * len(shapes),
         "png_sha256": compressed.hexdigest(),
-        "statistics_sha256": hashlib.sha256(
-            json.dumps(stats, sort_keys=True, allow_nan=False).encode()
-        ).hexdigest(),
+        "statistics_sha256": hashlib.sha256(json.dumps(stats, sort_keys=True, allow_nan=False).encode()).hexdigest(),
     }
 
 
