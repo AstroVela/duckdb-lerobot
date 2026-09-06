@@ -291,6 +291,11 @@ jobs:
             --duckdb "${BUILD_DIR}/duckdb" \
             --extension "${BUILD_DIR}/extension/lerobot/lerobot.duckdb_extension"
 
+      - name: Restore the pinned test-host source after testing
+        run: |
+          git -C duckdb apply --reverse --check ../test/patches/duckdb-1.5.5-cached-eof.patch
+          git -C duckdb apply --reverse ../test/patches/duckdb-1.5.5-cached-eof.patch
+
       - name: Reject generated or build files outside ignored paths
         run: |
           if git ls-files | grep -Eq '(^|/)(build|cmake-build-[^/]*|duckdb_unittest_tempdir|__pycache__)(/|$)|[.]pyc$'; then
