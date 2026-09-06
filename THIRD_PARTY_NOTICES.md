@@ -52,6 +52,11 @@ not legal advice.
   and is test-only.
 - **NumPy 2.2.6** is imported directly by the conformance fixture generator and
   is licensed under BSD-3-Clause. It is test-only.
+- **PyArrow** (Apache-2.0) and **pandas** (BSD-3-Clause) are used directly by
+  the conformance readers to inspect Parquet values, statistics and task-index
+  metadata. They are installed through LeRobot's dataset dependencies;
+  local validation used PyArrow 25.0.1 and pandas 2.3.3. They are test-only
+  and are not linked into the extension.
 - **PyAV 15.1.0** and **Pillow 12.3.0** are pinned for the visual conformance
   environment. PyAV is BSD-3-Clause and Pillow uses the
   [MIT-CMU license](https://pillow.readthedocs.io/en/stable/about.html#license). Their
@@ -63,3 +68,16 @@ not legal advice.
 - `test/data/lerobot/long-20701.mp4` is a generated 16x16 H.264 test stream.
   Its exact FFmpeg command and SHA-256 digest are documented in
   `test/data/lerobot/README.md`; it is not copied from a third-party dataset.
+
+## Runtime-generated test inputs
+
+- The numeric, image, mixed-video and shard conformance scripts generate
+  deterministic arrays and media at runtime. Pillow, FFmpeg and LeRobot
+  supply independent readers or reference routines; no third-party dataset
+  content is checked in by these tests.
+- `test/conformance/test_session_settings.py` serves generated metadata and
+  Parquet over loopback and reuses the generated H.264 fixture above. Its S3
+  keys are public dummy values, not credentials for an external service.
+- SQL and C++ regression fixtures are generated within their temporary test
+  directories. Benchmark result JSON records measurements of synthetic data,
+  not third-party media.

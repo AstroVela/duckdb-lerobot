@@ -82,12 +82,14 @@ void MaybeInvalidateCaches(ClientContext &context, const string &root, TableFunc
 unique_ptr<TableRef> LerobotInfoBindReplace(ClientContext &context, TableFunctionBindInput &input) {
 	auto root = GetRoot(input, "lerobot_info");
 	MaybeInvalidateCaches(context, root, input);
+	root = ResolveLerobotRoot(context, root);
 	return LerobotCreateTableFunctionRef("read_json_auto", Value(root + LEROBOT_INFO_SUFFIX));
 }
 
 unique_ptr<TableRef> LerobotEpisodesBindReplace(ClientContext &context, TableFunctionBindInput &input) {
 	auto root = GetRoot(input, "lerobot_episodes");
 	MaybeInvalidateCaches(context, root, input);
+	root = ResolveLerobotRoot(context, root);
 	auto info = ReadLerobotDatasetInfo(context, root);
 	auto parameters = GetParquetParameters(input);
 	if (info.total_episodes == 0) {
@@ -100,6 +102,7 @@ unique_ptr<TableRef> LerobotEpisodesBindReplace(ClientContext &context, TableFun
 unique_ptr<TableRef> LerobotTasksBindReplace(ClientContext &context, TableFunctionBindInput &input) {
 	auto root = GetRoot(input, "lerobot_tasks");
 	MaybeInvalidateCaches(context, root, input);
+	root = ResolveLerobotRoot(context, root);
 	auto info = ReadLerobotDatasetInfo(context, root);
 	if (info.total_tasks == 0) {
 		return LerobotCreateEmptyParquetRelation(context, {"task_index", "task"},
@@ -111,6 +114,7 @@ unique_ptr<TableRef> LerobotTasksBindReplace(ClientContext &context, TableFuncti
 unique_ptr<TableRef> LerobotStatsBindReplace(ClientContext &context, TableFunctionBindInput &input) {
 	auto root = GetRoot(input, "lerobot_stats");
 	MaybeInvalidateCaches(context, root, input);
+	root = ResolveLerobotRoot(context, root);
 	auto info = ReadLerobotDatasetInfo(context, root);
 	if (info.total_episodes == 0) {
 		return LerobotCreateEmptyParquetRelation(context, {"feature", "stats"},

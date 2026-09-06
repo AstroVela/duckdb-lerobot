@@ -1,0 +1,215 @@
+# name: test/sql/lerobot_timestamp_lookup.test
+# description: Repeated relation targets retain native timestamp and validation semantics
+# group: [sql]
+
+require parquet
+
+require json
+
+require lerobot
+
+statement ok
+SET threads = 1;
+
+statement ok
+COPY (SELECT 0 AS bootstrap, 1 AS payload) TO '{TEST_DIR}/lerobot_timestamp_lookup' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (SELECT 0 AS bootstrap, 1 AS payload) TO '{TEST_DIR}/lerobot_timestamp_lookup/meta' (FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (SELECT 'v3.0' AS codebase_version, 2 AS fps, 2 AS total_episodes,
+             10 AS total_frames, 0 AS total_tasks,
+             'data-{file_index:03d}.parquet' AS data_path,
+             'missing-{file_index:03d}.mp4' AS video_path,
+             struct_pack(camera := struct_pack(dtype := 'video')) AS features)
+TO '{TEST_DIR}/lerobot_timestamp_lookup/meta/info.json' (FORMAT JSON, ARRAY false);
+
+statement ok
+COPY (SELECT i AS episode_index, CASE WHEN i = 0 THEN 6 ELSE 4 END AS length,
+             0 AS "data/chunk_index", i AS "data/file_index",
+             0 AS "videos/camera/chunk_index", i AS "videos/camera/file_index",
+             i * 10.0 AS "videos/camera/from_timestamp",
+             i * 10.0 + 10 AS "videos/camera/to_timestamp", 0 AS metadata_chunk
+      FROM range(2) r(i))
+TO '{TEST_DIR}/lerobot_timestamp_lookup/meta/episodes' (FORMAT PARQUET, PARTITION_BY (metadata_chunk));
+
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, i AS frame_index,
+             i / 2.0 + (i % 2) * 0.0625 AS timestamp FROM range(6) r(i))
+TO '{TEST_DIR}/lerobot_timestamp_lookup/data-000.parquet' (FORMAT PARQUET);
+
+statement ok
+COPY (SELECT 1::BIGINT AS episode_index, i AS frame_index,
+             i / 2.0 + (i % 2) * 0.0625 AS timestamp FROM range(4) r(i))
+TO '{TEST_DIR}/lerobot_timestamp_lookup/data-001.parquet' (FORMAT PARQUET);
+
+# Nonuniform timestamps must come from Parquet, including clamped deltas.
+# Multiple chunks force index construction and repeated reuse for both shards.
+query IIIIII
+WITH requested AS (
+    SELECT i % 4 AS request_id, i % 2 AS episode_index,
+           i % CASE WHEN i % 2 = 0 THEN 6 ELSE 4 END AS frame_index,
+           'camera' AS video_key, i % 3 AS delta_index, i + 1099511627776 AS target_id
+    FROM range(12288) r(i)
+), expected AS (
+    SELECT *, greatest(0, least(CASE WHEN episode_index = 0 THEN 5 ELSE 3 END,
+                              frame_index + delta_index - 1)) AS resolved
+    FROM requested
+), actual AS (
+    SELECT * FROM lerobot_video_targets('{TEST_DIR}/lerobot_timestamp_lookup',
+        (SELECT * FROM requested), delta_timestamps := [-0.5, 0.0, 0.5], max_pending_targets := 2048)
+)
+SELECT count(*), count(DISTINCT actual.target_ordinal),
+       CAST(bool_and(actual.timestamp = expected.resolved / 2.0 + (expected.resolved % 2) * 0.0625) AS INTEGER),
+       CAST(bool_and(actual.is_padding = (expected.resolved <> expected.frame_index + expected.delta_index - 1)) AS INTEGER),
+       CAST(bool_and(actual.target_frame_index = expected.resolved) AS INTEGER),
+       CAST(bool_and(actual.video_timestamp = actual.timestamp + expected.episode_index * 10.0) AS INTEGER)
+FROM actual JOIN expected USING (target_id);
+----
+12288	12288	1	1	1	1
+
+query I
+SELECT count(*) FROM lerobot_video_targets('{TEST_DIR}/lerobot_timestamp_lookup',
+    (SELECT 0 AS request_id, 0 AS episode_index, 0 AS frame_index,
+            'camera' AS video_key, 0 AS delta_index WHERE false));
+----
+0
+
+statement ok
+PREPARE repeated_timestamps AS SELECT sum(timestamp) FROM lerobot_video_targets('{TEST_DIR}/lerobot_timestamp_lookup',
+    (SELECT i AS request_id, 0 AS episode_index, i % 6 AS frame_index,
+            'camera' AS video_key, 0 AS delta_index FROM range(6144) r(i)), max_pending_targets := 2048);
+
+query R
+EXECUTE repeated_timestamps;
+----
+7872.0
+
+# The same prepared query must observe a shard-only edit on its next execution.
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, i AS frame_index,
+             1.0 + i / 2.0 + (i % 2) * 0.0625 AS timestamp FROM range(6) r(i))
+TO '{TEST_DIR}/lerobot_timestamp_lookup/data-000.parquet' (FORMAT PARQUET);
+
+query R
+EXECUTE repeated_timestamps;
+----
+14016.0
+
+# Each error is requested only after two valid batches, entering the index path.
+
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, i AS frame_index,
+             CASE WHEN i = 2 THEN NULL::DOUBLE ELSE i / 2.0 END AS timestamp FROM range(6) r(i))
+TO '{TEST_DIR}/lerobot_timestamp_lookup/data-000.parquet' (FORMAT PARQUET);
+
+statement error
+SELECT sum(timestamp) FROM lerobot_video_targets('{TEST_DIR}/lerobot_timestamp_lookup',
+    (SELECT i AS request_id, 0 AS episode_index, CASE WHEN i < 4096 THEN i % 2 ELSE 2 END AS frame_index,
+            'camera' AS video_key, 0 AS delta_index FROM range(4097) r(i)), max_pending_targets := 2048);
+----
+has 1 Parquet rows for frame 2
+
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, i AS frame_index,
+             CASE WHEN i = 2 THEN -1.0 ELSE i / 2.0 END AS timestamp FROM range(6) r(i))
+TO '{TEST_DIR}/lerobot_timestamp_lookup/data-000.parquet' (FORMAT PARQUET);
+
+statement error
+SELECT sum(timestamp) FROM lerobot_video_targets('{TEST_DIR}/lerobot_timestamp_lookup',
+    (SELECT i AS request_id, 0 AS episode_index, CASE WHEN i < 4096 THEN i % 2 ELSE 2 END AS frame_index,
+            'camera' AS video_key, 0 AS delta_index FROM range(4097) r(i)), max_pending_targets := 2048);
+----
+Invalid LeRobot timestamp
+
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, i AS frame_index,
+             CASE WHEN i = 2 THEN 'NaN'::DOUBLE ELSE i / 2.0 END AS timestamp FROM range(6) r(i))
+TO '{TEST_DIR}/lerobot_timestamp_lookup/data-000.parquet' (FORMAT PARQUET);
+
+statement error
+SELECT sum(timestamp) FROM lerobot_video_targets('{TEST_DIR}/lerobot_timestamp_lookup',
+    (SELECT i AS request_id, 0 AS episode_index, CASE WHEN i < 4096 THEN i % 2 ELSE 2 END AS frame_index,
+            'camera' AS video_key, 0 AS delta_index FROM range(4097) r(i)), max_pending_targets := 2048);
+----
+Invalid LeRobot timestamp
+
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, i AS frame_index,
+             CASE WHEN i = 2 THEN 'Infinity'::DOUBLE ELSE i / 2.0 END AS timestamp FROM range(6) r(i))
+TO '{TEST_DIR}/lerobot_timestamp_lookup/data-000.parquet' (FORMAT PARQUET);
+
+statement error
+SELECT sum(timestamp) FROM lerobot_video_targets('{TEST_DIR}/lerobot_timestamp_lookup',
+    (SELECT i AS request_id, 0 AS episode_index, CASE WHEN i < 4096 THEN i % 2 ELSE 2 END AS frame_index,
+            'camera' AS video_key, 0 AS delta_index FROM range(4097) r(i)), max_pending_targets := 2048);
+----
+Invalid LeRobot timestamp
+
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, i AS frame_index, i / 2.0 AS timestamp
+      FROM range(6) r(i) WHERE i <> 2)
+TO '{TEST_DIR}/lerobot_timestamp_lookup/data-000.parquet' (FORMAT PARQUET);
+
+statement error
+SELECT sum(timestamp) FROM lerobot_video_targets('{TEST_DIR}/lerobot_timestamp_lookup',
+    (SELECT i AS request_id, 0 AS episode_index, CASE WHEN i < 4096 THEN i % 2 ELSE 2 END AS frame_index,
+            'camera' AS video_key, 0 AS delta_index FROM range(4097) r(i)), max_pending_targets := 2048);
+----
+has no Parquet row for frame 2
+
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, i AS frame_index, i / 2.0 AS timestamp FROM range(6) r(i)
+      UNION ALL SELECT 0, 2, 1.0)
+TO '{TEST_DIR}/lerobot_timestamp_lookup/data-000.parquet' (FORMAT PARQUET);
+
+statement error
+SELECT sum(timestamp) FROM lerobot_video_targets('{TEST_DIR}/lerobot_timestamp_lookup',
+    (SELECT i AS request_id, 0 AS episode_index, CASE WHEN i < 4096 THEN i % 2 ELSE 2 END AS frame_index,
+            'camera' AS video_key, 0 AS delta_index FROM range(4097) r(i)), max_pending_targets := 2048);
+----
+has 2 Parquet rows for frame 2
+
+# A frame misplaced in another selected shard is still a duplicate.
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, i AS frame_index, i / 2.0 AS timestamp FROM range(6) r(i))
+TO '{TEST_DIR}/lerobot_timestamp_lookup/data-000.parquet' (FORMAT PARQUET);
+
+statement ok
+COPY (SELECT 1::BIGINT AS episode_index, i AS frame_index, i / 2.0 AS timestamp FROM range(4) r(i)
+      UNION ALL SELECT 0, 2, 1.0)
+TO '{TEST_DIR}/lerobot_timestamp_lookup/data-001.parquet' (FORMAT PARQUET);
+
+statement error
+SELECT sum(timestamp) FROM lerobot_video_targets('{TEST_DIR}/lerobot_timestamp_lookup',
+    (SELECT i AS request_id, i % 2 AS episode_index, CASE WHEN i < 4096 THEN 0 ELSE 2 END AS frame_index,
+            'camera' AS video_key, 0 AS delta_index FROM range(4098) r(i)), max_pending_targets := 2048);
+----
+has 2 Parquet rows for frame 2
+
+# Every failure above is recoverable on this connection.
+query I
+SELECT 42;
+----
+42
+
+# Index construction must not introduce errors from unrequested string casts.
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, i AS frame_index,
+             CASE WHEN i = 5 THEN 'broken' ELSE '0.5' END AS timestamp FROM range(6) r(i))
+TO '{TEST_DIR}/lerobot_timestamp_lookup/data-000.parquet' (FORMAT PARQUET);
+
+query R
+SELECT sum(timestamp) FROM lerobot_video_targets('{TEST_DIR}/lerobot_timestamp_lookup',
+    (SELECT i AS request_id, 0 AS episode_index, 0 AS frame_index,
+            'camera' AS video_key, 0 AS delta_index FROM range(8192) r(i)));
+----
+4096.0
+
+statement error
+SELECT sum(timestamp) FROM lerobot_video_targets('{TEST_DIR}/lerobot_timestamp_lookup',
+    (SELECT 0 AS request_id, 0 AS episode_index, 5 AS frame_index,
+            'camera' AS video_key, 0 AS delta_index));
+----
+Could not convert string

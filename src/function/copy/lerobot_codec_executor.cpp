@@ -88,17 +88,28 @@ struct LerobotCodecExecutor::Impl {
 	}
 
 	idx_t DesiredWorkerCountLocked() {
+		// Prepare for capacity that becomes available when a batch with a
+		// smaller host budget finishes. Admission still uses the minimum live
+		// budget, but sizing the pool by that minimum can strand later batches
+		// at reduced parallelism: workers are only created during enqueue.
+		idx_t capacity = 0;
+		for (auto &batch_ref : batches) {
+			auto batch = batch_ref.lock();
+			if (batch && batch->remaining_jobs != 0) {
+				capacity = MaxValue(capacity, batch->host_thread_budget);
+			}
+		}
 		idx_t desired_workers = 0;
-		const auto capacity = GlobalCodecCapacityLocked();
 		for (auto &batch_ref : batches) {
 			auto batch = batch_ref.lock();
 			if (!batch || batch->remaining_jobs == 0) {
 				continue;
 			}
-			desired_workers += MinValue(batch->max_workers, batch->remaining_jobs);
-			if (desired_workers >= capacity) {
+			const auto batch_workers = MinValue(batch->max_workers, batch->remaining_jobs);
+			if (batch_workers >= capacity - desired_workers) {
 				return capacity;
 			}
+			desired_workers += batch_workers;
 		}
 		return desired_workers;
 	}
@@ -140,22 +151,36 @@ struct LerobotCodecExecutor::Impl {
 		return false;
 	}
 
+	void DiscardCancelledJobs(const shared_ptr<LerobotCodecBatchState> &batch) {
+		D_ASSERT(batch->cancelled.load());
+		idx_t discarded_jobs = 0;
+		{
+			lock_guard<mutex> guard(lock);
+			for (auto entry = queue.begin(); entry != queue.end();) {
+				if (entry->batch == batch) {
+					entry = queue.erase(entry);
+					discarded_jobs++;
+				} else {
+					entry++;
+				}
+			}
+			D_ASSERT(batch->remaining_jobs >= discarded_jobs);
+			batch->remaining_jobs -= discarded_jobs;
+		}
+		{
+			lock_guard<mutex> result_guard(batch->result_lock);
+			batch->completed_jobs += discarded_jobs;
+		}
+		batch->result_cv.notify_all();
+		work_cv.notify_all();
+	}
+
 	void CompleteJob(LerobotQueuedCodecJob &job, bool reserved_budget, LerobotEncodedVideoInfo encoded,
 	                 std::exception_ptr error) {
 		auto &batch = *job.batch;
 		if (error && !batch.cancelled.exchange(true)) {
 			lock_guard<mutex> result_guard(batch.result_lock);
 			batch.error = error;
-		}
-		{
-			lock_guard<mutex> result_guard(batch.result_lock);
-			if (!error && !batch.cancelled.load()) {
-				auto &result = batch.results[job.result_index];
-				result.feature_index = job.job.feature_index;
-				result.output_path = std::move(job.job.output_path);
-				result.encoded = std::move(encoded);
-			}
-			batch.completed_jobs++;
 		}
 		{
 			lock_guard<mutex> guard(lock);
@@ -169,6 +194,17 @@ struct LerobotCodecExecutor::Impl {
 			}
 			D_ASSERT(batch.remaining_jobs > 0);
 			batch.remaining_jobs--;
+		}
+		{
+			lock_guard<mutex> result_guard(batch.result_lock);
+			if (!error && !batch.cancelled.load()) {
+				auto &result = batch.results[job.result_index];
+				result.feature_index = job.job.feature_index;
+				result.output_path = std::move(job.job.output_path);
+				result.encoded = std::move(encoded);
+			}
+			// Publish completion only after releasing this job's thread budget.
+			batch.completed_jobs++;
 		}
 		batch.result_cv.notify_all();
 		work_cv.notify_all();
@@ -257,12 +293,22 @@ struct LerobotCodecExecutor::Impl {
 		work_cv.notify_all();
 
 		bool interrupted = false;
+		bool discarded_queue = false;
 		unique_lock<mutex> result_guard(batch->result_lock);
 		while (batch->completed_jobs != batch->results.size()) {
 			if (context.IsInterrupted()) {
 				interrupted = true;
 				batch->cancelled = true;
-				work_cv.notify_all();
+			}
+			if (!discarded_queue && batch->cancelled.load()) {
+				// Do not wait for an unrelated COPY's busy workers to discard our
+				// queued jobs. Jobs already taken by workers must still complete
+				// before returning, because they borrow the caller's FileSystem.
+				discarded_queue = true;
+				result_guard.unlock();
+				DiscardCancelledJobs(batch);
+				result_guard.lock();
+				continue;
 			}
 			batch->result_cv.wait_for(result_guard, std::chrono::milliseconds(10));
 		}

@@ -118,6 +118,21 @@ host's `httpfs` extension; released DuckDB
 builds can normally auto-install and auto-load it, or it can be loaded
 explicitly before `lerobot`.
 
+For a relative local root, readers use the caller's `file_search_path` to locate
+`meta/info.json`, preferring a match in the working directory. The selected
+dataset's metadata, Parquet shards and videos then use that same resolved root.
+If the search list matches multiple datasets, use an explicit path to select
+one. Local paths passed to internal queries are absolute; `~` is expanded using
+the caller's `home_directory` setting.
+
+Dataset `data_path` and `video_path` templates must expand to relative paths
+with `/` separators. Components cannot be empty, `.` or `..`, end in a dot or
+space, or contain backslashes, control characters, Windows drive/stream syntax,
+glob metacharacters or URI escapes/delimiters (`:*?"<>|[]%#`). Feature names use
+the same component rules on read and COPY. Unicode, internal spaces and
+apostrophes are allowed. These checks validate metadata paths lexically;
+filesystem access, including symbolic links, follows DuckDB's filesystem rules.
+
 ```sql
 INSTALL httpfs;
 LOAD httpfs;
@@ -328,7 +343,11 @@ or float32 metres. Image features are embedded as PNG/TIFF structs in Parquet.
 Video features use LeRobot's current defaults: AV1/yuv420p for RGB and
 lossless HEVC/gray12le after 12-bit logarithmic quantization for depth. Depth
 uses closed GOPs so independently encoded episodes remain seekable after
-concatenation. The writer records the encoder's returned codec and pixel format.
+concatenation. B-frame reordering is disabled for depth, keeping decode
+timestamps consistent across episodes of different lengths. Depth images up
+to 64 pixels wide use intra-only GOPs to avoid
+x265 reference-padding corruption in narrow images; these clips may be larger.
+The writer records the encoder's codec, pixel format, and GOP size.
 When `RGB_CODEC` is omitted, the build's AV1 encoder preference applies; the
 `auto` build prefers SVT-AV1 and falls back to libaom. An explicit `RGB_CODEC`
 selects that encoder without fallback. Depth-video writing requires an FFmpeg
@@ -337,6 +356,41 @@ Episode fragments are retained until a video shard closes and then
 stream-copy concatenated once. Episode metadata records the resulting
 `[from_timestamp, to_timestamp)` routes without repeatedly rewriting a growing
 shard prefix.
+`VIDEO_FILES_SIZE_IN_MB` is checked against the sum of retained fragment sizes
+before adding an episode, with rollover at `>=`. LeRobot 0.6.1 instead uses the
+size of its already merged prefix, so physical shard boundaries can differ near
+the limit. Episode contents and routes remain readable by both implementations.
+An episode is never split solely to meet the size target.
+
+Video output, fragment reads, and MP4 faststart use DuckDB's `FileSystem`.
+Fragments are remuxed directly; FFmpeg does not parse dataset paths as URLs or
+concat text. Buffered writes, file sync, and close errors are checked before
+publication. I/O failures abort COPY and preserve the original error during
+staging cleanup. COPY still requires a local dataset root.
+Final shard assembly checks the caller's interruption state during reads,
+writes and faststart. Finalization checks it again immediately before the
+publish rename, so cancellation during assembly or metadata writing rolls back
+the unpublished dataset.
+
+Rollback closes each visual spool independently, releases native Parquet
+writers, and then removes the staging directory. The staging directory is also
+owned during partial initialization, so a constructor error still triggers
+cleanup. If closing a spool or removing staging fails, a DuckDB warning records
+the resource, staging path, and reason. These diagnostics follow DuckDB's log
+settings; enable logging before COPY to inspect them afterwards:
+
+```sql
+SET enable_logging = true;
+SET logging_level = 'WARNING';
+-- Run COPY, then inspect any cleanup warnings:
+SELECT timestamp, message
+FROM duckdb_logs
+WHERE starts_with(message, 'LeRobot cleanup failed');
+```
+
+Cleanup or logging errors never replace the original COPY error. A directory
+that cannot be removed is left at the reported staging path; cleanup does not
+remove a pre-existing destination or an already-published dataset.
 
 COPY uses bounded episode memory. Numeric rows live in DuckDB's buffer-managed
 collection and statistics are computed in bounded streaming passes. Raw visual
@@ -348,12 +402,23 @@ whole episode batch completes. `VIDEO_WORKERS` limits active camera encoders;
 across those workers. Both default to `min(4, DuckDB's thread limit)` and cannot
 exceed that limit. Concurrent COPY statements share a database-wide admission
 limit for the configured codec budgets within that DatabaseInstance.
+Pool sizing accounts for the largest host-thread budget captured by active
+batches. If `threads` is increased between overlapping batches, the newer batch
+prepares enough workers for its eventual concurrency. Those workers wait until
+the older batch releases its smaller admission limit; active codec work still
+obeys the shared budget.
 Codec work deliberately does not occupy DuckDB pipeline workers; unrelated
 queries can still consume their own pipeline budget at the same time. These
 threads still compete for CPU and memory; this is not admission control for
 all read/write queries or an exact cap on threads created internally by codecs.
 The single COPY coordinator waits for each episode batch, but performs no codec
 CPU work while it waits.
+Cancellation removes that COPY's queued encoding jobs without waiting for
+another COPY's encoders. The coordinator still waits for its running encoders
+to exit before cleaning staging files or releasing the caller's file system.
+An encoder failure cancels the rest of its batch and preserves the original
+error. A codec call already in progress must return before cancellation can
+finish.
 Integer `min`/`max` statistics use LeRobot's native-compatible `BIGINT` leaf in
 episode Parquet metadata (`UBIGINT` for the complete `uint64` domain) and retain
 their exact decimal value in `stats.json`; they never pass through `DOUBLE`.
@@ -411,12 +476,27 @@ available as named parameters; moving them into SET alone is not resource govern
 ## Metadata and Parquet caching
 
 The data and video route caches are separate database-instance `ObjectCache`
-entries keyed by normalized dataset root. Entries are immutable and
-memory-accounted, so DuckDB can evict them. A size/mtime/version-tag fingerprint
-of `meta/info.json` invalidates stale entries automatically; `refresh := true`
-invalidates both entries for non-versioned or manually edited datasets, after
-which a cache-consuming query rebuilds only what it needs. Versioned Hugging
-Face revisions should normally need no explicit refresh.
+entries keyed by normalized dataset root and, for relative roots, the working
+directory and caller's file search paths. Changing these settings cannot reuse
+another dataset's routes. Entries retain the resolved physical root and are
+immutable and memory-accounted, so DuckDB can evict them. A size/mtime/version-tag
+fingerprint of `meta/info.json` invalidates stale entries automatically.
+For roots DuckDB recognizes as remote, entries also retain the episode metadata
+file list and each file's fingerprint, including Parquet files with zero rows.
+Each validation lists these files again and requests one byte from each nonempty
+file through DuckDB's filesystem. This checks read access even when listing or
+HEAD is public and detects metadata replacement without an `info.json` change.
+The same one-byte read validates remote `info.json` access, including for
+zero-episode datasets whose routes do not require episode files.
+The manifest is checked before files from a cached generation. Committing an
+empty dataset can therefore remove the old episode files without preventing
+warm readers from rebuilding empty routes.
+Data and video routes both rebuild when this snapshot changes. These checks add
+remote I/O; the host's caching, prefetching, and full-download policies still
+apply. Local roots continue to use the `info.json` commit marker.
+`refresh := true` explicitly invalidates both entries, after which a consuming
+query rebuilds only what it needs. Versioned Hugging Face revisions should
+normally need no explicit refresh.
 
 `lerobot_info`, `lerobot_episodes`, and `lerobot_tasks` register `refresh` in
 the current API. Passing `true` invalidates both routing caches at bind time
@@ -429,7 +509,16 @@ named parameter, and the option-parsing branch was unreachable.
 with the stable columns `root`, `component`, `cached`, `entries`, and `bytes`.
 `entries` is zero or one for the corresponding `ObjectCache` entry, and `bytes`
 is its current memory estimate. This is a passive snapshot: it neither reads
-storage nor validates, refreshes, or creates a cache entry.
+dataset files nor validates, refreshes, or creates a cache entry. S3-compatible
+roots include a SHA-256 fingerprint of the caller's S3 access settings and
+DuckDB secrets whose scopes overlap the dataset, including individual episode
+metadata files. Changing endpoints or credentials cannot reuse earlier routes
+just because `info.json` is public or has an identical fingerprint. Cache keys
+retain the digest, without plaintext credential values. Secrets scoped entirely
+outside the dataset do not change its cache identity.
+Metadata loading checks the access identity again after I/O and retries once
+when it changes. Persistent changes return an I/O error so routes are not
+published under an identity that failed validation.
 
 The data route builder projects only `episode_index`, `length`,
 `data/chunk_index`, and `data/file_index` from episode metadata. The lazy video
@@ -440,6 +529,28 @@ projection and filter pushdown,
 row-group min/max pruning, parallel reads, and external-file caching. DuckDB's
 optional `parquet_metadata_cache` setting can therefore be used without any
 LeRobot-specific footer cache.
+
+Within one `lerobot_video_targets` query, workers share a bounded timestamp
+index for repeatedly accessed data shards. Indexing starts only after 4,096
+logical targets and at least three batches visiting the same shard. Smaller
+requests use the native filtered query. A native footer count sizes each index
+before its three columns are read. Index row buffers use DuckDB's buffer
+allocator and together are limited to the smaller of 32 MiB and one eighth of
+`memory_limit` at operator initialization. At most 64 shard states are tracked;
+their paths and bookkeeping, and native query working memory, are separate
+from this row-buffer cap. Oversized shards and memory pressure fall back to
+filtered queries. Full-shard rebuilding is suppressed after memory eviction.
+Recoverable read or conversion failures during construction also fall back to
+the filtered query, so an unrequested bad row does not introduce a new error.
+
+Indexes are released with the query and never shared across connections or
+executions. Each shard's size, mtime and version tag are checked before reuse
+and across construction, independently of `info.json`; edits that leave all
+three unchanged cannot be detected by this fingerprint. A concurrent worker
+uses a filtered query while an index is being built, preserving independent
+cancellation without waiting on a nested query. Missing or duplicate frames,
+NULL and invalid timestamps retain the same validation on both paths. These
+query-local indexes are not entries in `lerobot_cache_info`.
 
 Decoded images are deliberately not cached by this extension: they are large,
 often consumed once by training, and cache policy belongs with the Vane actor or
@@ -514,7 +625,9 @@ LEROBOT_FFMPEG_TESTS=1 make test
 The native CI matrix pins the DuckDB submodule at v1.5.5/C++11 and runs three
 configurations on Ubuntu 24.04: a metadata-only release build, an FFmpeg-enabled
 release build with every visual test enabled, and an FFmpeg-enabled
-ASAN+UBSAN build. The metadata-only job also installs the pinned official
+ASAN+UBSAN build. A dedicated decoder test also enables LeakSanitizer and covers
+repeated opens, LRU eviction, early LIMIT and failed opens. The metadata-only job
+also installs the pinned official
 LeRobot release and runs the bidirectional format test documented in
 [`test/conformance/README.md`](test/conformance/README.md). CMake options can be
 reproduced locally without replacing the project's standard configure command,
@@ -526,6 +639,42 @@ make reldebug GEN=ninja \
 LEROBOT_FFMPEG_TESTS=1 make test_reldebug
 ```
 
+All three native CI builds also run a C++ executor regression suite with a
+controlled encoder. It checks cancellation while another COPY occupies the
+pool, running-job cleanup, error isolation, result order, thread-budget reuse
+and pool growth when overlapping batches release a smaller host limit, without
+depending on codec speed. A separate producer suite exercises
+DuckDB's destruction of blocked read tasks, connection and buffer ownership,
+and normal/error completion. A nested-query suite gates native JSON/Parquet
+reads to check cancellation during preparation and execution, streaming fetch,
+connection cleanup and isolation from other queries. A COPY binding suite
+pauses the real FEATURES JSON query to check interruption during direct COPY
+and preparation, error precedence, connection cleanup and retry. Numeric
+statistics tests cover native vector selections, nested NULLs, exact integer
+extrema and repeated scans across chunk and dimension boundaries. These suites
+run without FFmpeg. With
+`BUILD_UNITTESTS=ON` (the default), run them locally with:
+
+```bash
+cmake --build build/release --target test_lerobot_codec_executor
+cmake --build build/release --target test_lerobot_video_producer
+cmake --build build/release --target test_lerobot_nested_query
+cmake --build build/release --target test_lerobot_copy_bind
+cmake --build build/release --target test_lerobot_numeric_stats
+cmake --build build/release --target test_lerobot_image_writer
+cmake --build build/release --target test_lerobot_copy_cleanup
+```
+
+The cleanup suite checks partial construction, residual-directory diagnostics,
+ownership and retry without FFmpeg. With FFmpeg enabled, `test_lerobot_video_io`
+also injects filesystem failures into real video COPY operations, including
+simultaneous spool-close, staging-removal and diagnostic failures.
+Cancellation tests interrupt final fragment reads, output creation, faststart
+and manifest writing, then verify rollback and retry in the same database.
+`test_lerobot_image_writer` checks consecutive independent PNGs from reused
+encoders, mixed image sizes, malformed frames, COPY interruption and retry.
+With FFmpeg disabled it checks the missing-support error instead.
+
 FFmpeg support is fail-closed: configuring with its default
 `LEROBOT_ENABLE_FFMPEG=ON` requires all four development libraries. Use
 `-DLEROBOT_ENABLE_FFMPEG=OFF` only when intentionally building the
@@ -535,6 +684,17 @@ A release is blocked unless the complete native matrix and the pinned
 bidirectional conformance job pass, `LICENSE` is present, and every direct
 dependency or fixture is accounted for in `THIRD_PARTY_NOTICES.md`. The pull
 request template records the same checks before merge.
+
+Nested queries for dataset metadata, target timestamps and COPY FEATURES
+parsing inherit the outer query's cancellation. One monitor thread per database
+forwards interrupts; it sleeps when no nested reads are active and does no
+query execution or I/O.
+The calling thread waits for its own query and result cleanup before returning.
+Cancellation latency still depends on DuckDB and the underlying filesystem
+checking for interruption. Internal readers, including the video producer,
+inherit explicit session overrides of extension settings such as HTTPFS
+credentials and endpoints. Global settings and secrets remain shared. Other
+session state, profiling and the caller's transaction are not inherited.
 
 `frame_indices` is the pre-decode sampling control for the low-level frame API;
 training reads should normally use `lerobot_video_windows`. `tolerance`

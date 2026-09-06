@@ -1,0 +1,127 @@
+# name: test/sql/lerobot_path_safety.test
+# description: Dataset templates and feature names cannot redirect native readers outside the root
+# group: [sql]
+
+require parquet
+
+require json
+
+require lerobot
+
+statement ok
+COPY (SELECT 0 AS bootstrap, 1 AS payload) TO '{TEST_DIR}/lerobot_path_safety'
+(FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (SELECT 0 AS bootstrap, 1 AS payload) TO '{TEST_DIR}/lerobot_path_safety/meta'
+(FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (
+    SELECT 0::BIGINT AS episode_index, 1::BIGINT AS length,
+           0::BIGINT AS "data/chunk_index", 0::BIGINT AS "data/file_index",
+           0::BIGINT AS "videos/camera/chunk_index", 0::BIGINT AS "videos/camera/file_index",
+           0.0::DOUBLE AS "videos/camera/from_timestamp", 0.1::DOUBLE AS "videos/camera/to_timestamp",
+           0 AS metadata_chunk
+) TO '{TEST_DIR}/lerobot_path_safety/meta/episodes'
+(FORMAT PARQUET, PARTITION_BY (metadata_chunk));
+
+# A lone '..' previously reached the native Parquet reader, which recursively
+# expanded the parent directory. Reject it before it can read this sibling.
+statement ok
+COPY (SELECT 'outside dataset root' AS marker)
+TO '{TEST_DIR}/lerobot_path_safety_outside.parquet' (FORMAT PARQUET);
+
+statement ok
+CREATE TABLE unsafe_paths AS
+SELECT row_number() OVER () - 1 AS id, path FROM (VALUES
+    ('..'), ('../lerobot_path_safety_outside.parquet'), ('nested/../outside.parquet'),
+    ('./data.parquet'), ('nested//data.parquet'), ('nested/'),
+    ('/outside.parquet'), ('C:/outside.parquet'), ('C:outside.parquet'),
+    ('..\..\outside.parquet'), ('\\server\share\outside.parquet'),
+    ('hf://datasets/owner/repo/data.parquet'), ('data/*.parquet'),
+    ('data/[ab].parquet'), ('data/file?.parquet'), ('%2e%2e/outside.parquet'),
+    ('data%2f..%2foutside.parquet'), ('data/file#fragment'),
+    ('nested./data.parquet'), ('nested /data.parquet'),
+    ('data/' || chr(10) || 'file.parquet'), ('data/file:stream')
+) paths(path);
+
+loop path_id 0 22
+
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version, path AS data_path,
+           'video-{file_index:03d}.mp4' AS video_path,
+           10 AS fps, 1 AS total_episodes, 1 AS total_frames, 0 AS total_tasks,
+           struct_pack(camera := struct_pack(dtype := 'video')) AS features
+    FROM unsafe_paths WHERE id = ${path_id}
+) TO '{TEST_DIR}/lerobot_path_safety/meta/info.json' (FORMAT JSON, ARRAY false);
+
+statement error
+SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_path_safety', refresh := true, union_by_name := true);
+----
+data_path must stay relative to the dataset root
+
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version, 'data.parquet' AS data_path,
+           path AS video_path,
+           10 AS fps, 1 AS total_episodes, 1 AS total_frames, 0 AS total_tasks,
+           struct_pack(camera := struct_pack(dtype := 'video')) AS features
+    FROM unsafe_paths WHERE id = ${path_id}
+) TO '{TEST_DIR}/lerobot_path_safety/meta/info.json' (FORMAT JSON, ARRAY false);
+
+statement error
+SELECT * FROM lerobot_video_routes('{TEST_DIR}/lerobot_path_safety', [0], refresh := true);
+----
+video_path must stay relative to the dataset root
+
+endloop
+
+# Video keys are substituted into paths. Validate names before route lookup;
+# the same rule also applies when binding COPY, before a staging root is made.
+foreach feature .. . invalid/name invalid\\name C:camera camera? camera%2foutside
+
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version, 'data.parquet' AS data_path,
+           'videos/{video_key}/{file_index:03d}.mp4' AS video_path,
+           10 AS fps, 1 AS total_episodes, 1 AS total_frames, 0 AS total_tasks,
+           json_object('${feature}', json_object('dtype', 'video')) AS features
+) TO '{TEST_DIR}/lerobot_path_safety/meta/info.json' (FORMAT JSON, ARRAY false);
+
+statement error
+SELECT * FROM lerobot_video_routes('{TEST_DIR}/lerobot_path_safety', [0], refresh := true);
+----
+feature name must be a portable path component
+
+statement error
+COPY (SELECT 0::BIGINT AS episode_index, 'test' AS task, 1::FLOAT AS "${feature}")
+TO '{TEST_DIR}/lerobot_unsafe_feature' (FORMAT lerobot, FPS 10,
+FEATURES '{"${feature}":{"dtype":"float32","shape":[1]}}');
+----
+feature name must be a portable path component
+
+endloop
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/lerobot_unsafe_feature*');
+----
+0
+
+# Legitimate spaces, Unicode, apostrophes and a custom template remain usable.
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, 0::BIGINT AS frame_index, 'inside' AS marker)
+TO '{TEST_DIR}/lerobot_path_safety/机器人''s frames-000.parquet' (FORMAT PARQUET);
+
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version, '机器人''s frames-{file_index:03d}.parquet' AS data_path,
+           10 AS fps, 1 AS total_episodes, 1 AS total_frames, 0 AS total_tasks,
+           struct_pack("robot's state" := struct_pack(dtype := 'string')) AS features
+) TO '{TEST_DIR}/lerobot_path_safety/meta/info.json' (FORMAT JSON, ARRAY false);
+
+query T
+SELECT marker FROM lerobot_scan('{TEST_DIR}/lerobot_path_safety', refresh := true);
+----
+inside

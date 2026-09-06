@@ -342,7 +342,19 @@ statement ok
 SET debug_physical_table_scan_execution_strategy = 'default';
 
 # LIMIT must cancel/deschedule producers without poisoning the next query on
-# the same connection.
+# the same connection, with one or several threads and either scan strategy.
+foreach workers 1 4
+
+statement ok
+SET threads = ${workers};
+
+foreach strategy synchronous default
+
+statement ok
+SET debug_physical_table_scan_execution_strategy = '${strategy}';
+
+loop cancelled_scan 0 3
+
 query I
 SELECT count(*)
 FROM (
@@ -372,6 +384,18 @@ FROM lerobot_video_frames(
 );
 ----
 4
+
+endloop
+
+endloop
+
+endloop
+
+statement ok
+SET debug_physical_table_scan_execution_strategy = 'default';
+
+statement ok
+SET threads = 4;
 
 statement error
 SELECT *

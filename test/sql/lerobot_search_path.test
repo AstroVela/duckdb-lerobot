@@ -1,0 +1,269 @@
+# name: test/sql/lerobot_search_path.test
+# description: Caller-relative datasets resolve consistently across nested scans and session-scoped caches
+# group: [sql]
+
+require parquet
+
+require json
+
+require lerobot
+
+statement ok
+COPY (SELECT 0 AS bootstrap, 1 AS payload) TO '{TEST_DIR}/lerobot_search_path'
+(FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+foreach scope 1 2
+
+statement ok
+COPY (SELECT 0 AS bootstrap, 1 AS payload) TO '{TEST_DIR}/lerobot_search_path/${scope}'
+(FORMAT PARQUET, PARTITION_BY (bootstrap));
+
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, 'task-${scope}' AS task, ${scope}::FLOAT AS action)
+TO '{TEST_DIR}/lerobot_search_path/${scope}/dataset' (FORMAT lerobot, FPS 10,
+FEATURES '{"action":{"dtype":"float32","shape":[1]}}');
+
+# Add video routes without requiring any media codec. Projections below exercise
+# nested timestamp queries while the decoder is pruned from the physical plan.
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version,
+           'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet' AS data_path,
+           'video-{file_index:03d}.mp4' AS video_path,
+           10 AS fps, 1 AS total_episodes, 1 AS total_frames, 1 AS total_tasks,
+           struct_pack(action := struct_pack(dtype := 'float32'),
+                       camera := struct_pack(dtype := 'video')) AS features
+) TO '{TEST_DIR}/lerobot_search_path/${scope}/dataset/meta/info.json' (FORMAT JSON, ARRAY false);
+
+statement ok
+COPY (
+    SELECT 0::BIGINT AS episode_index, 1::BIGINT AS length,
+           0::BIGINT AS "data/chunk_index", 0::BIGINT AS "data/file_index",
+           0::BIGINT AS "videos/camera/chunk_index", ${scope}::BIGINT AS "videos/camera/file_index",
+           0.0::DOUBLE AS "videos/camera/from_timestamp", 0.1::DOUBLE AS "videos/camera/to_timestamp"
+) TO '{TEST_DIR}/lerobot_search_path/${scope}/dataset/meta/episodes/chunk-000/file-000.parquet'
+(FORMAT PARQUET);
+
+endloop
+
+statement ok
+SET file_search_path = '{TEST_DIR}/lerobot_search_path/1';
+
+# Peek must neither resolve missing metadata nor populate either cache.
+query TII
+SELECT component, cached, entries FROM lerobot_cache_info('dataset') ORDER BY component;
+----
+data	false	0
+video	false	0
+
+query I
+SELECT total_frames FROM lerobot_info('dataset');
+----
+1
+
+query II
+SELECT episode_index, length FROM lerobot_episodes('dataset');
+----
+0	1
+
+query T
+SELECT task FROM lerobot_tasks('dataset');
+----
+task-1
+
+query I
+SELECT (stats->>'$.mean[0]')::INTEGER FROM lerobot_stats('dataset') WHERE feature = 'action';
+----
+1
+
+query I
+SELECT action::INTEGER FROM lerobot_scan('dataset');
+----
+1
+
+query T
+SELECT video_path FROM lerobot_video_routes('dataset', [0]);
+----
+{TEST_DIR}/lerobot_search_path/1/dataset/video-001.mp4
+
+query II
+SELECT frame_index, timestamp FROM lerobot_video_frames('dataset', [0]);
+----
+0	0
+
+query II
+SELECT target_frame_index, timestamp FROM lerobot_video_windows('dataset',
+    [struct_pack(request_id := 1::BIGINT, episode_index := 0::BIGINT, frame_index := 0::BIGINT)],
+    delta_timestamps := [0.0]);
+----
+0	0
+
+query IIT
+SELECT target_frame_index, timestamp, video_path FROM lerobot_video_targets('dataset',
+    (SELECT 1 AS request_id, 0 AS episode_index, 0 AS frame_index, 'camera' AS video_key, 0 AS delta_index),
+    delta_timestamps := [0.0]);
+----
+0	0	{TEST_DIR}/lerobot_search_path/1/dataset/video-001.mp4
+
+query TI
+SELECT component, cached FROM lerobot_cache_info('dataset') ORDER BY component;
+----
+data	true
+video	true
+
+# A second connection uses the same spelling for a different physical dataset.
+# It must not observe the first connection's caches, or change its lookup.
+statement ok other
+SET file_search_path = '{TEST_DIR}/lerobot_search_path/2';
+
+query TI other
+SELECT component, cached FROM lerobot_cache_info('dataset') ORDER BY component;
+----
+data	false
+video	false
+
+query I other
+SELECT action::INTEGER FROM lerobot_scan('dataset');
+----
+2
+
+query T other
+SELECT video_path FROM lerobot_video_routes('dataset', [0]);
+----
+{TEST_DIR}/lerobot_search_path/2/dataset/video-002.mp4
+
+query I
+SELECT action::INTEGER FROM lerobot_scan('dataset');
+----
+1
+
+query T
+SELECT video_path FROM lerobot_video_routes('dataset', [0]);
+----
+{TEST_DIR}/lerobot_search_path/1/dataset/video-001.mp4
+
+# Switching settings selects the other cache; metadata refresh invalidates only
+# the current lookup's components without populating either cache.
+statement ok
+SET file_search_path = '{TEST_DIR}/lerobot_search_path/2';
+
+query I
+SELECT action::INTEGER FROM lerobot_scan('dataset');
+----
+2
+
+query I
+SELECT total_frames FROM lerobot_info('dataset', refresh := true);
+----
+1
+
+query TI
+SELECT component, cached FROM lerobot_cache_info('dataset') ORDER BY component;
+----
+data	false
+video	false
+
+statement ok
+SET file_search_path = '{TEST_DIR}/lerobot_search_path/1';
+
+query TI
+SELECT component, cached FROM lerobot_cache_info('dataset') ORDER BY component;
+----
+data	true
+video	true
+
+# With no match in the first directory, all components use the later match.
+statement ok
+SET file_search_path = '{TEST_DIR}/missing-search-dir,{TEST_DIR}/lerobot_search_path/2';
+
+query I
+SELECT action::INTEGER FROM lerobot_scan('dataset');
+----
+2
+
+# A single root cannot silently merge two datasets from a search list. The
+# cache diagnostic still performs no storage lookup for an ambiguous root.
+statement ok
+SET file_search_path = '{TEST_DIR}/lerobot_search_path/1,{TEST_DIR}/lerobot_search_path/2';
+
+query TI
+SELECT component, cached FROM lerobot_cache_info('dataset') ORDER BY component;
+----
+data	false
+video	false
+
+foreach function lerobot_info lerobot_episodes lerobot_tasks lerobot_stats lerobot_scan
+
+statement error
+SELECT * FROM ${function}('dataset');
+----
+matches multiple datasets in file_search_path
+
+endloop
+
+statement error
+SELECT * FROM lerobot_video_routes('dataset', [0]);
+----
+matches multiple datasets in file_search_path
+
+# Explicit paths do not depend on file_search_path, even when its matches are
+# ambiguous, and a missing diagnostic root never accesses storage.
+query I
+SELECT action::INTEGER FROM lerobot_scan('{TEST_DIR}/lerobot_search_path/1/dataset');
+----
+1
+
+# Tilde expansion must also use the caller's setting, before opening a nested
+# connection, and changing that setting must select the other cache identity.
+statement ok
+SET file_search_path = '~';
+
+statement ok
+SET home_directory = '{TEST_DIR}/lerobot_search_path/1';
+
+query I
+SELECT action::INTEGER FROM lerobot_scan('~/dataset');
+----
+1
+
+query I
+SELECT action::INTEGER FROM lerobot_scan('dataset');
+----
+1
+
+statement ok
+SET home_directory = '{TEST_DIR}/lerobot_search_path/2';
+
+query I
+SELECT action::INTEGER FROM lerobot_scan('~/dataset');
+----
+2
+
+query TI
+SELECT component, cached FROM lerobot_cache_info('dataset') ORDER BY component;
+----
+data	false
+video	false
+
+query I
+SELECT action::INTEGER FROM lerobot_scan('dataset');
+----
+2
+
+query TI
+SELECT component, cached FROM lerobot_cache_info('missing-dataset') ORDER BY component;
+----
+data	false
+video	false
+
+statement ok
+SET file_search_path = '';
+
+statement ok
+SET enable_external_access = false;
+
+query TI
+SELECT component, cached FROM lerobot_cache_info('missing-dataset') ORDER BY component;
+----
+data	false
+video	false

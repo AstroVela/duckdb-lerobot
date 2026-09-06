@@ -381,3 +381,41 @@ FROM lerobot_video_frames(
 );
 ----
 max_cached_decoders must be between 1
+
+# Exercise decoder destruction on normal completion and early LIMIT. Under
+# LSan, each new query must release the current AVIO buffer, including buffers
+# replaced by FFmpeg while probing the input.
+loop reopen 0 10
+
+query I
+SELECT sum(octet_length(image))
+FROM lerobot_video_frames('{TEST_DIR}/lerobot_video_frames', [0],
+                         video_keys := ['observation.images.front'], frame_indices := [0]);
+----
+768
+
+query I
+SELECT octet_length(image)
+FROM lerobot_video_frames('{TEST_DIR}/lerobot_video_frames', [0, 1],
+                         frame_indices := [0, 1, 2, 3],
+                         target_buffer_size := 1, max_pending_targets := 1)
+LIMIT 1;
+----
+768
+
+endloop
+
+# A failed avformat_open_input also leaves a caller-owned AVIO buffer to free.
+statement ok
+COPY (SELECT 'not an MP4'::BLOB AS content)
+TO '{TEST_DIR}/lerobot_video_frames/video-000.mp4' (FORMAT BLOB);
+
+loop failed_open 0 5
+
+statement error
+SELECT image FROM lerobot_video_frames('{TEST_DIR}/lerobot_video_frames', [0],
+                                      video_keys := ['observation.images.front'], frame_indices := [0]);
+----
+FFmpeg could not open LeRobot video
+
+endloop
