@@ -128,10 +128,13 @@ the caller's `home_directory` setting.
 Dataset `data_path` and `video_path` templates must expand to relative paths
 with `/` separators. Components cannot be empty, `.` or `..`, end in a dot or
 space, or contain backslashes, control characters, Windows drive/stream syntax,
-glob metacharacters or URI escapes/delimiters (`:*?"<>|[]%#`). Feature names use
-the same component rules on read and COPY. Unicode, internal spaces and
-apostrophes are allowed. These checks validate metadata paths lexically;
-filesystem access, including symbolic links, follows DuckDB's filesystem rules.
+glob metacharacters or URI escapes/delimiters (`:*?"<>|[]%#`). Windows device
+basenames (`CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, and `COM`/`LPT` with
+digits 1–9 or superscript ¹/²/³) are also rejected, including case variants,
+extensions and spaces before an extension. Feature names use the same rules on read and
+COPY. Unicode, internal spaces and apostrophes are allowed. These checks validate
+metadata paths lexically; filesystem access, including symbolic links, follows
+DuckDB's filesystem rules.
 
 ```sql
 INSTALL httpfs;

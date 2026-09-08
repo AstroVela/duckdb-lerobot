@@ -43,10 +43,14 @@ SELECT row_number() OVER () - 1 AS id, path FROM (VALUES
     ('data/[ab].parquet'), ('data/file?.parquet'), ('%2e%2e/outside.parquet'),
     ('data%2f..%2foutside.parquet'), ('data/file#fragment'),
     ('nested./data.parquet'), ('nested /data.parquet'),
-    ('data/' || chr(10) || 'file.parquet'), ('data/file:stream')
+    ('data/' || chr(10) || 'file.parquet'), ('data/file:stream'),
+    ('data/NUL.parquet'), ('data/nul .parquet'), ('Con/frames.parquet'),
+    ('PRN'), ('a/Aux.bin'), ('COM1'), ('data/cOm9.mp4'),
+    ('LPT1/data.parquet'), ('data/lpt9.mp4'), ('data/COM¹.bin'),
+    ('LPT²/data.parquet'), ('data/lpt³.bin'), ('CONIN$'), ('data/conout$.bin')
 ) paths(path);
 
-loop path_id 0 22
+loop path_id 0 36
 
 statement ok
 COPY (
@@ -80,7 +84,7 @@ endloop
 
 # Video keys are substituted into paths. Validate names before route lookup;
 # the same rule also applies when binding COPY, before a staging root is made.
-foreach feature .. . invalid/name invalid\\name C:camera camera? camera%2foutside
+foreach feature .. . invalid/name invalid\\name C:camera camera? camera%2foutside CON prn AUX nul.tar.gz COM1 cOm9 LPT1 lpt9 COM¹ lpt² COM³ CONIN$ conout$.txt
 
 statement ok
 COPY (
@@ -108,6 +112,28 @@ query I
 SELECT count(*) FROM glob('{TEST_DIR}/lerobot_unsafe_feature*');
 ----
 0
+
+# Similar ordinary names are valid on Windows and must not be rejected by a
+# prefix match. Check both metadata paths and feature names through real I/O.
+foreach name CONSOLE NUL-safe COM0 COM10 LPT0 LPT10 COM¹suffix .NUL
+
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, 0::BIGINT AS frame_index, 'inside' AS marker)
+TO '{TEST_DIR}/lerobot_path_safety/${name}.parquet' (FORMAT PARQUET);
+
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version, '${name}.parquet' AS data_path,
+           10 AS fps, 1 AS total_episodes, 1 AS total_frames, 0 AS total_tasks,
+           json_object('${name}', json_object('dtype', 'string')) AS features
+) TO '{TEST_DIR}/lerobot_path_safety/meta/info.json' (FORMAT JSON, ARRAY false);
+
+query T
+SELECT marker FROM lerobot_scan('{TEST_DIR}/lerobot_path_safety', refresh := true);
+----
+inside
+
+endloop
 
 # Legitimate spaces, Unicode, apostrophes and a custom template remain usable.
 statement ok

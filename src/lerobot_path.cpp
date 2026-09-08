@@ -113,6 +113,25 @@ bool IsPortablePathComponent(const string &component) {
 			return false;
 		}
 	}
+	// Win32 resolves device basenames even with an extension or spaces before
+	// its first dot (for example, "NUL .parquet"). Reject them on every host so
+	// metadata and COPY feature names retain the same portability contract.
+	auto basename = StringUtil::Lower(component.substr(0, component.find('.')));
+	while (!basename.empty() && basename.back() == ' ') {
+		basename.pop_back();
+	}
+	if (basename == "con" || basename == "prn" || basename == "aux" || basename == "nul" || basename == "conin$" ||
+	    basename == "conout$") {
+		return false;
+	}
+	if (StringUtil::StartsWith(basename, "com") || StringUtil::StartsWith(basename, "lpt")) {
+		const auto number = basename.substr(3);
+		// Windows also reserves the UTF-8 superscript digits 1, 2 and 3.
+		if ((number.size() == 1 && number[0] >= '1' && number[0] <= '9') || number == "\xC2\xB9" ||
+		    number == "\xC2\xB2" || number == "\xC2\xB3") {
+			return false;
+		}
+	}
 	return true;
 }
 
