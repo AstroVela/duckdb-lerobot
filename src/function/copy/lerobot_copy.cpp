@@ -1628,9 +1628,16 @@ struct LerobotCopyGlobalData : public GlobalFunctionData {
 	                   BindParquet(context, bind.parquet_function, {"task_index", "task"},
 	                               {LogicalType::BIGINT, LogicalType::VARCHAR}, "pandas", TasksPandasMetadataJSON())) {
 		// DuckDB 1.5's StringUtil::RTrim also removes trailing UTF-8 bytes.
+		// Windows accepts '/' as well as the separator returned by its filesystem.
 		const auto separator = fs.PathSeparator(root);
-		while (!root.empty() && StringUtil::EndsWith(root, separator)) {
-			root.resize(root.size() - separator.size());
+		while (!root.empty()) {
+			if (root.back() == '/') {
+				root.pop_back();
+			} else if (!separator.empty() && StringUtil::EndsWith(root, separator)) {
+				root.resize(root.size() - separator.size());
+			} else {
+				break;
+			}
 		}
 		if (root.empty()) {
 			throw IOException("LeRobot dataset root cannot be empty");

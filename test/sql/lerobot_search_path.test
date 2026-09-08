@@ -81,13 +81,14 @@ SELECT action::INTEGER FROM lerobot_scan('dataset');
 ----
 1
 
-# Resolved paths are absolute; compare from TEST_DIR onward for runners using
-# either a relative or an absolute temporary directory.
-query T
-SELECT substr(video_path, strpos(video_path, '{TEST_DIR}/')) AS video_path
+# Resolved paths are absolute and can mix separators on Windows. Compare
+# normalized suffixes for either a relative or an absolute temporary directory.
+query I
+SELECT ends_with(replace(video_path, chr(92), '/'),
+    replace('{TEST_DIR}/lerobot_search_path/1/dataset/video-001.mp4', chr(92), '/'))
 FROM lerobot_video_routes('dataset', [0]);
 ----
-{TEST_DIR}/lerobot_search_path/1/dataset/video-001.mp4
+true
 
 query II
 SELECT frame_index, timestamp FROM lerobot_video_frames('dataset', [0]);
@@ -101,13 +102,14 @@ SELECT target_frame_index, timestamp FROM lerobot_video_windows('dataset',
 ----
 0	0
 
-query IIT
-SELECT target_frame_index, timestamp, substr(video_path, strpos(video_path, '{TEST_DIR}/')) AS video_path
+query III
+SELECT target_frame_index, timestamp, ends_with(replace(video_path, chr(92), '/'),
+    replace('{TEST_DIR}/lerobot_search_path/1/dataset/video-001.mp4', chr(92), '/'))
 FROM lerobot_video_targets('dataset',
     (SELECT 1 AS request_id, 0 AS episode_index, 0 AS frame_index, 'camera' AS video_key, 0 AS delta_index),
     delta_timestamps := [0.0]);
 ----
-0	0	{TEST_DIR}/lerobot_search_path/1/dataset/video-001.mp4
+0	0	true
 
 query TI
 SELECT component, cached FROM lerobot_cache_info('dataset') ORDER BY component;
@@ -131,22 +133,24 @@ SELECT action::INTEGER FROM lerobot_scan('dataset');
 ----
 2
 
-query T other
-SELECT substr(video_path, strpos(video_path, '{TEST_DIR}/')) AS video_path
+query I other
+SELECT ends_with(replace(video_path, chr(92), '/'),
+    replace('{TEST_DIR}/lerobot_search_path/2/dataset/video-002.mp4', chr(92), '/'))
 FROM lerobot_video_routes('dataset', [0]);
 ----
-{TEST_DIR}/lerobot_search_path/2/dataset/video-002.mp4
+true
 
 query I
 SELECT action::INTEGER FROM lerobot_scan('dataset');
 ----
 1
 
-query T
-SELECT substr(video_path, strpos(video_path, '{TEST_DIR}/')) AS video_path
+query I
+SELECT ends_with(replace(video_path, chr(92), '/'),
+    replace('{TEST_DIR}/lerobot_search_path/1/dataset/video-001.mp4', chr(92), '/'))
 FROM lerobot_video_routes('dataset', [0]);
 ----
-{TEST_DIR}/lerobot_search_path/1/dataset/video-001.mp4
+true
 
 # Switching settings selects the other cache; metadata refresh invalidates only
 # the current lookup's components without populating either cache.

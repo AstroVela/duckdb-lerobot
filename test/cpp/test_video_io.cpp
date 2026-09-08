@@ -252,6 +252,11 @@ public:
 	string GetName() const override {
 		return "LeRobot video fault filesystem";
 	}
+	string PathSeparator(const string &path) override {
+		// Exercise Windows destination normalization while keeping the backing
+		// filesystem's native spelling for all I/O paths on every test host.
+		return path == backslash_separator_path ? "\\" : local->PathSeparator(path);
+	}
 	bool FileExists(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
 		if (plan.stage_collision && plan.IsStagingRoot(path)) {
 			// Model a pre-existing directory at the generated staging name.
@@ -297,6 +302,7 @@ public:
 	FaultPlan plan;
 	string root;
 	unique_ptr<FileSystem> local;
+	string backslash_separator_path;
 	bool invalid_size = false;
 };
 
@@ -404,6 +410,32 @@ struct CopyTest {
 };
 
 } // namespace
+
+TEST_CASE("COPY publishes beside a destination ending in forward slashes on Windows", "[copy_cleanup]") {
+	for (const auto suffix : {"/", "///"}) {
+		DYNAMIC_SECTION("suffix=" << suffix) {
+			CopyTest test;
+			const auto root = test.root;
+			test.root += suffix;
+			test.fs->backslash_separator_path = test.root;
+			auto result = test.CopyNumeric();
+			INFO((result->HasError() ? result->GetError() : ""));
+			REQUIRE_FALSE(result->HasError());
+			REQUIRE(test.fs->plan.open_handles.load() == 0);
+			REQUIRE_FALSE(test.fs->plan.staging_root.empty());
+			REQUIRE_FALSE(test.directory.fs->DirectoryExists(test.fs->plan.staging_root));
+			auto rows = test.connection->Query("SELECT action FROM read_parquet(" +
+			                                   Value(root + "/data/**/*.parquet").ToSQLString() + ")");
+			REQUIRE_FALSE(rows->HasError());
+			REQUIRE(rows->RowCount() == 1);
+			REQUIRE(rows->GetValue(0, 0).GetValue<float>() == 7);
+			vector<string> entries;
+			test.directory.fs->ListFiles(test.directory.path,
+			                             [&](const string &name, bool) { entries.push_back(name); });
+			REQUIRE(entries.size() == 1);
+		}
+	}
+}
 
 TEST_CASE("COPY timestamps round only after division, including FPS beyond float integer precision",
           "[numeric_stats]") {
