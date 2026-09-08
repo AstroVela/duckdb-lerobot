@@ -1,0 +1,157 @@
+# name: test/sql/lerobot_copy_mixed_video.test
+# description: Repeated concurrent RGB/depth encoding with different camera dimensions
+# group: [sql]
+
+require-env LEROBOT_FFMPEG_TESTS
+
+require parquet
+
+require json
+
+require lerobot
+
+statement ok
+SET threads = 3;
+
+# Spatial depth patterns reach both image edges. Flat frames would miss x265's
+# narrow-image reference-padding corruption, which changes a block in frame 5.
+# Raw uint16 millimetres and decoded float32 millimetres are independent inputs.
+statement ok
+CREATE TEMP TABLE mixed_depth_input AS
+WITH levels(level, raw_hex, float_hex) AS (VALUES
+        (1, 'e204', '00409c44'),
+        (2, 'dc05', '0080bb44'),
+        (3, 'd606', '00c0da44'),
+        (4, 'd007', '0000fa44'),
+        (5, 'ca08', '00a00c45'),
+        (6, 'c409', '00401c45'),
+        (7, 'be0a', '00e02b45'),
+        (8, 'b80b', '00803b45'),
+        (9, 'b20c', '00204b45'),
+        (10, 'ac0d', '00c05a45'),
+        (11, 'a60e', '00606a45'),
+        (12, 'a00f', '00007a45'),
+        (13, '9a10', '00d08445'),
+        (14, '9411', '00a08c45'),
+        (15, '8e12', '00709445')
+)
+SELECT i // 4 AS episode, i % 4 AS frame,
+       from_hex(string_agg(raw_hex, '' ORDER BY pixel)) AS depth,
+       from_hex(string_agg(float_hex, '' ORDER BY pixel)) AS expected_depth
+FROM range(12) frames(i), range(6144) pixels(pixel), levels
+WHERE level = 1 + ((pixel % 64) // 8 + 3 * (pixel // 64 // 8) + i) % 15
+GROUP BY episode, frame;
+
+# The native CI matrix selects SVT or libaom as the default RGB encoder.
+# Three workers exercise two different RGB sizes together with a depth encoder.
+# Each episode reopens all codecs; a second COPY reuses the database worker pool.
+loop mixed_copy 0 2
+
+statement ok
+COPY (
+    SELECT episode::BIGINT AS episode_index, 'mixed cameras' AS task,
+           from_hex(repeat(CASE (episode * 4 + frame) % 3
+               WHEN 0 THEN '102030' WHEN 1 THEN '705040' ELSE '308070' END, 6144)) AS front,
+           from_hex(repeat(CASE (episode * 4 + frame) % 3
+               WHEN 0 THEN '903020' WHEN 1 THEN '2070a0' ELSE '703090' END, 12288)) AS wrist,
+           depth
+    FROM mixed_depth_input
+    ORDER BY episode, frame
+) TO '{TEST_DIR}/lerobot_copy_mixed_${mixed_copy}' (
+    FORMAT lerobot, FPS 10, VIDEO_WORKERS 3, ENCODER_THREADS 3,
+    FEATURES '{"front":{"dtype":"video","shape":[64,96,3]},"wrist":{"dtype":"video","shape":[96,128,3]},"depth":{"dtype":"video","shape":[96,64,1],"info":{"is_depth_map":true}}}',
+    RGB_CRF 18, DEPTH_MIN 1, DEPTH_MAX 5, DEPTH_SHIFT 0, DEPTH_USE_LOG false, DEPTH_CLIP false
+);
+
+query III
+SELECT total_episodes, total_frames, fps
+FROM lerobot_info('{TEST_DIR}/lerobot_copy_mixed_${mixed_copy}');
+----
+3	12	10
+
+# All three episode fragments for each camera must concatenate into one shard.
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/lerobot_copy_mixed_${mixed_copy}/videos/**/*.mp4');
+----
+3
+
+query IIRRR
+SELECT episode_index, length,
+       round("videos/front/from_timestamp", 3),
+       round("videos/wrist/from_timestamp", 3),
+       round("videos/depth/to_timestamp", 3)
+FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_mixed_${mixed_copy}')
+ORDER BY episode_index;
+----
+0	4	0.0	0.0	0.4
+1	4	0.4	0.4	0.8
+2	4	0.8	0.8	1.2
+
+statement ok
+CREATE TEMP TABLE mixed_decoded_${mixed_copy} AS
+SELECT * FROM lerobot_video_frames('{TEST_DIR}/lerobot_copy_mixed_${mixed_copy}', [0, 1, 2]);
+
+query TIIIII
+SELECT video_key, count(*), min(width), min(height), min(channels), min(octet_length(image))
+FROM mixed_decoded_${mixed_copy}
+GROUP BY video_key ORDER BY video_key;
+----
+depth	12	64	96	1	24576
+front	12	96	64	3	18432
+wrist	12	128	96	3	36864
+
+# Validate every row's shape, byte count, and position after concatenation.
+query I
+SELECT count(*) FROM mixed_decoded_${mixed_copy}
+WHERE (video_key = 'front' AND (width != 96 OR height != 64 OR channels != 3 OR octet_length(image) != 18432))
+   OR (video_key = 'wrist' AND (width != 128 OR height != 96 OR channels != 3 OR octet_length(image) != 36864))
+   OR (video_key = 'depth' AND (width != 64 OR height != 96 OR channels != 1 OR octet_length(image) != 24576))
+   OR abs(decoded_timestamp - (episode_index * 4 + frame_index) / 10.0) > 0.000001;
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT episode_index, frame_index, video_key, count(*) AS n
+    FROM mixed_decoded_${mixed_copy} GROUP BY ALL
+) WHERE n != 1 OR episode_index NOT BETWEEN 0 AND 2 OR frame_index NOT BETWEEN 0 AND 3;
+----
+0
+
+# These quarter-metre inputs round back to exact float32 millimetres under the
+# chosen linear quantizer. Independent FFmpeg tests also check the 12-bit codes.
+query I
+SELECT count(*) FROM mixed_decoded_${mixed_copy} decoded
+JOIN mixed_depth_input source ON episode_index = episode AND frame_index = frame
+WHERE video_key = 'depth' AND image != expected_depth;
+----
+0
+
+# Narrow depth clips use intra-only GOPs; metadata must describe the encoder.
+query I
+SELECT json_extract(content, '/features/depth/info/video.g')::INTEGER
+FROM read_text('{TEST_DIR}/lerobot_copy_mixed_${mixed_copy}/meta/info.json');
+----
+1
+
+# RGB is lossy; distinct source colours still identify each camera and frame.
+# The independent conformance script checks every pixel against patterned input.
+query I
+WITH expected AS (
+    SELECT *, CASE video_key
+        WHEN 'front' THEN CASE (episode_index * 4 + frame_index) % 3
+            WHEN 0 THEN 16 WHEN 1 THEN 112 ELSE 48 END
+        ELSE CASE (episode_index * 4 + frame_index) % 3
+            WHEN 0 THEN 144 WHEN 1 THEN 32 ELSE 112 END
+        END AS expected_red
+    FROM mixed_decoded_${mixed_copy} WHERE video_key != 'depth'
+)
+SELECT count(*) FROM expected
+WHERE abs(('0x' || left(hex(image), 2))::INTEGER - expected_red) > 6;
+----
+0
+
+statement ok
+DROP TABLE mixed_decoded_${mixed_copy};
+
+endloop

@@ -18,6 +18,11 @@ endif()
 
 add_subdirectory(src)
 
+if(BUILD_UNITTESTS AND BUILD_MAIN_DUCKDB_LIBRARY AND NOT PREBUILT_BINARY
+   AND NOT DISABLE_THREADS)
+    add_subdirectory(test)
+endif()
+
 # Keep the loadable artifact at DuckDB's standard extension path even though
 # the target itself is organized in the src subdirectory. The distribution
 # workflow uploads build/<config>/extension/lerobot/lerobot.duckdb_extension.

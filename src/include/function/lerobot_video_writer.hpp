@@ -15,6 +15,7 @@
 namespace duckdb {
 
 class FileSystem;
+class ClientContext;
 
 enum class LerobotRawVisualType : uint8_t { RGB24, DEPTH_UINT16, DEPTH_FLOAT32 };
 
@@ -50,8 +51,29 @@ struct LerobotEncodedVideoInfo {
 	string encoder;
 	string codec;
 	string pixel_format;
+	int gop = 0;
 	double duration = 0;
 	idx_t frame_count = 0;
+};
+
+//! One fixed-shape image feature in a COPY. Used by the serial COPY sink;
+//! RGB reuses a PNG encoder and depth keeps the existing TIFF representation.
+class LerobotImageWriter {
+public:
+	LerobotImageWriter(idx_t width, idx_t height, LerobotRawVisualType raw_type);
+	~LerobotImageWriter();
+	LerobotImageWriter(const LerobotImageWriter &) = delete;
+	LerobotImageWriter &operator=(const LerobotImageWriter &) = delete;
+
+	string Encode(const string &raw_frame);
+
+private:
+	struct Impl;
+	idx_t width;
+	idx_t height;
+	LerobotRawVisualType raw_type;
+	idx_t expected_size;
+	unique_ptr<Impl> impl;
 };
 
 struct LerobotVisualWriter {
@@ -59,10 +81,8 @@ struct LerobotVisualWriter {
 
 	static LerobotEncodedVideoInfo EncodeVideo(FileSystem &fs, const string &path, const string &raw_frames_path,
 	                                           idx_t frame_count, const LerobotVideoEncodeOptions &options);
-	static void ConcatenateVideos(const vector<string> &input_paths, const string &list_path,
+	static void ConcatenateVideos(ClientContext &context, FileSystem &fs, const vector<string> &input_paths,
 	                              const string &output_path);
-	static string EncodeImage(const string &raw_frame, idx_t width, idx_t height, LerobotRawVisualType raw_type);
-
 	static idx_t ExpectedFrameBytes(idx_t width, idx_t height, LerobotRawVisualType raw_type);
 };
 

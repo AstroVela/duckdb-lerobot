@@ -11,6 +11,9 @@ require json
 require lerobot
 
 statement ok
+SET threads = 2;
+
+statement ok
 COPY (
     SELECT 0::BIGINT AS episode_index, 'image task'::VARCHAR AS task,
            CASE frame_index
@@ -74,7 +77,8 @@ FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_image_sampling');
 true
 
 # Two episodes share one MP4. Finalize performs an FFmpeg stream-copy concat,
-# while episode routes retain the local half-open time ranges.
+# while episode routes retain the local half-open time ranges. Apostrophes,
+# spaces and '#' in the root must survive concat token and URL parsing.
 statement ok
 COPY (
     SELECT episode_index, task, from_hex(repeat(pixel, 4096)) AS "observation.images.front", action
@@ -85,7 +89,7 @@ COPY (
         (1::BIGINT, 'place'::VARCHAR, '6e6467', 1.1::FLOAT)
     ) frames(episode_index, task, pixel, action)
 	ORDER BY episode_index, action
-) TO '{TEST_DIR}/lerobot_copy_video' (
+) TO '{TEST_DIR}/lerobot_copy_video''s clips#1' (
     FORMAT lerobot,
     FPS 10,
     FEATURES '{"observation.images.front":{"dtype":"video","shape":[64,64,3],"names":["height","width","channels"]},"action":{"dtype":"float32","shape":[1],"names":null}}',
@@ -94,7 +98,7 @@ COPY (
 
 query I
 SELECT count(*)
-FROM glob('{TEST_DIR}/lerobot_copy_video/videos/**/*.mp4');
+FROM glob('{TEST_DIR}/lerobot_copy_video''s clips#1/videos/**/*.mp4');
 ----
 1
 
@@ -102,7 +106,7 @@ query IRR
 SELECT episode_index,
        round("videos/observation.images.front/from_timestamp", 3),
        round("videos/observation.images.front/to_timestamp", 3)
-FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_video')
+FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_video''s clips#1')
 ORDER BY episode_index;
 ----
 0	0.0	0.2
@@ -111,7 +115,7 @@ ORDER BY episode_index;
 query IIIIII
 SELECT count(*), min(width), max(width), min(height), min(channels), min(octet_length(image))
 FROM lerobot_video_frames(
-    '{TEST_DIR}/lerobot_copy_video',
+    '{TEST_DIR}/lerobot_copy_video''s clips#1',
     [0, 1],
     video_keys := ['observation.images.front'],
     frame_indices := [0, 1]
@@ -123,9 +127,40 @@ query III
 SELECT contains(content, '"video.codec":"av1"'),
        contains(content, '"video.pix_fmt":"yuv420p"'),
        contains(content, '"video.g":2')
-FROM read_text('{TEST_DIR}/lerobot_copy_video/meta/info.json');
+FROM read_text('{TEST_DIR}/lerobot_copy_video''s clips#1/meta/info.json');
 ----
 true	true	true
+
+# The timestamp queries run on nested connections and media opens use AVIO.
+# Both must use the caller-resolved dataset root, including a quoted filename.
+statement ok
+SET file_search_path = '{TEST_DIR}';
+
+query I
+SELECT sum(octet_length(image))
+FROM lerobot_video_frames('lerobot_copy_video''s clips#1', [0, 1], frame_indices := [0, 1]);
+----
+49152
+
+query I
+SELECT sum(octet_length(image))
+FROM lerobot_video_windows('lerobot_copy_video''s clips#1',
+    [struct_pack(request_id := 1::BIGINT, episode_index := 1::BIGINT, frame_index := 0::BIGINT)],
+    delta_timestamps := [0.0, 0.1]);
+----
+24576
+
+query I
+SELECT sum(octet_length(image))
+FROM lerobot_video_targets('lerobot_copy_video''s clips#1',
+    (SELECT 1 AS request_id, 1 AS episode_index, 0 AS frame_index,
+            'observation.images.front' AS video_key, 0 AS delta_index),
+    delta_timestamps := [0.0]);
+----
+12288
+
+statement ok
+SET file_search_path = '';
 
 # Each camera is spooled independently. Two dedicated codec workers encode the
 # cameras concurrently under a two-thread total codec budget, and feature-order
@@ -453,15 +488,43 @@ COPY (
                    )
                )
            ) AS features
-) TO '{TEST_DIR}/lerobot_copy_video/meta/info.json'
+) TO '{TEST_DIR}/lerobot_copy_video''s clips#1/meta/info.json'
   (FORMAT JSON, ARRAY false, OVERWRITE_OR_IGNORE);
 
 statement error
 SELECT decoded_timestamp
 FROM lerobot_video_frames(
-    '{TEST_DIR}/lerobot_copy_video', [0],
+    '{TEST_DIR}/lerobot_copy_video''s clips#1', [0],
     video_keys := ['observation.images.front'], frame_indices := [0],
     refresh := true
 );
 ----
 instead of gray12le
+
+# A prepared COPY retains its bound encoder budget. Reducing the global thread
+# setting must produce a recoverable error and clean up staging, not invalidate
+# the database with InternalException.
+statement ok
+PREPARE budget_copy AS
+COPY (SELECT 0::BIGINT AS episode_index, 'budget' AS task,
+             from_hex(repeat('102030', 4096)) AS camera)
+TO '{TEST_DIR}/lerobot_changed_thread_budget' (FORMAT lerobot, FPS 10,
+FEATURES '{"camera":{"dtype":"video","shape":[64,64,3]}}', ENCODER_THREADS 2);
+
+statement ok
+SET threads = 1;
+
+statement error
+EXECUTE budget_copy;
+----
+rebind COPY after changing threads
+
+query I
+SELECT 42;
+----
+42
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/lerobot_changed_thread_budget*');
+----
+0

@@ -2,6 +2,8 @@
 
 #include "function/lerobot_schema.hpp"
 #include "lerobot_depth.hpp"
+#include "lerobot_path.hpp"
+#include "lerobot_query.hpp"
 
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/exception.hpp"
@@ -12,7 +14,7 @@
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/main/connection.hpp"
+#include "duckdb/main/query_result.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -27,6 +29,14 @@ static const char *LEROBOT_EPISODES_SUFFIX = "/meta/episodes/**/*.parquet";
 
 string MetadataQueryPath(const string &path) {
 	return Value(path).ToSQLString();
+}
+
+idx_t MetadataFilesMemory(const vector<LerobotDatasetMetadata::MetadataFile> &files) {
+	idx_t memory = files.capacity() * sizeof(LerobotDatasetMetadata::MetadataFile);
+	for (const auto &file : files) {
+		memory += file.path.capacity() + file.fingerprint.version_tag.capacity();
+	}
+	return memory;
 }
 
 void ThrowQueryError(const char *description, const QueryResult &result) {
@@ -130,15 +140,7 @@ string FormatPathTemplate(const string &path_template, int64_t chunk_index, int6
 string ResolveDatasetPath(const string &root, const string &path_template, int64_t chunk_index, int64_t file_index,
                           const string *video_key, const char *path_name) {
 	auto relative_path = FormatPathTemplate(path_template, chunk_index, file_index, video_key, path_name);
-	if (relative_path.empty()) {
-		throw BinderException("LeRobot %s must not be empty", path_name);
-	}
-	if (relative_path[0] == '/' || StringUtil::Contains(relative_path, "://") ||
-	    StringUtil::StartsWith(relative_path, "../") || StringUtil::Contains(relative_path, "/../") ||
-	    StringUtil::EndsWith(relative_path, "/..")) {
-		throw BinderException("LeRobot %s must stay relative to the dataset root: '%s'", path_name, relative_path);
-	}
-	return root + "/" + relative_path;
+	return ResolveLerobotRelativePath(root, relative_path, path_name);
 }
 
 string ResolveDataPath(const string &root, const string &path_template, int64_t chunk_index, int64_t file_index) {
@@ -242,40 +244,41 @@ void BuildEmptyDatasetSchemas(LerobotDatasetInfo &info, const vector<ParsedLerob
 	AppendColumn(info.episode_schema, "meta/episodes/file_index", LogicalType::BIGINT);
 }
 
-LerobotDatasetInfo ParseLerobotInfo(Connection &connection, const string &info_path) {
-	auto info_result = connection.Query(
+LerobotDatasetInfo ParseLerobotInfo(ClientContext &context, const string &info_path) {
+	LerobotNestedQuery info_query(
+	    context,
 	    "WITH info AS (SELECT row_number() OVER () AS record_index, json FROM read_json_objects(" +
-	    MetadataQueryPath(info_path) +
-	    ")) SELECT CAST(record_index AS BIGINT), json_extract_string(info.json, '$.codebase_version'), "
-	    "json_extract_string(info.json, '$.data_path'), json_extract_string(info.json, '$.video_path'), "
-	    "CAST(json_extract_string(info.json, '$.fps') AS BIGINT), "
-	    "CAST(json_extract_string(info.json, '$.total_episodes') AS BIGINT), "
-	    "CAST(json_extract_string(info.json, '$.total_frames') AS BIGINT), "
-	    "CAST(json_extract_string(info.json, '$.total_tasks') AS BIGINT), "
-	    "features.key, json_extract_string(features.value, '$.dtype'), "
-	    "CAST(json_extract(features.value, '$.shape') AS BIGINT[]), "
-	    "CAST(json_extract(features.value, '$.info.is_depth_map') AS BOOLEAN), "
-	    "CAST(json_extract(features.value, '$.info.\"video.depth_min\"') AS DOUBLE), "
-	    "CAST(json_extract(features.value, '$.info.\"video.depth_max\"') AS DOUBLE), "
-	    "CAST(json_extract(features.value, '$.info.\"video.shift\"') AS DOUBLE), "
-	    "CAST(json_extract(features.value, '$.info.\"video.use_log\"') AS BOOLEAN), "
-	    "json_extract_string(features.value, '$.info.\"video.pix_fmt\"'), "
-	    "json_extract_string(features.value, '$.info.\"video.is_depth_map\"'), "
-	    "json_extract_string(features.value, '$.video_info.\"video.is_depth_map\"') "
-	    "FROM info LEFT JOIN LATERAL "
-	    "json_each(json_extract(info.json, '$.features')) features ON true ORDER BY record_index, features.id");
-	if (info_result->HasError()) {
-		ThrowQueryError("info.json", *info_result);
+	        MetadataQueryPath(info_path) +
+	        ")) SELECT CAST(record_index AS BIGINT), json_extract_string(info.json, '$.codebase_version'), "
+	        "json_extract_string(info.json, '$.data_path'), json_extract_string(info.json, '$.video_path'), "
+	        "CAST(json_extract_string(info.json, '$.fps') AS BIGINT), "
+	        "CAST(json_extract_string(info.json, '$.total_episodes') AS BIGINT), "
+	        "CAST(json_extract_string(info.json, '$.total_frames') AS BIGINT), "
+	        "CAST(json_extract_string(info.json, '$.total_tasks') AS BIGINT), "
+	        "features.key, json_extract_string(features.value, '$.dtype'), "
+	        "CAST(json_extract(features.value, '$.shape') AS BIGINT[]), "
+	        "CAST(json_extract(features.value, '$.info.is_depth_map') AS BOOLEAN), "
+	        "CAST(json_extract(features.value, '$.info.\"video.depth_min\"') AS DOUBLE), "
+	        "CAST(json_extract(features.value, '$.info.\"video.depth_max\"') AS DOUBLE), "
+	        "CAST(json_extract(features.value, '$.info.\"video.shift\"') AS DOUBLE), "
+	        "CAST(json_extract(features.value, '$.info.\"video.use_log\"') AS BOOLEAN), "
+	        "json_extract_string(features.value, '$.info.\"video.pix_fmt\"'), "
+	        "json_extract_string(features.value, '$.info.\"video.is_depth_map\"'), "
+	        "json_extract_string(features.value, '$.video_info.\"video.is_depth_map\"') "
+	        "FROM info LEFT JOIN LATERAL "
+	        "json_each(json_extract(info.json, '$.features')) features ON true ORDER BY record_index, features.id");
+	const auto &info_result = info_query.GetResult();
+	if (info_result.HasError()) {
+		ThrowQueryError("info.json", info_result);
 	}
 
 	LerobotDatasetInfo info;
 	vector<ParsedLerobotFeature> features;
-	unordered_set<string> video_keys_seen;
 	case_insensitive_set_t feature_names_seen;
 	vector<std::pair<string, LerobotVideoFeatureMetadata>> videos;
 	bool found_record = false;
 	while (true) {
-		auto chunk = info_result->Fetch();
+		auto chunk = info_query.Fetch();
 		if (!chunk) {
 			break;
 		}
@@ -314,12 +317,7 @@ LerobotDatasetInfo ParseLerobotInfo(Connection &connection, const string &info_p
 				feature.name = StringValue::Get(chunk->GetValue(8, row));
 				feature.dtype = StringValue::Get(chunk->GetValue(9, row));
 				feature.is_depth = !chunk->GetValue(11, row).IsNull() && BooleanValue::Get(chunk->GetValue(11, row));
-				if (feature.name.empty()) {
-					throw BinderException("LeRobot feature keys must not be empty");
-				}
-				if (feature.name.find('/') != string::npos) {
-					throw BinderException("LeRobot feature names must not contain '/': '%s'", feature.name);
-				}
+				ValidateLerobotFeatureName(feature.name);
 				if (!feature_names_seen.insert(feature.name).second) {
 					if (feature.dtype == "video") {
 						throw BinderException("Duplicate LeRobot video feature key '%s' in info.json", feature.name);
@@ -340,9 +338,6 @@ LerobotDatasetInfo ParseLerobotInfo(Connection &connection, const string &info_p
 				if (feature.dtype != "video") {
 					features.push_back(std::move(feature));
 					continue;
-				}
-				if (!video_keys_seen.insert(feature.name).second) {
-					throw BinderException("Duplicate LeRobot video feature key '%s' in info.json", feature.name);
 				}
 				if (!chunk->GetValue(17, row).IsNull() || !chunk->GetValue(18, row).IsNull()) {
 					throw BinderException(
@@ -447,15 +442,16 @@ LerobotDatasetInfo ParseLerobotInfo(Connection &connection, const string &info_p
 } // namespace
 
 LerobotDatasetInfo ReadLerobotDatasetInfo(ClientContext &context, const string &root) {
-	Connection connection(*context.db);
-	return ParseLerobotInfo(connection, root + LEROBOT_INFO_SUFFIX);
+	const auto info_path = ResolveLerobotRoot(context, root) + LEROBOT_INFO_SUFFIX;
+	return ParseLerobotInfo(context, info_path);
 }
 
 LerobotDatasetMetadata::LerobotDatasetMetadata(string root_p, LerobotDatasetInfo info_p,
                                                vector<LerobotEpisodeRoute> routes_p, vector<string> data_files_p,
-                                               FileFingerprint info_fingerprint_p)
+                                               FileFingerprint info_fingerprint_p, vector<MetadataFile> episode_files_p)
     : root(std::move(root_p)), info(std::move(info_p)), routes(std::move(routes_p)),
-      data_files(std::move(data_files_p)), info_fingerprint(std::move(info_fingerprint_p)) {
+      data_files(std::move(data_files_p)), info_fingerprint(std::move(info_fingerprint_p)),
+      episode_files(std::move(episode_files_p)) {
 	D_ASSERT(info.video_keys.size() == info.video_feature_metadata.size());
 }
 
@@ -491,24 +487,90 @@ optional_idx LerobotDatasetMetadata::GetEstimatedCacheMemory() const {
 	for (const auto &path : data_files) {
 		memory += path.capacity();
 	}
-	memory += info_fingerprint.version_tag.capacity();
+	memory += info_fingerprint.version_tag.capacity() + MetadataFilesMemory(episode_files);
 	return memory;
 }
 
-string LerobotDatasetMetadata::CacheKey(const string &root) {
-	return ObjectType() + ":" + root;
+string LerobotDatasetMetadata::CacheKey(ClientContext &context, const string &root) {
+	return ObjectType() + ":" + LerobotRootCacheKey(context, root);
 }
 
 LerobotDatasetMetadata::FileFingerprint LerobotDatasetMetadata::ReadInfoFingerprint(ClientContext &context,
                                                                                     const string &root) {
 	auto &file_system = FileSystem::GetFileSystem(context);
-	auto handle = file_system.OpenFile(root + LEROBOT_INFO_SUFFIX, FileFlags::FILE_FLAGS_READ);
-	return FileFingerprint(file_system.GetFileSize(*handle), file_system.GetLastModifiedTime(*handle),
-	                       file_system.GetVersionTag(*handle));
+	try {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		auto handle = file_system.OpenFile(root + LEROBOT_INFO_SUFFIX, FileFlags::FILE_FLAGS_READ);
+		const auto size = file_system.GetFileSize(*handle);
+		if (FileSystem::IsRemoteFile(root) && size > 0) {
+			// A public HEAD must not authorize reuse of the parsed manifest
+			// after GET access is revoked, including for zero-episode datasets.
+			char probe;
+			handle->Read(&probe, 1, 0);
+		}
+		auto fingerprint =
+		    FileFingerprint(size, file_system.GetLastModifiedTime(*handle), file_system.GetVersionTag(*handle));
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		return fingerprint;
+	} catch (...) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		throw;
+	}
 }
 
 bool LerobotDatasetMetadata::IsValid(ClientContext &context) const {
-	return info_fingerprint == ReadInfoFingerprint(context, root);
+	// A new manifest can commit an empty dataset and remove all episode files.
+	// Invalidate that generation before probing files belonging to the old one.
+	return info_fingerprint == ReadInfoFingerprint(context, root) && EpisodeFilesAreValid(context);
+}
+
+vector<LerobotDatasetMetadata::MetadataFile> LerobotDatasetMetadata::ReadEpisodeFiles(ClientContext &context,
+                                                                                      const string &root) {
+	vector<MetadataFile> result;
+	auto &fs = FileSystem::GetFileSystem(context);
+	try {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		auto files = fs.GlobFiles(root + LEROBOT_EPISODES_SUFFIX, FileGlobOptions::DISALLOW_EMPTY);
+		std::sort(files.begin(), files.end());
+		for (const auto &file : files) {
+			if (context.IsInterrupted()) {
+				throw InterruptException();
+			}
+			// A listing or HEAD response can be public even when GET is denied.
+			// Keep the listing's version information and perform a bounded read,
+			// including for Parquet files with zero rows. The host filesystem
+			// still owns caching, credentials, retries and ETag validation.
+			auto handle = fs.OpenFile(file, FileFlags::FILE_FLAGS_READ);
+			const auto size = fs.GetFileSize(*handle);
+			if (size > 0) {
+				char probe;
+				handle->Read(&probe, 1, 0);
+			}
+			result.emplace_back(file.path,
+			                    FileFingerprint(size, fs.GetLastModifiedTime(*handle), fs.GetVersionTag(*handle)));
+		}
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+	} catch (...) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		throw;
+	}
+	return result;
+}
+
+bool LerobotDatasetMetadata::EpisodeFilesAreValid(ClientContext &context) const {
+	return episode_files.empty() || episode_files == ReadEpisodeFiles(context, root);
 }
 
 shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Load(ClientContext &context, const string &root,
@@ -521,19 +583,26 @@ shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Load(ClientContext &c
 		                                               info_fingerprint);
 	}
 
-	Connection connection(*context.db);
+	// Revalidate remote metadata on reuse even when client credentials and the
+	// public manifest have not changed. This also detects a changed visible file
+	// set or independently replaced metadata, instead of retaining its routes.
+	vector<MetadataFile> episode_files;
+	if (FileSystem::IsRemoteFile(root)) {
+		episode_files = ReadEpisodeFiles(context, root);
+	}
 	const auto episodes_path = root + LEROBOT_EPISODES_SUFFIX;
-	auto episode_result = connection.Query(
-	    "SELECT CAST(episode_index AS BIGINT), CAST(length AS BIGINT), CAST(\"data/chunk_index\" AS BIGINT), "
-	    "CAST(\"data/file_index\" AS BIGINT) FROM read_parquet(" +
-	    MetadataQueryPath(episodes_path) + ")");
-	if (episode_result->HasError()) {
-		ThrowQueryError("episode metadata", *episode_result);
+	LerobotNestedQuery episode_query(
+	    context, "SELECT CAST(episode_index AS BIGINT), CAST(length AS BIGINT), CAST(\"data/chunk_index\" AS BIGINT), "
+	             "CAST(\"data/file_index\" AS BIGINT) FROM read_parquet(" +
+	                 MetadataQueryPath(episodes_path) + ")");
+	const auto &episode_result = episode_query.GetResult();
+	if (episode_result.HasError()) {
+		ThrowQueryError("episode metadata", episode_result);
 	}
 
 	unordered_map<string, idx_t> data_file_indexes;
 	while (true) {
-		auto chunk = episode_result->Fetch();
+		auto chunk = episode_query.Fetch();
 		if (!chunk) {
 			break;
 		}
@@ -594,44 +663,51 @@ shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Load(ClientContext &c
 	}
 
 	return make_shared_ptr<LerobotDatasetMetadata>(root, std::move(info), std::move(routes), std::move(data_files),
-	                                               info_fingerprint);
+	                                               info_fingerprint, std::move(episode_files));
 }
 
 shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Get(ClientContext &context, const string &root,
                                                                bool refresh) {
 	auto &cache = ObjectCache::GetObjectCache(context);
-	const auto cache_key = CacheKey(root);
-	if (refresh) {
-		Invalidate(context, root);
-	}
-	if (!refresh) {
-		auto cached = cache.Get<LerobotDatasetMetadata>(cache_key);
-		if (cached && cached->IsValid(context)) {
-			return cached;
-		}
-	}
 	// Treat info.json as the dataset commit marker. A changing marker retries
-	// once so routes and path templates cannot be cached across an update.
+	// once. Also recheck the access configuration after I/O: identical manifests
+	// on different endpoints must not let one store publish under another's key.
 	for (idx_t attempt = 0; attempt < 2; attempt++) {
-		auto before = ReadInfoFingerprint(context, root);
-		auto loaded = Load(context, root, before);
-		auto after = ReadInfoFingerprint(context, root);
-		if (before == after) {
+		const auto cache_key = CacheKey(context, root);
+		const auto resolved_root = ResolveLerobotRoot(context, root);
+		if (refresh) {
+			Invalidate(context, root);
+		}
+		if (!refresh) {
+			auto cached = cache.Get<LerobotDatasetMetadata>(cache_key);
+			if (cached && cached->root == resolved_root && cached->IsValid(context)) {
+				if (cache_key == CacheKey(context, root)) {
+					return cached;
+				}
+				continue;
+			}
+		}
+		auto before = ReadInfoFingerprint(context, resolved_root);
+		auto loaded = Load(context, resolved_root, before);
+		const auto files_valid = loaded->EpisodeFilesAreValid(context);
+		auto after = ReadInfoFingerprint(context, resolved_root);
+		if (before == after && files_valid && cache_key == CacheKey(context, root)) {
 			cache.Put(cache_key, loaded);
 			return loaded;
 		}
 	}
-	throw IOException("LeRobot info.json changed while metadata was being loaded for '%s'", root);
+	throw IOException("LeRobot info.json or access configuration changed while metadata was being loaded for '%s'",
+	                  root);
 }
 
 shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Peek(ClientContext &context, const string &root) {
 	auto &cache = ObjectCache::GetObjectCache(context);
-	return cache.Get<LerobotDatasetMetadata>(CacheKey(root));
+	return cache.Get<LerobotDatasetMetadata>(CacheKey(context, root));
 }
 
 void LerobotDatasetMetadata::Invalidate(ClientContext &context, const string &root) {
 	auto &cache = ObjectCache::GetObjectCache(context);
-	cache.Delete(CacheKey(root));
+	cache.Delete(CacheKey(context, root));
 	LerobotVideoMetadata::Invalidate(context, root);
 }
 
@@ -668,11 +744,12 @@ LerobotVideoMetadata::LerobotVideoMetadata(string root_p, string video_path_temp
                                            vector<string> video_keys_p,
                                            vector<LerobotVideoFeatureMetadata> video_feature_metadata_p,
                                            vector<LerobotVideoRoute> routes_p, vector<string> video_files_p,
-                                           LerobotDatasetMetadata::FileFingerprint info_fingerprint_p)
+                                           LerobotDatasetMetadata::FileFingerprint info_fingerprint_p,
+                                           vector<LerobotDatasetMetadata::MetadataFile> episode_files_p)
     : root(std::move(root_p)), video_path_template(std::move(video_path_template_p)), fps(fps_p),
       video_keys(std::move(video_keys_p)), video_feature_metadata(std::move(video_feature_metadata_p)),
       routes(std::move(routes_p)), video_files(std::move(video_files_p)),
-      info_fingerprint(std::move(info_fingerprint_p)) {
+      info_fingerprint(std::move(info_fingerprint_p)), episode_files(std::move(episode_files_p)) {
 	D_ASSERT(video_keys.size() == video_feature_metadata.size());
 }
 
@@ -696,16 +773,17 @@ optional_idx LerobotVideoMetadata::GetEstimatedCacheMemory() const {
 	for (const auto &video_file : video_files) {
 		memory += video_file.capacity();
 	}
-	memory += info_fingerprint.version_tag.capacity();
+	memory += info_fingerprint.version_tag.capacity() + MetadataFilesMemory(episode_files);
 	return memory;
 }
 
-string LerobotVideoMetadata::CacheKey(const string &root) {
-	return ObjectType() + ":" + root;
+string LerobotVideoMetadata::CacheKey(ClientContext &context, const string &root) {
+	return ObjectType() + ":" + LerobotRootCacheKey(context, root);
 }
 
 bool LerobotVideoMetadata::IsValid(const LerobotDatasetMetadata &dataset) const {
-	return info_fingerprint == dataset.GetInfoFingerprint();
+	return root == dataset.GetRoot() && info_fingerprint == dataset.GetInfoFingerprint() &&
+	       episode_files == dataset.GetEpisodeFiles();
 }
 
 shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Load(ClientContext &context,
@@ -717,7 +795,7 @@ shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Load(ClientContext &conte
 	if (dataset.GetEpisodeCount() == 0 || video_keys.empty()) {
 		return make_shared_ptr<LerobotVideoMetadata>(
 		    dataset.GetRoot(), dataset.GetVideoPathTemplate(), dataset.GetFPS(), video_keys, video_feature_metadata,
-		    std::move(routes), std::move(video_files), dataset.GetInfoFingerprint());
+		    std::move(routes), std::move(video_files), dataset.GetInfoFingerprint(), dataset.GetEpisodeFiles());
 	}
 
 	string query = "SELECT CAST(episode_index AS BIGINT), CAST(length AS BIGINT)";
@@ -730,16 +808,16 @@ shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Load(ClientContext &conte
 	}
 	query += " FROM read_parquet(" + MetadataQueryPath(dataset.GetRoot() + LEROBOT_EPISODES_SUFFIX) + ")";
 
-	Connection connection(*context.db);
-	auto episode_result = connection.Query(query);
-	if (episode_result->HasError()) {
-		ThrowQueryError("episode video metadata", *episode_result);
+	LerobotNestedQuery episode_query(context, query);
+	const auto &episode_result = episode_query.GetResult();
+	if (episode_result.HasError()) {
+		ThrowQueryError("episode video metadata", episode_result);
 	}
 
 	unordered_map<string, idx_t> video_file_indexes;
 	vector<idx_t> video_file_key_indices;
 	while (true) {
-		auto chunk = episode_result->Fetch();
+		auto chunk = episode_query.Fetch();
 		if (!chunk) {
 			break;
 		}
@@ -824,42 +902,44 @@ shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Load(ClientContext &conte
 		}
 	}
 
-	return make_shared_ptr<LerobotVideoMetadata>(dataset.GetRoot(), dataset.GetVideoPathTemplate(), dataset.GetFPS(),
-	                                             video_keys, video_feature_metadata, std::move(routes),
-	                                             std::move(video_files), dataset.GetInfoFingerprint());
+	return make_shared_ptr<LerobotVideoMetadata>(
+	    dataset.GetRoot(), dataset.GetVideoPathTemplate(), dataset.GetFPS(), video_keys, video_feature_metadata,
+	    std::move(routes), std::move(video_files), dataset.GetInfoFingerprint(), dataset.GetEpisodeFiles());
 }
 
 shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Get(ClientContext &context, const string &root, bool refresh) {
 	auto &cache = ObjectCache::GetObjectCache(context);
-	const auto cache_key = CacheKey(root);
-	auto dataset = LerobotDatasetMetadata::Get(context, root, refresh);
-	if (!refresh) {
-		auto cached = cache.Get<LerobotVideoMetadata>(cache_key);
-		if (cached && cached->IsValid(*dataset)) {
-			return cached;
-		}
-	}
-
 	for (idx_t attempt = 0; attempt < 2; attempt++) {
+		const auto cache_key = CacheKey(context, root);
+		auto dataset = LerobotDatasetMetadata::Get(context, root, refresh && attempt == 0);
+		if (cache_key != CacheKey(context, root)) {
+			continue;
+		}
+		if (!refresh) {
+			auto cached = cache.Get<LerobotVideoMetadata>(cache_key);
+			if (cached && cached->IsValid(*dataset)) {
+				return cached;
+			}
+		}
 		auto loaded = Load(context, *dataset);
 		auto current = LerobotDatasetMetadata::Get(context, root, false);
-		if (loaded->IsValid(*current)) {
+		if (loaded->IsValid(*current) && cache_key == CacheKey(context, root)) {
 			cache.Put(cache_key, loaded);
 			return loaded;
 		}
-		dataset = std::move(current);
 	}
-	throw IOException("LeRobot info.json changed while video metadata was being loaded for '%s'", root);
+	throw IOException(
+	    "LeRobot info.json or access configuration changed while video metadata was being loaded for '%s'", root);
 }
 
 shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Peek(ClientContext &context, const string &root) {
 	auto &cache = ObjectCache::GetObjectCache(context);
-	return cache.Get<LerobotVideoMetadata>(CacheKey(root));
+	return cache.Get<LerobotVideoMetadata>(CacheKey(context, root));
 }
 
 void LerobotVideoMetadata::Invalidate(ClientContext &context, const string &root) {
 	auto &cache = ObjectCache::GetObjectCache(context);
-	cache.Delete(CacheKey(root));
+	cache.Delete(CacheKey(context, root));
 }
 
 vector<LerobotVideoRoute> LerobotVideoMetadata::ResolveRoutes(const vector<int64_t> &episode_indices,

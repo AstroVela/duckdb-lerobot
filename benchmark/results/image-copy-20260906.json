@@ -1,0 +1,778 @@
+{
+  "date": "2026-09-06",
+  "scope": "Local synthetic RGB image COPY; compare the previous fix batch with per-feature PNG reuse, all earlier review fixes present in both binaries. All working fixes remain uncommitted.",
+  "base_commit": "fab70ad4effa1e5e5dda43e58a99cc17d70bb5d4",
+  "duckdb_commit": "d8cdaa33fda8df955cc76ef58a280f68f4cd43fa",
+  "cpu": "Intel(R) Xeon(R) CPU E5-2686 v4 @ 2.30GHz",
+  "source_sha256": {
+    "before": {
+      "src/function/copy/lerobot_copy.cpp": "8b073c94adf560c0576c165f56330d1f70031a5d86274340a2b5f7f55decdb90",
+      "src/function/copy/lerobot_video_writer.cpp": "52ca8000a9649c585b632b3f45cbca870be9cf37316eb907982d330201233514",
+      "src/include/function/lerobot_video_writer.hpp": "05dd1f88a546eaa8cfc3a412c45d0a837c5670f2bfc4ea0a202bcb1f27533dcb"
+    },
+    "after": {
+      "src/function/copy/lerobot_copy.cpp": "1255bd0447d6b1e1e90f2fa525aa02c09d4ba44664ad51649c45ac1250423aa1",
+      "src/function/copy/lerobot_video_writer.cpp": "4507e970f68bbbe491f91a79afad8851cf0e6f9b0c24ea74b410eda9ff59be8f",
+      "src/include/function/lerobot_video_writer.hpp": "37a35825765b966f1afa2c0613aac048b4e10680ad62660a6b5514d8c2fa4d1b"
+    }
+  },
+  "benchmark_sha256": {
+    "benchmark/lerobot_copy_image.py": "8aba01633033a7a9e82c98ba69f163f8f74488f8d4515e859a108fd3dae6f6a5",
+    "test/conformance/test_image_copy.py": "eca711df3389214c47093730748447cdceda966e041f4f6f09c82ccca27593f8"
+  },
+  "before": {
+    "extension_sha256": "81bb1ed3fe2776356cc6bb92226afe54c3facad13156c07b61d09963f0143d83",
+    "duckdb_sha256": "47214dd84600ae3e149645c4bed5902e2b673b040e6ce73b51a4d5ca58f71813",
+    "platform": "Linux-6.17.0-29-generic-x86_64-with-glibc2.39",
+    "dependencies": {
+      "numpy": "2.2.6",
+      "pillow": "12.3.0",
+      "pyarrow": "25.0.1"
+    },
+    "parameters": {
+      "duckdb": "/home/kaka/duckdb-lerobot-worktrees/review-assessment-20260905/build/mixed-video-cli",
+      "extension": "/home/kaka/duckdb-lerobot-worktrees/review-assessment-20260905/build/before-png-fix/lerobot.duckdb_extension",
+      "cases": [
+        "tiny",
+        "small",
+        "vga",
+        "vga-noise",
+        "mixed"
+      ],
+      "episodes": 2,
+      "repeats": 3,
+      "threads": 1,
+      "memory_limit": "512MB",
+      "output": "build/png-before.json"
+    },
+    "scope": "synthetic local data, fresh process per repeat, OS cache not flushed",
+    "timing_scope": "COPY latency excludes input materialization and Pillow validation; process time includes input load and shutdown",
+    "memory_scope": "GNU time DuckDB process peak includes input load and shutdown, excludes Python; buffer/temp peaks are cumulative",
+    "scenarios": [
+      {
+        "case": "tiny",
+        "shapes_hw": [
+          [
+            16,
+            16
+          ]
+        ],
+        "frames_per_episode": 2048,
+        "noise": false,
+        "median_copy_seconds": 0.391780508,
+        "runs": [
+          {
+            "copy_seconds": 0.391780508,
+            "process_seconds": 0.517921644001035,
+            "peak_process_rss_bytes": 79851520,
+            "peak_connection_buffer_bytes": 36301077,
+            "peak_temp_bytes": 0,
+            "validated_frames": 4096,
+            "validated_images": 4096,
+            "png_sha256": "c6700e76434a195a79db6659a242e4a32d3ecb4ba94047ba3c124d5ddab59986",
+            "statistics_sha256": "7b206da86e14446e85f95a2faf88cd8ec1bace2b4e1a935cf8a2f2bff4d9f118"
+          },
+          {
+            "copy_seconds": 0.399167978,
+            "process_seconds": 0.5121446309785824,
+            "peak_process_rss_bytes": 80056320,
+            "peak_connection_buffer_bytes": 36301077,
+            "peak_temp_bytes": 0,
+            "validated_frames": 4096,
+            "validated_images": 4096,
+            "png_sha256": "c6700e76434a195a79db6659a242e4a32d3ecb4ba94047ba3c124d5ddab59986",
+            "statistics_sha256": "7b206da86e14446e85f95a2faf88cd8ec1bace2b4e1a935cf8a2f2bff4d9f118"
+          },
+          {
+            "copy_seconds": 0.382852092,
+            "process_seconds": 0.49312685799668543,
+            "peak_process_rss_bytes": 80171008,
+            "peak_connection_buffer_bytes": 36301077,
+            "peak_temp_bytes": 0,
+            "validated_frames": 4096,
+            "validated_images": 4096,
+            "png_sha256": "c6700e76434a195a79db6659a242e4a32d3ecb4ba94047ba3c124d5ddab59986",
+            "statistics_sha256": "7b206da86e14446e85f95a2faf88cd8ec1bace2b4e1a935cf8a2f2bff4d9f118"
+          }
+        ]
+      },
+      {
+        "case": "small",
+        "shapes_hw": [
+          [
+            120,
+            160
+          ]
+        ],
+        "frames_per_episode": 256,
+        "noise": false,
+        "median_copy_seconds": 1.800643963,
+        "runs": [
+          {
+            "copy_seconds": 1.800643963,
+            "process_seconds": 1.927190463989973,
+            "peak_process_rss_bytes": 127574016,
+            "peak_connection_buffer_bytes": 144537701,
+            "peak_temp_bytes": 0,
+            "validated_frames": 512,
+            "validated_images": 512,
+            "png_sha256": "7433633ae560762513c0971d93ab4521163a8c97779367596f1388e34fa04b4a",
+            "statistics_sha256": "6def734710fcd992a7effdda1277ecc6f7d06ba402d00844d1be2c02125ffee3"
+          },
+          {
+            "copy_seconds": 1.826558874,
+            "process_seconds": 1.9450248969951645,
+            "peak_process_rss_bytes": 127770624,
+            "peak_connection_buffer_bytes": 144537701,
+            "peak_temp_bytes": 0,
+            "validated_frames": 512,
+            "validated_images": 512,
+            "png_sha256": "7433633ae560762513c0971d93ab4521163a8c97779367596f1388e34fa04b4a",
+            "statistics_sha256": "6def734710fcd992a7effdda1277ecc6f7d06ba402d00844d1be2c02125ffee3"
+          },
+          {
+            "copy_seconds": 1.769763806,
+            "process_seconds": 1.89275425899541,
+            "peak_process_rss_bytes": 128212992,
+            "peak_connection_buffer_bytes": 144537701,
+            "peak_temp_bytes": 0,
+            "validated_frames": 512,
+            "validated_images": 512,
+            "png_sha256": "7433633ae560762513c0971d93ab4521163a8c97779367596f1388e34fa04b4a",
+            "statistics_sha256": "6def734710fcd992a7effdda1277ecc6f7d06ba402d00844d1be2c02125ffee3"
+          }
+        ]
+      },
+      {
+        "case": "vga",
+        "shapes_hw": [
+          [
+            480,
+            640
+          ]
+        ],
+        "frames_per_episode": 64,
+        "noise": false,
+        "median_copy_seconds": 1.732881514,
+        "runs": [
+          {
+            "copy_seconds": 1.622916782,
+            "process_seconds": 1.8665507110126782,
+            "peak_process_rss_bytes": 313053184,
+            "peak_connection_buffer_bytes": 483476317,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "913dbe206b23064fa32560861a1c7452fe5bd510586ce0b7da57ae04d6519ffd",
+            "statistics_sha256": "d95284aaeb34c1b436ceefca441d45d62e76cd21e56326faf9834b4b3a08ea46"
+          },
+          {
+            "copy_seconds": 1.794389031,
+            "process_seconds": 2.0650557200133335,
+            "peak_process_rss_bytes": 312741888,
+            "peak_connection_buffer_bytes": 483476317,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "913dbe206b23064fa32560861a1c7452fe5bd510586ce0b7da57ae04d6519ffd",
+            "statistics_sha256": "d95284aaeb34c1b436ceefca441d45d62e76cd21e56326faf9834b4b3a08ea46"
+          },
+          {
+            "copy_seconds": 1.732881514,
+            "process_seconds": 2.0110820349946152,
+            "peak_process_rss_bytes": 312766464,
+            "peak_connection_buffer_bytes": 483476317,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "913dbe206b23064fa32560861a1c7452fe5bd510586ce0b7da57ae04d6519ffd",
+            "statistics_sha256": "d95284aaeb34c1b436ceefca441d45d62e76cd21e56326faf9834b4b3a08ea46"
+          }
+        ]
+      },
+      {
+        "case": "vga-noise",
+        "shapes_hw": [
+          [
+            480,
+            640
+          ]
+        ],
+        "frames_per_episode": 64,
+        "noise": true,
+        "median_copy_seconds": 5.405458721,
+        "runs": [
+          {
+            "copy_seconds": 5.679329191,
+            "process_seconds": 5.982405615010066,
+            "peak_process_rss_bytes": 569499648,
+            "peak_connection_buffer_bytes": 542458741,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "525f020da978829817dcc9d177043e90eaff6c62abbbac782754f452ad048a2e",
+            "statistics_sha256": "8d205ee847e59855bb1df1fbabe17cbc4837a05ac09c19cff1ce502a3ffe7b03"
+          },
+          {
+            "copy_seconds": 5.405458721,
+            "process_seconds": 5.7114786689926405,
+            "peak_process_rss_bytes": 570126336,
+            "peak_connection_buffer_bytes": 542458741,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "525f020da978829817dcc9d177043e90eaff6c62abbbac782754f452ad048a2e",
+            "statistics_sha256": "8d205ee847e59855bb1df1fbabe17cbc4837a05ac09c19cff1ce502a3ffe7b03"
+          },
+          {
+            "copy_seconds": 5.193892382,
+            "process_seconds": 5.495920009008842,
+            "peak_process_rss_bytes": 622604288,
+            "peak_connection_buffer_bytes": 542458741,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "525f020da978829817dcc9d177043e90eaff6c62abbbac782754f452ad048a2e",
+            "statistics_sha256": "8d205ee847e59855bb1df1fbabe17cbc4837a05ac09c19cff1ce502a3ffe7b03"
+          }
+        ]
+      },
+      {
+        "case": "mixed",
+        "shapes_hw": [
+          [
+            48,
+            64
+          ],
+          [
+            120,
+            160
+          ]
+        ],
+        "frames_per_episode": 256,
+        "noise": false,
+        "median_copy_seconds": 2.110819232,
+        "runs": [
+          {
+            "copy_seconds": 2.099099792,
+            "process_seconds": 2.219462586013833,
+            "peak_process_rss_bytes": 140267520,
+            "peak_connection_buffer_bytes": 179666626,
+            "peak_temp_bytes": 0,
+            "validated_frames": 512,
+            "validated_images": 1024,
+            "png_sha256": "f8c81cc594209f9427d3f7411a4edc807686e5143151052595986e3f4dfd49b2",
+            "statistics_sha256": "b756e67ba2274f7590d2eb94309b2f9d456af76b432a7c080319a312a3f82c43"
+          },
+          {
+            "copy_seconds": 2.110819232,
+            "process_seconds": 2.243255063018296,
+            "peak_process_rss_bytes": 140193792,
+            "peak_connection_buffer_bytes": 179666626,
+            "peak_temp_bytes": 0,
+            "validated_frames": 512,
+            "validated_images": 1024,
+            "png_sha256": "f8c81cc594209f9427d3f7411a4edc807686e5143151052595986e3f4dfd49b2",
+            "statistics_sha256": "b756e67ba2274f7590d2eb94309b2f9d456af76b432a7c080319a312a3f82c43"
+          },
+          {
+            "copy_seconds": 2.129645576,
+            "process_seconds": 2.246346279978752,
+            "peak_process_rss_bytes": 140435456,
+            "peak_connection_buffer_bytes": 179666626,
+            "peak_temp_bytes": 0,
+            "validated_frames": 512,
+            "validated_images": 1024,
+            "png_sha256": "f8c81cc594209f9427d3f7411a4edc807686e5143151052595986e3f4dfd49b2",
+            "statistics_sha256": "b756e67ba2274f7590d2eb94309b2f9d456af76b432a7c080319a312a3f82c43"
+          }
+        ]
+      }
+    ]
+  },
+  "after": {
+    "extension_sha256": "5302287f965aead6d262960ef54e0f5721ae067388d73ab37383b90b8ce4c8fe",
+    "duckdb_sha256": "47214dd84600ae3e149645c4bed5902e2b673b040e6ce73b51a4d5ca58f71813",
+    "platform": "Linux-6.17.0-29-generic-x86_64-with-glibc2.39",
+    "dependencies": {
+      "numpy": "2.2.6",
+      "pillow": "12.3.0",
+      "pyarrow": "25.0.1"
+    },
+    "parameters": {
+      "duckdb": "/home/kaka/duckdb-lerobot-worktrees/review-assessment-20260905/build/mixed-video-cli",
+      "extension": "/home/kaka/duckdb-lerobot-worktrees/review-assessment-20260905/build/audit/extension/lerobot/lerobot.duckdb_extension",
+      "cases": [
+        "tiny",
+        "small",
+        "vga",
+        "vga-noise",
+        "mixed"
+      ],
+      "episodes": 2,
+      "repeats": 3,
+      "threads": 1,
+      "memory_limit": "512MB",
+      "output": "build/png-after.json"
+    },
+    "scope": "synthetic local data, fresh process per repeat, OS cache not flushed",
+    "timing_scope": "COPY latency excludes input materialization and Pillow validation; process time includes input load and shutdown",
+    "memory_scope": "GNU time DuckDB process peak includes input load and shutdown, excludes Python; buffer/temp peaks are cumulative",
+    "scenarios": [
+      {
+        "case": "tiny",
+        "shapes_hw": [
+          [
+            16,
+            16
+          ]
+        ],
+        "frames_per_episode": 2048,
+        "noise": false,
+        "median_copy_seconds": 0.340225304,
+        "runs": [
+          {
+            "copy_seconds": 0.340225304,
+            "process_seconds": 0.4408348900033161,
+            "peak_process_rss_bytes": 80064512,
+            "peak_connection_buffer_bytes": 36301077,
+            "peak_temp_bytes": 0,
+            "validated_frames": 4096,
+            "validated_images": 4096,
+            "png_sha256": "c6700e76434a195a79db6659a242e4a32d3ecb4ba94047ba3c124d5ddab59986",
+            "statistics_sha256": "7b206da86e14446e85f95a2faf88cd8ec1bace2b4e1a935cf8a2f2bff4d9f118"
+          },
+          {
+            "copy_seconds": 0.340164837,
+            "process_seconds": 0.4508312450197991,
+            "peak_process_rss_bytes": 80461824,
+            "peak_connection_buffer_bytes": 36301077,
+            "peak_temp_bytes": 0,
+            "validated_frames": 4096,
+            "validated_images": 4096,
+            "png_sha256": "c6700e76434a195a79db6659a242e4a32d3ecb4ba94047ba3c124d5ddab59986",
+            "statistics_sha256": "7b206da86e14446e85f95a2faf88cd8ec1bace2b4e1a935cf8a2f2bff4d9f118"
+          },
+          {
+            "copy_seconds": 0.359240855,
+            "process_seconds": 0.47174438601359725,
+            "peak_process_rss_bytes": 80556032,
+            "peak_connection_buffer_bytes": 36301077,
+            "peak_temp_bytes": 0,
+            "validated_frames": 4096,
+            "validated_images": 4096,
+            "png_sha256": "c6700e76434a195a79db6659a242e4a32d3ecb4ba94047ba3c124d5ddab59986",
+            "statistics_sha256": "7b206da86e14446e85f95a2faf88cd8ec1bace2b4e1a935cf8a2f2bff4d9f118"
+          }
+        ]
+      },
+      {
+        "case": "small",
+        "shapes_hw": [
+          [
+            120,
+            160
+          ]
+        ],
+        "frames_per_episode": 256,
+        "noise": false,
+        "median_copy_seconds": 1.764556828,
+        "runs": [
+          {
+            "copy_seconds": 1.769696799,
+            "process_seconds": 1.8893659529858269,
+            "peak_process_rss_bytes": 128913408,
+            "peak_connection_buffer_bytes": 144537701,
+            "peak_temp_bytes": 0,
+            "validated_frames": 512,
+            "validated_images": 512,
+            "png_sha256": "7433633ae560762513c0971d93ab4521163a8c97779367596f1388e34fa04b4a",
+            "statistics_sha256": "6def734710fcd992a7effdda1277ecc6f7d06ba402d00844d1be2c02125ffee3"
+          },
+          {
+            "copy_seconds": 1.764556828,
+            "process_seconds": 1.8806996629864443,
+            "peak_process_rss_bytes": 127934464,
+            "peak_connection_buffer_bytes": 144537701,
+            "peak_temp_bytes": 0,
+            "validated_frames": 512,
+            "validated_images": 512,
+            "png_sha256": "7433633ae560762513c0971d93ab4521163a8c97779367596f1388e34fa04b4a",
+            "statistics_sha256": "6def734710fcd992a7effdda1277ecc6f7d06ba402d00844d1be2c02125ffee3"
+          },
+          {
+            "copy_seconds": 1.754792028,
+            "process_seconds": 1.877390211011516,
+            "peak_process_rss_bytes": 129105920,
+            "peak_connection_buffer_bytes": 144537701,
+            "peak_temp_bytes": 0,
+            "validated_frames": 512,
+            "validated_images": 512,
+            "png_sha256": "7433633ae560762513c0971d93ab4521163a8c97779367596f1388e34fa04b4a",
+            "statistics_sha256": "6def734710fcd992a7effdda1277ecc6f7d06ba402d00844d1be2c02125ffee3"
+          }
+        ]
+      },
+      {
+        "case": "vga",
+        "shapes_hw": [
+          [
+            480,
+            640
+          ]
+        ],
+        "frames_per_episode": 64,
+        "noise": false,
+        "median_copy_seconds": 1.635309051,
+        "runs": [
+          {
+            "copy_seconds": 1.616703692,
+            "process_seconds": 1.9075722330017015,
+            "peak_process_rss_bytes": 314355712,
+            "peak_connection_buffer_bytes": 483435229,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "913dbe206b23064fa32560861a1c7452fe5bd510586ce0b7da57ae04d6519ffd",
+            "statistics_sha256": "d95284aaeb34c1b436ceefca441d45d62e76cd21e56326faf9834b4b3a08ea46"
+          },
+          {
+            "copy_seconds": 1.653915435,
+            "process_seconds": 1.9331121089926455,
+            "peak_process_rss_bytes": 313765888,
+            "peak_connection_buffer_bytes": 483476317,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "913dbe206b23064fa32560861a1c7452fe5bd510586ce0b7da57ae04d6519ffd",
+            "statistics_sha256": "d95284aaeb34c1b436ceefca441d45d62e76cd21e56326faf9834b4b3a08ea46"
+          },
+          {
+            "copy_seconds": 1.635309051,
+            "process_seconds": 1.893723637011135,
+            "peak_process_rss_bytes": 313565184,
+            "peak_connection_buffer_bytes": 483447645,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "913dbe206b23064fa32560861a1c7452fe5bd510586ce0b7da57ae04d6519ffd",
+            "statistics_sha256": "d95284aaeb34c1b436ceefca441d45d62e76cd21e56326faf9834b4b3a08ea46"
+          }
+        ]
+      },
+      {
+        "case": "vga-noise",
+        "shapes_hw": [
+          [
+            480,
+            640
+          ]
+        ],
+        "frames_per_episode": 64,
+        "noise": true,
+        "median_copy_seconds": 5.539475384,
+        "runs": [
+          {
+            "copy_seconds": 5.468367504,
+            "process_seconds": 5.769921781000448,
+            "peak_process_rss_bytes": 571940864,
+            "peak_connection_buffer_bytes": 542458741,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "525f020da978829817dcc9d177043e90eaff6c62abbbac782754f452ad048a2e",
+            "statistics_sha256": "8d205ee847e59855bb1df1fbabe17cbc4837a05ac09c19cff1ce502a3ffe7b03"
+          },
+          {
+            "copy_seconds": 5.648467694,
+            "process_seconds": 5.961730247014202,
+            "peak_process_rss_bytes": 571760640,
+            "peak_connection_buffer_bytes": 542430069,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "525f020da978829817dcc9d177043e90eaff6c62abbbac782754f452ad048a2e",
+            "statistics_sha256": "8d205ee847e59855bb1df1fbabe17cbc4837a05ac09c19cff1ce502a3ffe7b03"
+          },
+          {
+            "copy_seconds": 5.539475384,
+            "process_seconds": 5.855004298005952,
+            "peak_process_rss_bytes": 571924480,
+            "peak_connection_buffer_bytes": 542458741,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "525f020da978829817dcc9d177043e90eaff6c62abbbac782754f452ad048a2e",
+            "statistics_sha256": "8d205ee847e59855bb1df1fbabe17cbc4837a05ac09c19cff1ce502a3ffe7b03"
+          }
+        ]
+      },
+      {
+        "case": "mixed",
+        "shapes_hw": [
+          [
+            48,
+            64
+          ],
+          [
+            120,
+            160
+          ]
+        ],
+        "frames_per_episode": 256,
+        "noise": false,
+        "median_copy_seconds": 2.05702046,
+        "runs": [
+          {
+            "copy_seconds": 2.056736368,
+            "process_seconds": 2.1872226349951234,
+            "peak_process_rss_bytes": 141529088,
+            "peak_connection_buffer_bytes": 179666626,
+            "peak_temp_bytes": 0,
+            "validated_frames": 512,
+            "validated_images": 1024,
+            "png_sha256": "f8c81cc594209f9427d3f7411a4edc807686e5143151052595986e3f4dfd49b2",
+            "statistics_sha256": "b756e67ba2274f7590d2eb94309b2f9d456af76b432a7c080319a312a3f82c43"
+          },
+          {
+            "copy_seconds": 2.05702046,
+            "process_seconds": 2.1746224780217744,
+            "peak_process_rss_bytes": 140230656,
+            "peak_connection_buffer_bytes": 179666914,
+            "peak_temp_bytes": 0,
+            "validated_frames": 512,
+            "validated_images": 1024,
+            "png_sha256": "f8c81cc594209f9427d3f7411a4edc807686e5143151052595986e3f4dfd49b2",
+            "statistics_sha256": "b756e67ba2274f7590d2eb94309b2f9d456af76b432a7c080319a312a3f82c43"
+          },
+          {
+            "copy_seconds": 2.057896293,
+            "process_seconds": 2.1865033580106683,
+            "peak_process_rss_bytes": 141234176,
+            "peak_connection_buffer_bytes": 179666626,
+            "peak_temp_bytes": 0,
+            "validated_frames": 512,
+            "validated_images": 1024,
+            "png_sha256": "f8c81cc594209f9427d3f7411a4edc807686e5143151052595986e3f4dfd49b2",
+            "statistics_sha256": "b756e67ba2274f7590d2eb94309b2f9d456af76b432a7c080319a312a3f82c43"
+          }
+        ]
+      }
+    ]
+  },
+  "comparison": [
+    {
+      "case": "tiny",
+      "before_seconds": 0.391780508,
+      "after_seconds": 0.340225304,
+      "speedup": 1.151532538567443,
+      "before_rss_bytes": 80056320,
+      "after_rss_bytes": 80461824
+    },
+    {
+      "case": "small",
+      "before_seconds": 1.800643963,
+      "after_seconds": 1.764556828,
+      "speedup": 1.0204511038847655,
+      "before_rss_bytes": 127770624,
+      "after_rss_bytes": 128913408
+    },
+    {
+      "case": "vga",
+      "before_seconds": 1.732881514,
+      "after_seconds": 1.635309051,
+      "speedup": 1.0596660691997846,
+      "before_rss_bytes": 312766464,
+      "after_rss_bytes": 313765888
+    },
+    {
+      "case": "vga-noise",
+      "before_seconds": 5.405458721,
+      "after_seconds": 5.539475384,
+      "speedup": 0.975806975623163,
+      "before_rss_bytes": 570126336,
+      "after_rss_bytes": 571924480
+    },
+    {
+      "case": "mixed",
+      "before_seconds": 2.110819232,
+      "after_seconds": 2.05702046,
+      "speedup": 1.026153736944357,
+      "before_rss_bytes": 140267520,
+      "after_rss_bytes": 141234176
+    }
+  ],
+  "paired_noise_followup": {
+    "extension_sha256": "5302287f965aead6d262960ef54e0f5721ae067388d73ab37383b90b8ce4c8fe",
+    "baseline_extension_sha256": "81bb1ed3fe2776356cc6bb92226afe54c3facad13156c07b61d09963f0143d83",
+    "duckdb_sha256": "47214dd84600ae3e149645c4bed5902e2b673b040e6ce73b51a4d5ca58f71813",
+    "platform": "Linux-6.17.0-29-generic-x86_64-with-glibc2.39",
+    "dependencies": {
+      "numpy": "2.2.6",
+      "pillow": "12.3.0",
+      "pyarrow": "25.0.1"
+    },
+    "parameters": {
+      "duckdb": "/home/kaka/duckdb-lerobot-worktrees/review-assessment-20260905/build/mixed-video-cli",
+      "extension": "/home/kaka/duckdb-lerobot-worktrees/review-assessment-20260905/build/audit/extension/lerobot/lerobot.duckdb_extension",
+      "baseline_extension": "/home/kaka/duckdb-lerobot-worktrees/review-assessment-20260905/build/before-png-fix/lerobot.duckdb_extension",
+      "cases": [
+        "vga-noise"
+      ],
+      "episodes": 2,
+      "repeats": 4,
+      "threads": 1,
+      "memory_limit": "512MB",
+      "output": "build/png-noise-paired.json"
+    },
+    "scope": "synthetic local data, fresh process per repeat, OS cache not flushed",
+    "timing_scope": "COPY latency excludes input materialization and Pillow validation; process time includes input load and shutdown",
+    "memory_scope": "GNU time DuckDB process peak includes input load and shutdown, excludes Python; buffer/temp peaks are cumulative",
+    "scenarios": [
+      {
+        "case": "vga-noise",
+        "shapes_hw": [
+          [
+            480,
+            640
+          ]
+        ],
+        "frames_per_episode": 64,
+        "noise": true,
+        "median_copy_seconds": 5.3242747989999994,
+        "runs": [
+          {
+            "copy_seconds": 5.395099999,
+            "process_seconds": 5.687659507995704,
+            "peak_process_rss_bytes": 572174336,
+            "peak_connection_buffer_bytes": 542458741,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "525f020da978829817dcc9d177043e90eaff6c62abbbac782754f452ad048a2e",
+            "statistics_sha256": "8d205ee847e59855bb1df1fbabe17cbc4837a05ac09c19cff1ce502a3ffe7b03"
+          },
+          {
+            "copy_seconds": 5.408923145,
+            "process_seconds": 5.697054662974551,
+            "peak_process_rss_bytes": 625516544,
+            "peak_connection_buffer_bytes": 542458741,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "525f020da978829817dcc9d177043e90eaff6c62abbbac782754f452ad048a2e",
+            "statistics_sha256": "8d205ee847e59855bb1df1fbabe17cbc4837a05ac09c19cff1ce502a3ffe7b03"
+          },
+          {
+            "copy_seconds": 5.253449599,
+            "process_seconds": 5.550278187991353,
+            "peak_process_rss_bytes": 572583936,
+            "peak_connection_buffer_bytes": 542458741,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "525f020da978829817dcc9d177043e90eaff6c62abbbac782754f452ad048a2e",
+            "statistics_sha256": "8d205ee847e59855bb1df1fbabe17cbc4837a05ac09c19cff1ce502a3ffe7b03"
+          },
+          {
+            "copy_seconds": 4.948628511,
+            "process_seconds": 5.255449353018776,
+            "peak_process_rss_bytes": 572030976,
+            "peak_connection_buffer_bytes": 542458741,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "525f020da978829817dcc9d177043e90eaff6c62abbbac782754f452ad048a2e",
+            "statistics_sha256": "8d205ee847e59855bb1df1fbabe17cbc4837a05ac09c19cff1ce502a3ffe7b03"
+          }
+        ],
+        "baseline_runs": [
+          {
+            "copy_seconds": 5.656634474,
+            "process_seconds": 5.9536756919987965,
+            "peak_process_rss_bytes": 571101184,
+            "peak_connection_buffer_bytes": 542458741,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "525f020da978829817dcc9d177043e90eaff6c62abbbac782754f452ad048a2e",
+            "statistics_sha256": "8d205ee847e59855bb1df1fbabe17cbc4837a05ac09c19cff1ce502a3ffe7b03"
+          },
+          {
+            "copy_seconds": 5.667263451,
+            "process_seconds": 5.9476655070029665,
+            "peak_process_rss_bytes": 569683968,
+            "peak_connection_buffer_bytes": 542458741,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "525f020da978829817dcc9d177043e90eaff6c62abbbac782754f452ad048a2e",
+            "statistics_sha256": "8d205ee847e59855bb1df1fbabe17cbc4837a05ac09c19cff1ce502a3ffe7b03"
+          },
+          {
+            "copy_seconds": 5.66054391,
+            "process_seconds": 5.951854895014549,
+            "peak_process_rss_bytes": 570875904,
+            "peak_connection_buffer_bytes": 542458741,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "525f020da978829817dcc9d177043e90eaff6c62abbbac782754f452ad048a2e",
+            "statistics_sha256": "8d205ee847e59855bb1df1fbabe17cbc4837a05ac09c19cff1ce502a3ffe7b03"
+          },
+          {
+            "copy_seconds": 5.251135497,
+            "process_seconds": 5.536835000006249,
+            "peak_process_rss_bytes": 570724352,
+            "peak_connection_buffer_bytes": 542458741,
+            "peak_temp_bytes": 0,
+            "validated_frames": 128,
+            "validated_images": 128,
+            "png_sha256": "525f020da978829817dcc9d177043e90eaff6c62abbbac782754f452ad048a2e",
+            "statistics_sha256": "8d205ee847e59855bb1df1fbabe17cbc4837a05ac09c19cff1ce502a3ffe7b03"
+          }
+        ],
+        "median_baseline_copy_seconds": 5.658589192,
+        "speedup": 1.0627905969584424,
+        "run_order": "before/after on even repeats, after/before on odd repeats"
+      }
+    ]
+  },
+  "validation": {
+    "pillow_conformance": {
+      "images_per_binary": 16744,
+      "before_after_hashes_identical": true,
+      "threads": [
+        1,
+        4
+      ]
+    },
+    "cpp_image_release": {
+      "assertions": 4564,
+      "cases": 4
+    },
+    "asan_ubsan_lsan": {
+      "assertions": 6219,
+      "cases": 18,
+      "detect_leaks": true,
+      "scope": "Image writers/COPY, numeric stats, COPY bind/cleanup and custom AVIO; extension/test source instrumented, fixed DuckDB host and system FFmpeg not rebuilt with sanitizers."
+    },
+    "cpp_ffmpeg_off": {
+      "assertions": 1587,
+      "cases": 11
+    },
+    "sql_ffmpeg_on": {
+      "assertions": 1596,
+      "cases": 18,
+      "skips": 1
+    },
+    "sql_ffmpeg_off": {
+      "assertions": 1143,
+      "cases": 12,
+      "skips": 7
+    },
+    "existing_pinned_lerobot_visual_conformance": "passed",
+    "remote_ci": "not run"
+  },
+  "interpretation": "Small-image COPY time decreased by about 13%. Initial larger-image ratios are 0.976–1.060; four alternating pairs for noisy VGA give 1.063. Both rounds retained: noise/compression and run variance limit broader speed claims. RSS increases by roughly 0.4–1.7 MiB in the initial cases, with encoder state now retained per active image feature until COPY teardown. No hard RSS/FFmpeg memory cap or platform-wide claim."
+}

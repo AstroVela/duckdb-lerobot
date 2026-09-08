@@ -1,0 +1,519 @@
+{
+  "date": "2026-09-06",
+  "platform": "Linux x86_64",
+  "duckdb_commit": "d8cdaa33fda8df955cc76ef58a280f68f4cd43fa",
+  "after_extension_sha256": "83d191add5d466ddce42c3d0abde3c3faea0e116bd2e7f912a93889457edef2f",
+  "scope": "Local synthetic shards, fresh database per scenario, OS cache not flushed. Medians include query execution and timestamp materialization. Video validation hashes request identity, target timestamp and decoded pixels together. Remote and cross-platform performance not measured.",
+  "runs": [
+    {
+      "name": "final",
+      "duckdb": "v1.5.5",
+      "before_extension_sha256": "7e912c219f4ca96def1e0ad5b449b6b1ec93a519250cd53abda924a822f548f2",
+      "rows": 1000000,
+      "threads": 1,
+      "batch_size": 2048,
+      "memory_limit": "512MB",
+      "measured_repeats": 5,
+      "video_sha256": null,
+      "scenarios": [
+        {
+          "shards": 1,
+          "targets": 4,
+          "pattern": "dense",
+          "result": [
+            "4",
+            "0.1875"
+          ],
+          "metadata": {
+            "before_seconds": 0.014655105,
+            "after_seconds": 0.015380823,
+            "speedup": 0.9528166990804068
+          }
+        },
+        {
+          "shards": 1,
+          "targets": 4,
+          "pattern": "sparse",
+          "result": [
+            "4",
+            "1484.8125"
+          ],
+          "metadata": {
+            "before_seconds": 0.015071072,
+            "after_seconds": 0.015392288,
+            "speedup": 0.9791313676043483
+          }
+        },
+        {
+          "shards": 1,
+          "targets": 4,
+          "pattern": "repeated",
+          "result": [
+            "4",
+            "46875.0"
+          ],
+          "metadata": {
+            "before_seconds": 0.016609945,
+            "after_seconds": 0.017236451,
+            "speedup": 0.9636522622899576
+          }
+        },
+        {
+          "shards": 1,
+          "targets": 4096,
+          "pattern": "dense",
+          "result": [
+            "4096",
+            "262080.0"
+          ],
+          "metadata": {
+            "before_seconds": 0.082661797,
+            "after_seconds": 0.083327268,
+            "speedup": 0.9920137667299976
+          }
+        },
+        {
+          "shards": 1,
+          "targets": 4096,
+          "pattern": "sparse",
+          "result": [
+            "4096",
+            "63505270.0"
+          ],
+          "metadata": {
+            "before_seconds": 0.217804163,
+            "after_seconds": 0.205073455,
+            "speedup": 1.062078770750705
+          }
+        },
+        {
+          "shards": 1,
+          "targets": 4096,
+          "pattern": "repeated",
+          "result": [
+            "4096",
+            "48000000.0"
+          ],
+          "metadata": {
+            "before_seconds": 0.033217428,
+            "after_seconds": 0.031070351,
+            "speedup": 1.069103725284597
+          }
+        },
+        {
+          "shards": 1,
+          "targets": 32768,
+          "pattern": "dense",
+          "result": [
+            "32768",
+            "16776704.0"
+          ],
+          "metadata": {
+            "before_seconds": 0.636131537,
+            "after_seconds": 0.180302962,
+            "speedup": 3.528125827461448
+          }
+        },
+        {
+          "shards": 1,
+          "targets": 32768,
+          "pattern": "sparse",
+          "result": [
+            "32768",
+            "511500226.0"
+          ],
+          "metadata": {
+            "before_seconds": 1.745640158,
+            "after_seconds": 0.307992654,
+            "speedup": 5.6677980313127865
+          }
+        },
+        {
+          "shards": 1,
+          "targets": 32768,
+          "pattern": "repeated",
+          "result": [
+            "32768",
+            "384000000.0"
+          ],
+          "metadata": {
+            "before_seconds": 0.261177664,
+            "after_seconds": 0.115828481,
+            "speedup": 2.254865657782389
+          }
+        },
+        {
+          "shards": 4,
+          "targets": 4,
+          "pattern": "dense",
+          "result": [
+            "4",
+            "0.1875"
+          ],
+          "metadata": {
+            "before_seconds": 0.006149654,
+            "after_seconds": 0.006553347,
+            "speedup": 0.9383989585779602
+          }
+        },
+        {
+          "shards": 4,
+          "targets": 4,
+          "pattern": "sparse",
+          "result": [
+            "4",
+            "1484.8125"
+          ],
+          "metadata": {
+            "before_seconds": 0.006613354,
+            "after_seconds": 0.006580542,
+            "speedup": 1.0049862154211613
+          }
+        },
+        {
+          "shards": 4,
+          "targets": 4,
+          "pattern": "repeated",
+          "result": [
+            "4",
+            "11718.75"
+          ],
+          "metadata": {
+            "before_seconds": 0.00675996,
+            "after_seconds": 0.006521472,
+            "speedup": 1.0365696578931871
+          }
+        },
+        {
+          "shards": 4,
+          "targets": 4096,
+          "pattern": "dense",
+          "result": [
+            "4096",
+            "262080.0"
+          ],
+          "metadata": {
+            "before_seconds": 0.063132465,
+            "after_seconds": 0.06085292,
+            "speedup": 1.0374599115375236
+          }
+        },
+        {
+          "shards": 4,
+          "targets": 4096,
+          "pattern": "sparse",
+          "result": [
+            "4096",
+            "15966207.5"
+          ],
+          "metadata": {
+            "before_seconds": 0.217194621,
+            "after_seconds": 0.213817791,
+            "speedup": 1.0157930263155697
+          }
+        },
+        {
+          "shards": 4,
+          "targets": 4096,
+          "pattern": "repeated",
+          "result": [
+            "4096",
+            "12000000.0"
+          ],
+          "metadata": {
+            "before_seconds": 0.03237537,
+            "after_seconds": 0.030754619,
+            "speedup": 1.0526994335387474
+          }
+        },
+        {
+          "shards": 4,
+          "targets": 32768,
+          "pattern": "dense",
+          "result": [
+            "32768",
+            "16776704.0"
+          ],
+          "metadata": {
+            "before_seconds": 0.503919461,
+            "after_seconds": 0.103469041,
+            "speedup": 4.870243853907953
+          }
+        },
+        {
+          "shards": 4,
+          "targets": 32768,
+          "pattern": "sparse",
+          "result": [
+            "32768",
+            "127992413.5"
+          ],
+          "metadata": {
+            "before_seconds": 1.77038218,
+            "after_seconds": 0.338908519,
+            "speedup": 5.223775977139129
+          }
+        },
+        {
+          "shards": 4,
+          "targets": 32768,
+          "pattern": "repeated",
+          "result": [
+            "32768",
+            "96000000.0"
+          ],
+          "metadata": {
+            "before_seconds": 0.257516403,
+            "after_seconds": 0.119019283,
+            "speedup": 2.16365278389385
+          }
+        }
+      ]
+    },
+    {
+      "name": "low-memory",
+      "duckdb": "v1.5.5",
+      "before_extension_sha256": "7e912c219f4ca96def1e0ad5b449b6b1ec93a519250cd53abda924a822f548f2",
+      "rows": 1000000,
+      "threads": 1,
+      "batch_size": 2048,
+      "memory_limit": "64MB",
+      "measured_repeats": 2,
+      "video_sha256": null,
+      "scenarios": [
+        {
+          "shards": 1,
+          "targets": 32768,
+          "pattern": "sparse",
+          "result": [
+            "32768",
+            "511500226.0"
+          ],
+          "metadata": {
+            "before_seconds": 1.6639869775,
+            "after_seconds": 1.7417969045000001,
+            "speedup": 0.9553277843134437
+          }
+        },
+        {
+          "shards": 1,
+          "targets": 32768,
+          "pattern": "repeated",
+          "result": [
+            "32768",
+            "384000000.0"
+          ],
+          "metadata": {
+            "before_seconds": 0.239974484,
+            "after_seconds": 0.24519280100000002,
+            "speedup": 0.9787174950540247
+          }
+        }
+      ]
+    },
+    {
+      "name": "parallel",
+      "duckdb": "v1.5.5",
+      "before_extension_sha256": "7e912c219f4ca96def1e0ad5b449b6b1ec93a519250cd53abda924a822f548f2",
+      "rows": 1000000,
+      "threads": 4,
+      "batch_size": 2048,
+      "memory_limit": "512MB",
+      "measured_repeats": 2,
+      "video_sha256": null,
+      "scenarios": [
+        {
+          "shards": 4,
+          "targets": 32768,
+          "pattern": "dense",
+          "result": [
+            "32768",
+            "16776704.0"
+          ],
+          "metadata": {
+            "before_seconds": 0.49881189400000003,
+            "after_seconds": 0.09765008950000001,
+            "speedup": 5.1081560350233985
+          }
+        },
+        {
+          "shards": 4,
+          "targets": 32768,
+          "pattern": "sparse",
+          "result": [
+            "32768",
+            "127992413.5"
+          ],
+          "metadata": {
+            "before_seconds": 1.0473410754999999,
+            "after_seconds": 0.2174827485,
+            "speedup": 4.815743238135506
+          }
+        }
+      ]
+    },
+    {
+      "name": "video",
+      "duckdb": "v1.5.5",
+      "before_extension_sha256": "7e912c219f4ca96def1e0ad5b449b6b1ec93a519250cd53abda924a822f548f2",
+      "rows": 4096,
+      "threads": 1,
+      "batch_size": 2048,
+      "memory_limit": "512MB",
+      "measured_repeats": 2,
+      "video_sha256": "e40671c1023adea9f84508df229e152fb8b953b58b965df4e8501ecf2e7bfb97",
+      "scenarios": [
+        {
+          "shards": 1,
+          "targets": 8192,
+          "pattern": "dense",
+          "result": [
+            "8192",
+            "524160.0"
+          ],
+          "metadata": {
+            "before_seconds": 0.11483143700000001,
+            "after_seconds": 0.080972311,
+            "speedup": 1.4181568437635428
+          },
+          "decoded": {
+            "before_seconds": 0.243995721,
+            "after_seconds": 0.1846697715,
+            "speedup": 1.3212542530275455
+          },
+          "pixel_validation": {
+            "rows": "8192",
+            "timestamps": "524160.0",
+            "bytes": "18874368",
+            "hash_sum": "75411836576051879134639"
+          }
+        },
+        {
+          "shards": 1,
+          "targets": 8192,
+          "pattern": "sparse",
+          "result": [
+            "8192",
+            "524160.0"
+          ],
+          "metadata": {
+            "before_seconds": 0.11876239,
+            "after_seconds": 0.065204368,
+            "speedup": 1.8213870273230774
+          },
+          "decoded": {
+            "before_seconds": 1.5908245675,
+            "after_seconds": 1.5593473015,
+            "speedup": 1.0201861804421124
+          },
+          "pixel_validation": {
+            "rows": "8192",
+            "timestamps": "524160.0",
+            "bytes": "18874368",
+            "hash_sum": "75533935053870306342814"
+          }
+        },
+        {
+          "shards": 1,
+          "targets": 8192,
+          "pattern": "repeated",
+          "result": [
+            "8192",
+            "393216.0"
+          ],
+          "metadata": {
+            "before_seconds": 0.0187449845,
+            "after_seconds": 0.015173428,
+            "speedup": 1.2353823078080972
+          },
+          "decoded": {
+            "before_seconds": 0.0887378645,
+            "after_seconds": 0.0822924455,
+            "speedup": 1.0783233377114791
+          },
+          "pixel_validation": {
+            "rows": "8192",
+            "timestamps": "393216.0",
+            "bytes": "18874368",
+            "hash_sum": "75179393547098852432411"
+          }
+        },
+        {
+          "shards": 4,
+          "targets": 8192,
+          "pattern": "dense",
+          "result": [
+            "8192",
+            "130944.0"
+          ],
+          "metadata": {
+            "before_seconds": 0.116573082,
+            "after_seconds": 0.1167453835,
+            "speedup": 0.9985241257955181
+          },
+          "decoded": {
+            "before_seconds": 0.2526640525,
+            "after_seconds": 0.2408826445,
+            "speedup": 1.048909326881788
+          },
+          "pixel_validation": {
+            "rows": "8192",
+            "timestamps": "130944.0",
+            "bytes": "18874368",
+            "hash_sum": "75594970426490723029139"
+          }
+        },
+        {
+          "shards": 4,
+          "targets": 8192,
+          "pattern": "sparse",
+          "result": [
+            "8192",
+            "130944.0"
+          ],
+          "metadata": {
+            "before_seconds": 0.119590154,
+            "after_seconds": 0.07314185749999999,
+            "speedup": 1.6350439828520902
+          },
+          "decoded": {
+            "before_seconds": 0.5928521355,
+            "after_seconds": 0.566146563,
+            "speedup": 1.0471707756353543
+          },
+          "pixel_validation": {
+            "rows": "8192",
+            "timestamps": "130944.0",
+            "bytes": "18874368",
+            "hash_sum": "75067494710841210574328"
+          }
+        },
+        {
+          "shards": 4,
+          "targets": 8192,
+          "pattern": "repeated",
+          "result": [
+            "8192",
+            "98304.0"
+          ],
+          "metadata": {
+            "before_seconds": 0.0218254825,
+            "after_seconds": 0.018926336000000002,
+            "speedup": 1.1531805469373468
+          },
+          "decoded": {
+            "before_seconds": 0.31768538999999996,
+            "after_seconds": 0.335052766,
+            "speedup": 0.9481652510816757
+          },
+          "pixel_validation": {
+            "rows": "8192",
+            "timestamps": "98304.0",
+            "bytes": "18874368",
+            "hash_sum": "75496442890075683040212"
+          }
+        }
+      ]
+    }
+  ]
+}

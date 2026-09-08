@@ -1,0 +1,13 @@
+diff --git a/src/storage/caching_file_system_wrapper.cpp b/src/storage/caching_file_system_wrapper.cpp
+--- a/src/storage/caching_file_system_wrapper.cpp
++++ b/src/storage/caching_file_system_wrapper.cpp
+@@ -151,6 +151,9 @@ bool CachingFileSystemWrapper::SupportsOpenFileExtended() const {
+ // Read Operations
+ //===----------------------------------------------------------------------===//
+ void CachingFileSystemWrapper::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
++	if (nr_bytes == 0) {
++		return;
++	}
+ 	auto *caching_handle = GetCachingHandleIfPossible(handle);
+ 	if (!caching_handle) {
+ 		return underlying_file_system.Read(handle, buffer, nr_bytes, location);

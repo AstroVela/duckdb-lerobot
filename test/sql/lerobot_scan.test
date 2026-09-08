@@ -137,8 +137,11 @@ ORDER BY frame_index;
 # The public Parquet option whitelist survives bind replacement.
 # union_by_name exposes the later shard's evolved column and filename proves
 # the option reaches the replacement scan.
+# Resolved paths are absolute; compare from TEST_DIR onward for runners using
+# either a relative or an absolute temporary directory.
 query ITT
-SELECT frame_index, coalesce(shard_marker, 'missing'), filename
+SELECT frame_index, coalesce(shard_marker, 'missing'),
+       substr(filename, strpos(filename, '{TEST_DIR}/')) AS filename
 FROM lerobot_scan(
     '{TEST_DIR}/lerobot_scan',
     refresh := true,
@@ -224,7 +227,8 @@ ORDER BY frame_index;
 # Parquet output options are also forwarded through the episode-pruned
 # replacement relation, not only the full-scan form.
 query ITTI
-SELECT frame_index, shard_marker, source_file, file_row_number
+SELECT frame_index, shard_marker,
+       substr(source_file, strpos(source_file, '{TEST_DIR}/')) AS source_file, file_row_number
 FROM lerobot_scan(
     '{TEST_DIR}/lerobot_scan',
     episode_indices := [2],
@@ -245,7 +249,8 @@ data	true	1	true
 video	false	0	false
 
 query ITTIIRRI
-SELECT episode_index, video_key, video_path, chunk_index, file_index,
+SELECT episode_index, video_key, substr(video_path, strpos(video_path, '{TEST_DIR}/')) AS video_path,
+       chunk_index, file_index,
        from_timestamp, to_timestamp, fps
 FROM lerobot_video_routes(
     '{TEST_DIR}/lerobot_scan',
@@ -382,7 +387,7 @@ COPY (
 # No explicit refresh: both stale components must be replaced from the new
 # info.json fingerprint before video routes are resolved.
 query T
-SELECT video_path
+SELECT substr(video_path, strpos(video_path, '{TEST_DIR}/')) AS video_path
 FROM lerobot_video_routes(
     '{TEST_DIR}/lerobot_scan',
     [0],

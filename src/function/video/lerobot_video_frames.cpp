@@ -25,7 +25,9 @@
 #include "function/lerobot_temporal.hpp"
 #include "function/lerobot_video_options.hpp"
 #include "lerobot_path.hpp"
+#include "lerobot_query.hpp"
 #include "storage/lerobot_metadata_cache.hpp"
+#include "storage/lerobot_timestamp_lookup.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -958,6 +960,8 @@ public:
 			avformat_close_input(&format_context);
 		}
 		if (avio_context) {
+			// FFmpeg may replace the caller-supplied buffer while probing input.
+			av_freep(&avio_context->buffer);
 			avio_context_free(&avio_context);
 		}
 	}
@@ -1614,8 +1618,10 @@ int64_t ReadUnifiedInteger(const vector<UnifiedVectorFormat> &formats, idx_t col
 }
 
 struct LerobotVideoTargetsGlobalState final : public GlobalTableFunctionState {
-	LerobotVideoTargetsGlobalState(const LerobotVideoTargetsBindData &bind_data_p, const vector<column_t> &column_ids)
-	    : bind_data(bind_data_p), next_target_ordinal(0), needs_decode(false), needs_pixels(false) {
+	LerobotVideoTargetsGlobalState(ClientContext &context, const LerobotVideoTargetsBindData &bind_data_p,
+	                               const vector<column_t> &column_ids)
+	    : timestamps(context), bind_data(bind_data_p), next_target_ordinal(0), needs_decode(false),
+	      needs_pixels(false) {
 		for (const auto column_id : column_ids) {
 			const auto logical_column = static_cast<idx_t>(column_id);
 			if (logical_column >= LEROBOT_TARGET_COLUMN_COUNT) {
@@ -1676,6 +1682,8 @@ struct LerobotVideoTargetsGlobalState final : public GlobalTableFunctionState {
 	}
 #endif
 
+	LerobotTimestampLookup timestamps;
+
 private:
 	bool IsProjected(idx_t logical_column) const {
 		return std::find(projected_columns.begin(), projected_columns.end(), logical_column) != projected_columns.end();
@@ -1735,29 +1743,10 @@ struct LerobotVideoTargetsLocalState final : public LocalTableFunctionState {
 	bool have_decoded;
 };
 
-string BuildTargetTimestampQuery(const vector<std::pair<int64_t, int64_t>> &frame_keys,
-                                 const vector<string> &data_files) {
-	string values;
-	for (idx_t index = 0; index < frame_keys.size(); index++) {
-		if (!values.empty()) {
-			values += ", ";
-		}
-		values += "(" + std::to_string(frame_keys[index].first) + ", " + std::to_string(frame_keys[index].second) + ")";
-	}
-	return "WITH requested(episode_index, frame_index) AS (VALUES " + values +
-	       "), frames AS (SELECT CAST(episode_index AS BIGINT) AS episode_index, "
-	       "CAST(frame_index AS BIGINT) AS frame_index, CAST(timestamp AS DOUBLE) AS timestamp "
-	       "FROM read_parquet(" +
-	       ValueListSQL(data_files) +
-	       ")) SELECT requested.episode_index, requested.frame_index, min(frames.timestamp), "
-	       "CAST(count(frames.frame_index) AS BIGINT) FROM requested LEFT JOIN frames "
-	       "ON frames.episode_index = requested.episode_index AND frames.frame_index = requested.frame_index "
-	       "GROUP BY requested.episode_index, requested.frame_index";
-}
-
 unordered_map<string, double> ReadTargetTimestamps(ClientContext &context, const LerobotVideoTargetsBindData &bind_data,
-                                                   const vector<LerobotDecodeTarget> &targets) {
-	vector<std::pair<int64_t, int64_t>> frame_keys;
+                                                   const vector<LerobotDecodeTarget> &targets,
+                                                   LerobotTimestampLookup &lookup) {
+	vector<LerobotTimestampKey> frame_keys;
 	vector<int64_t> episode_indices;
 	frame_keys.reserve(targets.size());
 	episode_indices.reserve(targets.size());
@@ -1774,46 +1763,25 @@ unordered_map<string, double> ReadTargetTimestamps(ClientContext &context, const
 		throw InvalidInputException("LeRobot target episodes do not resolve to a Parquet data shard");
 	}
 
-	Connection connection(*context.db);
-	auto result = connection.SendQuery(BuildTargetTimestampQuery(frame_keys, data_files));
-	if (result->HasError()) {
-		throw InvalidInputException("Failed to read LeRobot target timestamps: %s", result->GetError());
-	}
+	auto matches = lookup.Lookup(context, data_files, frame_keys, targets.size());
 	unordered_map<string, double> timestamps;
-	while (true) {
-		auto chunk = result->Fetch();
-		if (!chunk) {
-			break;
-		}
-		vector<UnifiedVectorFormat> formats;
-		formats.reserve(chunk->ColumnCount());
-		for (idx_t column = 0; column < chunk->ColumnCount(); column++) {
-			formats.push_back(UnifiedVectorFormat());
-			PrepareUnifiedFormat(chunk->data[column], chunk->size(), formats.back());
-		}
-		for (idx_t row = 0; row < chunk->size(); row++) {
-			const auto episode_index = ReadUnifiedInteger(formats, 0, row, "episode_index");
-			const auto frame_index = ReadUnifiedInteger(formats, 1, row, "frame_index");
-			const auto match_count = ReadUnifiedInteger(formats, 3, row, "match_count");
-			const auto timestamp_index = formats[2].sel->get_index(row);
-			if (match_count != 1 || !formats[2].validity.RowIsValid(timestamp_index)) {
-				if (match_count == 0) {
-					throw InvalidInputException("LeRobot episode %d has no Parquet row for frame %d", episode_index,
-					                            frame_index);
-				}
-				throw InvalidInputException("LeRobot episode %d has %d Parquet rows for frame %d", episode_index,
-				                            match_count, frame_index);
-			}
-			const auto timestamp = formats[2].GetData<double>()[timestamp_index];
-			if (!std::isfinite(timestamp) || timestamp < 0) {
-				throw InvalidInputException("Invalid LeRobot timestamp for episode %d, frame %d", episode_index,
+	for (idx_t key = 0; key < frame_keys.size(); key++) {
+		const auto episode_index = frame_keys[key].first;
+		const auto frame_index = frame_keys[key].second;
+		const auto &match = matches[key];
+		if (match.count != 1 || !match.has_timestamp) {
+			if (match.count == 0) {
+				throw InvalidInputException("LeRobot episode %d has no Parquet row for frame %d", episode_index,
 				                            frame_index);
 			}
-			timestamps.emplace(LerobotFrameKey(episode_index, frame_index), timestamp);
+			throw InvalidInputException("LeRobot episode %d has %d Parquet rows for frame %d", episode_index,
+			                            match.count, frame_index);
 		}
-	}
-	if (result->HasError()) {
-		throw InvalidInputException("Failed to read LeRobot target timestamps: %s", result->GetError());
+		if (!std::isfinite(match.timestamp) || match.timestamp < 0) {
+			throw InvalidInputException("Invalid LeRobot timestamp for episode %d, frame %d", episode_index,
+			                            frame_index);
+		}
+		timestamps.emplace(LerobotFrameKey(episode_index, frame_index), match.timestamp);
 	}
 	return timestamps;
 }
@@ -1892,7 +1860,7 @@ void BuildTargetBuffers(ClientContext &context, const LerobotVideoTargetsBindDat
 		targets.back().target_id = target_id;
 	}
 	local_state.input_position += batch_count;
-	auto timestamps = ReadTargetTimestamps(context, bind_data, targets);
+	auto timestamps = ReadTargetTimestamps(context, bind_data, targets, global_state.timestamps);
 	unordered_map<idx_t, vector<LerobotDecodeTarget>> targets_by_shard;
 	for (auto &target : targets) {
 		auto timestamp_entry = timestamps.find(LerobotFrameKey(target.episode_index, target.target_frame_index));
@@ -1929,9 +1897,10 @@ void BuildTargetBuffers(ClientContext &context, const LerobotVideoTargetsBindDat
 	}
 }
 
-unique_ptr<GlobalTableFunctionState> LerobotVideoTargetsInitGlobal(ClientContext &, TableFunctionInitInput &input) {
+unique_ptr<GlobalTableFunctionState> LerobotVideoTargetsInitGlobal(ClientContext &context,
+                                                                   TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<LerobotVideoTargetsBindData>();
-	return make_uniq<LerobotVideoTargetsGlobalState>(bind_data, input.column_ids);
+	return make_uniq<LerobotVideoTargetsGlobalState>(context, bind_data, input.column_ids);
 }
 
 unique_ptr<LocalTableFunctionState> LerobotVideoTargetsInitLocal(ExecutionContext &, TableFunctionInitInput &,
@@ -2126,12 +2095,25 @@ public:
 		return LerobotTargetQueueResult::BLOCKED;
 	}
 
-	void ProducerFinished() {
+	void ProducerFinished(bool abandoned) {
 		lock_guard<mutex> guard(lock);
 		D_ASSERT(active_producers > 0);
+		if (abandoned) {
+			stop_requested.store(true, std::memory_order_release);
+		}
 		active_producers--;
-		if (active_producers == 0) {
+		if (stop_requested.load(std::memory_order_relaxed)) {
+			// Cancellation must not allocate/finalize more output. Buffers that
+			// consumers already hold keep their busy_shards entries until release.
+			partial_buffers.clear();
+			partial_lru.clear();
+			partial_lru_entries.clear();
+			ready_buffers.clear();
+			pending_target_count = 0;
+		} else if (active_producers == 0) {
 			FlushAllPartialBuffers();
+		}
+		if (active_producers == 0) {
 			source_exhausted = true;
 		}
 		state_changed.notify_all();
@@ -2303,6 +2285,9 @@ private:
 	}
 
 	void TakeBlockedProducers(vector<shared_ptr<Task>> &result) {
+		// Reserve before locking weak references: if growth threw with the last
+		// task reference held here, its destructor would re-enter this state lock.
+		result.reserve(result.size() + blocked_producers.size());
 		for (auto &producer : blocked_producers) {
 			auto task = producer.lock();
 			if (task) {
@@ -2402,6 +2387,12 @@ public:
 	      pending_target_position(0), next_query(producer_index), query_stride(producer_count), finished(false) {
 	}
 
+	~LerobotVideoProducerTask() override {
+		// CancelTasks can destroy a blocked task while holding executor_lock.
+		// Settle its count without publishing buffers or rescheduling peers.
+		Finish(true);
+	}
+
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
 		try {
 			idx_t rows_processed = 0;
@@ -2439,6 +2430,7 @@ public:
 					next_query += query_stride;
 					if (!frame_connection) {
 						frame_connection = make_shared_ptr<Connection>(*database);
+						InheritLerobotReaderSettings(executor.context, *frame_connection->context);
 						state->RegisterConnection(frame_connection);
 					}
 					frame_result = frame_connection->SendQuery(query);
@@ -2491,12 +2483,12 @@ public:
 	}
 
 private:
-	void Finish() {
+	void Finish(bool abandoned = false) {
 		if (finished) {
 			return;
 		}
 		finished = true;
-		state->ProducerFinished();
+		state->ProducerFinished(abandoned);
 	}
 
 private:

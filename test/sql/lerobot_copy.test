@@ -8,6 +8,32 @@ require json
 
 require lerobot
 
+# Path trimming must preserve trailing UTF-8 bytes on COPY and every reader.
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, 'unicode root' AS task, 7::FLOAT AS action)
+TO '{TEST_DIR}/lerobot_copy_机器人/'
+(FORMAT lerobot, FPS 10, FEATURES '{"action":{"dtype":"float32","shape":[1]}}');
+
+query I
+SELECT count(*) FROM read_json_auto('{TEST_DIR}/lerobot_copy_机器人/meta/info.json');
+----
+1
+
+query I
+SELECT count(*) FROM lerobot_info('  {TEST_DIR}/lerobot_copy_机器人/  ');
+----
+1
+
+query I
+SELECT sum(action) FROM lerobot_scan('{TEST_DIR}/lerobot_copy_机器人');
+----
+7
+
+query II
+SELECT episode_index, length FROM lerobot_episodes('{TEST_DIR}/lerobot_copy_机器人');
+----
+0	1
+
 statement error
 COPY (
     SELECT 0::BIGINT AS episode_index, 'invalid workers'::VARCHAR AS task,
@@ -584,7 +610,7 @@ COPY (
     FEATURES '{"invalid/name":{"dtype":"float32","shape":[1]}}'
 );
 ----
-feature names must not contain '/'
+feature name must be a portable path component
 
 # DuckDB identifiers are case-insensitive. Generated feature names must use the
 # same rule so COPY cannot publish an ambiguous schema that its reader rejects.

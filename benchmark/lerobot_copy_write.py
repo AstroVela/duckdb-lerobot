@@ -11,13 +11,14 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
 from statistics import median
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def sql_string(value: str) -> str:
@@ -93,46 +94,44 @@ COPY (
 """
 
 
-def process_counters(pid: int) -> dict[str, int]:
-    result: dict[str, int] = {}
-    try:
-        for line in Path(f"/proc/{pid}/io").read_text().splitlines():
-            key, value = line.split(":", 1)
-            result[key] = int(value.strip())
-    except (OSError, ValueError):
-        pass
-    try:
-        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
-            if line.startswith("VmHWM:"):
-                result["peak_rss_bytes"] = int(line.split()[1]) * 1024
-                break
-    except (OSError, ValueError, IndexError):
-        pass
-    return result
-
-
-def run_sql_measured(cli: Path, sql: str) -> tuple[float, dict[str, int]]:
+def run_sql_measured(
+    cli: Path, sql: str, extension: Path | None = None
+) -> tuple[float, dict[str, int | None]]:
     started = time.perf_counter()
     with tempfile.TemporaryFile(mode="w+t") as sql_input, tempfile.TemporaryFile(
         mode="w+t"
     ) as process_output:
+        if extension:
+            sql_input.write(f"LOAD {sql_string(str(extension))};\n")
         sql_input.write(sql)
         sql_input.seek(0)
         process = subprocess.Popen(
-            [str(cli), "-batch"],
+            [str(cli), *(["-unsigned"] if extension else []), "-batch"],
             stdin=sql_input,
             stdout=process_output,
             stderr=subprocess.STDOUT,
             text=True,
         )
-        counters: dict[str, int] = {}
+        counters: dict[str, int | None] = {
+            "fs_input_blocks": None,
+            "fs_output_blocks": None,
+            "peak_rss_bytes": None,
+        }
         try:
-            while True:
-                for key, value in process_counters(process.pid).items():
-                    counters[key] = max(value, counters.get(key, 0))
-                if process.poll() is not None:
-                    break
-                time.sleep(0.01)
+            if hasattr(os, "wait4"):
+                # Reap this exact process once. Sampling /proc can miss the
+                # final writes, and a zombie's counters may be inaccessible.
+                # These are filesystem block counters, not rchar/wchar bytes.
+                _, status, usage = os.wait4(process.pid, 0)
+                process.returncode = os.waitstatus_to_exitcode(status)
+                counters["fs_input_blocks"] = usage.ru_inblock
+                counters["fs_output_blocks"] = usage.ru_oublock
+                if sys.platform == "linux":
+                    counters["peak_rss_bytes"] = usage.ru_maxrss * 1024
+                elif sys.platform == "darwin":
+                    counters["peak_rss_bytes"] = usage.ru_maxrss
+            else:
+                process.wait()
         except BaseException:
             process.terminate()
             try:
@@ -149,9 +148,34 @@ def run_sql_measured(cli: Path, sql: str) -> tuple[float, dict[str, int]]:
     return elapsed, counters
 
 
-def query_csv(cli: Path, sql: str) -> list[list[str]]:
+def io_scaling(small_samples: list[dict], larger: dict) -> dict:
+    result = {}
+    for key in ("fs_input_blocks", "fs_output_blocks"):
+        values = [sample["process_io"].get(key) for sample in small_samples]
+        small = (
+            median(values)
+            if values and all(value is not None for value in values)
+            else None
+        )
+        large = larger["process_io"].get(key)
+        result[f"small_{key}_median"] = small
+        result[f"large_{key}"] = large
+        result[f"{key}_ratio"] = large / small if small and large is not None else None
+    return result
+
+
+def query_csv(cli: Path, sql: str, extension: Path | None = None) -> list[list[str]]:
+    if extension:
+        sql = f"LOAD {sql_string(str(extension))};\n" + sql
     result = subprocess.run(
-        [str(cli), "-noheader", "-csv", "-c", sql],
+        [
+            str(cli),
+            *(["-unsigned"] if extension else []),
+            "-noheader",
+            "-csv",
+            "-c",
+            sql,
+        ],
         check=True,
         capture_output=True,
         text=True,
@@ -168,6 +192,7 @@ def validate_dataset(
     fps: int,
     height: int,
     width: int,
+    extension: Path | None = None,
 ) -> list[list[str]]:
     cameras = camera_names(camera_count)
     episode_duration = frames_per_episode / fps
@@ -186,6 +211,7 @@ def validate_dataset(
         cli,
         f"SELECT count(*), bool_and({' AND '.join(route_checks)}) "
         f"FROM lerobot_episodes({sql_string(str(root))})",
+        extension,
     )
     if route_rows != [[str(episodes), "true"]]:
         raise RuntimeError(f"invalid video routes: {route_rows}")
@@ -193,6 +219,7 @@ def validate_dataset(
     file_rows = query_csv(
         cli,
         f"SELECT count(*) FROM glob(" f"{sql_string(str(root / 'videos/**/*.mp4'))})",
+        extension,
     )
     if file_rows != [[str(camera_count)]]:
         raise RuntimeError(f"expected one shard per camera: {file_rows}")
@@ -208,6 +235,7 @@ def validate_dataset(
         f"video_keys := [{camera_values}], "
         f"frame_indices := [{frame_indices}]) "
         f"ORDER BY episode_index, frame_index, video_key",
+        extension,
     )
     expected_rows = camera_count * episodes * frames_per_episode
     if len(decoded) != expected_rows:
@@ -248,6 +276,7 @@ def run_case(
             args.threads,
             video_workers,
         ),
+        args.extension,
     )
     signature = validate_dataset(
         args.duckdb_cli,
@@ -258,6 +287,7 @@ def run_case(
         args.fps,
         args.height,
         args.width,
+        args.extension,
     )
     measurement = {
         "seconds": elapsed,
@@ -272,6 +302,11 @@ def run_case(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duckdb-cli", type=Path, required=True)
+    parser.add_argument(
+        "--extension",
+        type=Path,
+        help="explicit local extension to load in every CLI process",
+    )
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--episodes", type=int, default=8)
@@ -302,6 +337,10 @@ def main() -> int:
     args.output = args.output.resolve()
     if not args.duckdb_cli.is_file():
         parser.error(f"DuckDB CLI does not exist: {args.duckdb_cli}")
+    if args.extension:
+        args.extension = args.extension.resolve()
+        if not args.extension.is_file():
+            parser.error(f"extension does not exist: {args.extension}")
     args.work_dir.mkdir(parents=True, exist_ok=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.run_dir = Path(
@@ -310,12 +349,20 @@ def main() -> int:
 
     result: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
+        "measurement": {
+            "method": "wait4" if hasattr(os, "wait4") else "wall_time_only",
+            "scope": "whole CLI process, including COPY finalize and shutdown; excludes validation",
+            "io_units": "kernel filesystem block counters; cache-dependent, not logical read/write bytes",
+            "unavailable": "null; ratios are also null for zero denominators",
+        },
         "machine": {
             "platform": platform.platform(),
             "processor": platform.processor(),
             "cpu_count": os.cpu_count(),
         },
         "configuration": {
+            "duckdb_cli": str(args.duckdb_cli),
+            "extension": str(args.extension) if args.extension else None,
             "episodes": args.episodes,
             "frames_per_episode": args.frames_per_episode,
             "fps": args.fps,
@@ -367,25 +414,10 @@ def main() -> int:
         0,
     )
     small_samples = result["camera_cases"]["4"]["parallel"]
-    small_rchar = median(
-        sample["process_io"].get("rchar", 0) for sample in small_samples
-    )
-    small_wchar = median(
-        sample["process_io"].get("wchar", 0) for sample in small_samples
-    )
     result["episode_scaling"] = {
         "small_episodes": args.episodes,
         "large_episodes": args.episodes * 2,
-        "small_rchar_median": small_rchar,
-        "large_rchar": larger["process_io"].get("rchar", 0),
-        "rchar_ratio": (
-            larger["process_io"].get("rchar", 0) / small_rchar if small_rchar else None
-        ),
-        "small_wchar_median": small_wchar,
-        "large_wchar": larger["process_io"].get("wchar", 0),
-        "wchar_ratio": (
-            larger["process_io"].get("wchar", 0) / small_wchar if small_wchar else None
-        ),
+        **io_scaling(small_samples, larger),
     }
 
     if not args.keep_output:

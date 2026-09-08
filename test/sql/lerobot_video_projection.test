@@ -66,8 +66,11 @@ FROM lerobot_video_frames('{TEST_DIR}/lerobot_video_projection', [0]);
 ----
 2
 
+# Resolved paths are absolute; compare from TEST_DIR onward for runners using
+# either a relative or an absolute temporary directory.
 query IITII
-SELECT episode_index, frame_index, video_path, width, height
+SELECT episode_index, frame_index, substr(video_path, strpos(video_path, '{TEST_DIR}/')) AS video_path,
+       width, height
 FROM lerobot_video_frames(
     '{TEST_DIR}/lerobot_video_projection',
     [0],
