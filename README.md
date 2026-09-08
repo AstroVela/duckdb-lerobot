@@ -629,6 +629,10 @@ make release
 LEROBOT_FFMPEG_TESTS=1 make test
 ```
 
+The separate [Quality CI checks](test/quality/README.md) add TSan concurrency
+tests, bounded libFuzzer runs with nightly expansion, and clang-tidy 18 defect
+checks across all extension C++ sources.
+
 The native CI matrix pins the DuckDB submodule at v1.5.5/C++11 and runs three
 configurations on Ubuntu 24.04: a metadata-only release build, an FFmpeg-enabled
 release build with every visual test enabled, and an FFmpeg-enabled

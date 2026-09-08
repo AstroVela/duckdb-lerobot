@@ -233,7 +233,11 @@ vector<LerobotFeature> ParseUserFeatures(ClientContext &context, const string &f
 				if (value <= 0) {
 					throw BinderException("LeRobot feature '%s' shape dimensions must be positive", feature.name);
 				}
-				if (static_cast<uint64_t>(value) > NumericLimits<idx_t>::Maximum()) {
+				// Numeric and string features become DuckDB ARRAYs. Validate their
+				// dimensions before constructing a type, which asserts this limit.
+				if (static_cast<uint64_t>(value) > NumericLimits<idx_t>::Maximum() ||
+				    (feature.dtype != "image" && feature.dtype != "video" &&
+				     static_cast<uint64_t>(value) > ArrayType::MAX_ARRAY_SIZE)) {
 					throw BinderException("LeRobot feature '%s' shape dimension is too large", feature.name);
 				}
 				feature.shape.push_back(static_cast<idx_t>(value));

@@ -1,0 +1,148 @@
+name: Quality CI
+
+on:
+  push:
+    branches: [v1.5-variegata]
+  pull_request:
+    branches: [v1.5-variegata]
+  workflow_dispatch:
+  schedule:
+    - cron: '23 19 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  instrumented-tests:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: tsan
+            name: TSan / concurrency
+            options: >-
+              -DENABLE_THREAD_SANITIZER=ON -DENABLE_SANITIZER=OFF -DENABLE_UBSAN=OFF
+              -DCMAKE_C_FLAGS=-fsanitize=thread
+            targets: lerobot_codec_executor_test lerobot_video_producer_test lerobot_nested_query_test
+          - id: fuzz
+            name: libFuzzer / validation
+            options: >-
+              -DENABLE_THREAD_SANITIZER=OFF -DENABLE_SANITIZER=ON -DENABLE_UBSAN=ON
+              -DCMAKE_C_FLAGS=-fsanitize=address,undefined -DLEROBOT_BUILD_FUZZERS=ON
+            targets: lerobot_validation_fuzz
+    env:
+      CC: clang-18
+      CXX: clang++-18
+      TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Clang 18 and build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-18 libclang-rt-18-dev llvm-18 ccache ninja-build
+      - name: Reserve a supported TSan shadow address layout
+        if: matrix.id == 'tsan'
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Apply the pinned test-host EOF fix
+        run: |
+          test "$(git -C duckdb rev-parse HEAD)" = d8cdaa33fda8df955cc76ef58a280f68f4cd43fa
+          git -C duckdb apply --check ../test/patches/duckdb-1.5.5-cached-eof.patch
+          git -C duckdb apply ../test/patches/duckdb-1.5.5-cached-eof.patch
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: quality-clang18-${{ matrix.id }}-${{ github.sha }}
+          restore-keys: quality-clang18-${{ matrix.id }}-
+      - name: Configure an instrumented DuckDB and extension
+        env:
+          QUALITY_OPTIONS: ${{ matrix.options }}
+        run: |
+          ccache --max-size=1500M
+          cmake -S duckdb -B build/quality -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DDUCKDB_EXTENSION_CONFIGS="$PWD/extension_config.cmake" \
+            -DOVERRIDE_GIT_DESCRIBE=v1.5.5-0-gd8cdaa33fd \
+            -DBUILD_UNITTESTS=ON -DBUILD_SHELL=OFF -DENABLE_JEMALLOC=OFF \
+            -DFORCE_ASSERT=ON -DLEROBOT_ENABLE_FFMPEG=OFF \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON $QUALITY_OPTIONS
+      - name: Build the selected test executables
+        env:
+          QUALITY_TARGETS: ${{ matrix.targets }}
+        run: cmake --build build/quality --parallel 2 --target $QUALITY_TARGETS
+      - name: Check concurrency with ThreadSanitizer
+        if: matrix.id == 'tsan'
+        run: |
+          for suite in codec_executor video_producer nested_query; do
+            timeout 300s "build/quality/extension/lerobot/test/lerobot_${suite}_test"
+          done
+      - name: Replay seeds and fuzz validation boundaries
+        if: matrix.id == 'fuzz'
+        env:
+          FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '1800' || '120' }}
+        run: |
+          mkdir -p build/quality/fuzz-artifacts
+          python3 test/fuzz/make_corpus.py build/quality/corpus
+          fuzzer=build/quality/extension/lerobot/test/lerobot_validation_fuzz
+          "$fuzzer" -runs=0 -timeout=30 -rss_limit_mb=4096 \
+            -artifact_prefix=build/quality/fuzz-artifacts/ build/quality/corpus
+          "$fuzzer" -max_total_time="$FUZZ_SECONDS" -timeout=30 -rss_limit_mb=4096 \
+            -max_len=4096 -dict=test/fuzz/validation.dict \
+            -artifact_prefix=build/quality/fuzz-artifacts/ build/quality/corpus
+      - name: Preserve reproducers and the evolved corpus
+        if: always() && matrix.id == 'fuzz'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/quality/corpus
+            build/quality/fuzz-artifacts
+          retention-days: 14
+          if-no-files-found: ignore
+      - name: Compiler cache statistics
+        if: always()
+        run: ccache --show-stats
+
+  tidy:
+    name: clang-tidy 18 / defects
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install analysis tools and FFmpeg headers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-18 clang-tidy-18 ninja-build pkg-config \
+            libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+      - name: Configure all extension translation units with FFmpeg
+        env:
+          CC: clang-18
+          CXX: clang++-18
+        run: |
+          cmake -S duckdb -B build/tidy -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DDISABLE_UNITY=ON \
+            -DDUCKDB_EXTENSION_CONFIGS="$PWD/extension_config.cmake" \
+            -DOVERRIDE_GIT_DESCRIBE=v1.5.5-0-gd8cdaa33fd \
+            -DENABLE_SANITIZER=OFF -DENABLE_UBSAN=OFF -DLEROBOT_ENABLE_FFMPEG=ON
+      - name: Check every extension source file
+        run: python3 test/quality/run_tidy.py --build-dir build/tidy
+      - name: Preserve analysis diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-tidy-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/tidy/tidy/*.log
+          retention-days: 14
