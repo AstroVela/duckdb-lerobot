@@ -236,7 +236,12 @@ TEST_CASE("COPY FEATURES cancellation takes precedence over a nested JSON error"
 TEST_CASE("COPY FEATURES validation errors preserve diagnostics and release connections", "[copy_bind]") {
 	const auto features = GENERATE(string("{"), string(R"({"action":{"dtype":"float32","shape":["bad"]}})"),
 	                               string(R"({"action":{"dtype":"float32","shape":[null]}})"),
-	                               string(R"({"action":{"dtype":"float32","shape":[0]}})"));
+	                               string(R"({"action":{"dtype":"float32","shape":[0]}})"),
+	                               string(R"({"action":{"dtype":"float32","shape":[100001]}})"),
+	                               string(R"({"action":{"dtype":"float32","shape":[1,100001]}})"),
+	                               string(R"({"action":{"dtype":"float32","shape":[100001,1]}})"),
+	                               string(R"({"action":{"dtype":"float32","shape":[9223372036854775807,8]}})"),
+	                               string(R"({"action":{"dtype":"string","shape":[100001]}})"));
 	CopyBindTest test;
 	test.gate->Release();
 	for (idx_t i = 0; i < 3; i++) {
@@ -250,6 +255,22 @@ TEST_CASE("COPY FEATURES validation errors preserve diagnostics and release conn
 		}
 		test.CheckClean();
 	}
+	test.CheckRetry();
+}
+
+TEST_CASE("COPY FEATURES accepts DuckDB's maximum array dimension during binding", "[copy_bind]") {
+	const auto nested = GENERATE(false, true);
+	const auto dimension = std::to_string(ArrayType::MAX_ARRAY_SIZE);
+	const auto features =
+	    "{\"action\":{\"dtype\":\"float32\",\"shape\":[" + (nested ? "1," : string()) + dimension + "]}}";
+	CopyBindTest test;
+	test.gate->Release();
+	const auto sql =
+	    StringUtil::Replace(test.SQL(features), "7::FLOAT", "NULL::FLOAT[" + dimension + "]" + (nested ? "[1]" : ""));
+	auto result = test.connection->Prepare(sql);
+	INFO((result->HasError() ? result->GetError() : ""));
+	REQUIRE_FALSE(result->HasError());
+	test.CheckClean();
 	test.CheckRetry();
 }
 

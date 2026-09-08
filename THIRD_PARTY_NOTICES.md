@@ -67,6 +67,15 @@ not legal advice.
   wheels may bundle native libraries with separate licenses; they are test-only
   and are not part of the extension artifact.
 
+## Additional correctness tooling
+
+Clang/LLVM 18, clang-tidy, compiler-rt sanitizers and libFuzzer are used only by
+the additional correctness jobs. They are supplied by Ubuntu packages and are
+not vendored or included in release artifacts. LLVM uses Apache-2.0 with LLVM
+exceptions; package-specific licenses are included in the installed packages.
+The fuzz seed generator and dictionary are original synthetic test inputs,
+not excerpts from a third-party dataset.
+
 ## Checked-in media fixture
 
 - `test/data/lerobot/long-20701.mp4` is a generated 16x16 H.264 test stream.

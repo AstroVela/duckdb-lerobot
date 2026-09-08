@@ -167,3 +167,20 @@ add_custom_target(
   COMMAND $<TARGET_FILE:lerobot_video_io_test> "[image_writer],[image_copy]"
   DEPENDS lerobot_video_io_test
   USES_TERMINAL)
+
+if(LEROBOT_BUILD_FUZZERS)
+  # Cover the production implementation, not just the harness. DuckDB itself is
+  # built with ASAN/UBSAN by the enclosing build.
+  target_compile_options(lerobot_extension PRIVATE -fsanitize=fuzzer-no-link)
+  target_link_options(lerobot_extension INTERFACE -fsanitize=fuzzer-no-link)
+  add_executable(lerobot_validation_fuzz fuzz/validation_fuzz.cpp)
+  target_include_directories(lerobot_validation_fuzz PRIVATE ../src/include)
+  target_compile_options(lerobot_validation_fuzz
+                         PRIVATE -fsanitize=fuzzer-no-link)
+  target_link_options(lerobot_validation_fuzz PRIVATE -fsanitize=fuzzer)
+  target_link_libraries(lerobot_validation_fuzz PRIVATE lerobot_extension
+                                                        lerobot_test_duckdb)
+  set_target_properties(
+    lerobot_validation_fuzz PROPERTIES CXX_VISIBILITY_PRESET hidden
+                                       VISIBILITY_INLINES_HIDDEN ON)
+endif()
