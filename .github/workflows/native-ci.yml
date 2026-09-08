@@ -207,7 +207,7 @@ jobs:
         run: |
           timeout 60s "${{ matrix.build_dir }}/extension/lerobot/test/lerobot_video_io_test" '[image_writer],[image_copy]'
 
-      - name: Check video producer cancellation and ownership
+      - name: Check video producer lifetime and decoder I/O restrictions
         env:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1

@@ -867,6 +867,26 @@ struct DuckDBAVIOState {
 		return AVERROR(EACCES);
 	}
 
+	AVIOContext *Attach(AVFormatContext &format) {
+		const int io_buffer_size = 64 * 1024;
+		auto io_buffer = reinterpret_cast<unsigned char *>(av_malloc(io_buffer_size));
+		if (!io_buffer) {
+			throw OutOfMemoryException("Failed to allocate FFmpeg IO buffer");
+		}
+		auto io = avio_alloc_context(io_buffer, io_buffer_size, 0, this, Read, nullptr, Seek);
+		if (!io) {
+			av_free(io_buffer);
+			throw OutOfMemoryException("Failed to allocate FFmpeg AVIO context");
+		}
+		format.pb = io;
+		format.flags |= AVFMT_FLAG_CUSTOM_IO;
+		// Custom pb only controls the main input. A demuxer can otherwise open
+		// referenced files/URLs through FFmpeg, bypassing DuckDB access checks.
+		format.opaque = this;
+		format.io_open = RejectOpen;
+		return io;
+	}
+
 	void ThrowIOError(const string &path) {
 		if (secondary_open_denied) {
 			throw PermissionException("LeRobot video '%s' cannot open external media references", path);
@@ -1038,28 +1058,11 @@ public:
 
 private:
 	void Open() {
-		const idx_t io_buffer_size = 64 * 1024;
-		auto io_buffer = reinterpret_cast<unsigned char *>(av_malloc(io_buffer_size));
-		if (!io_buffer) {
-			throw OutOfMemoryException("Failed to allocate FFmpeg IO buffer");
-		}
-		avio_context = avio_alloc_context(io_buffer, static_cast<int>(io_buffer_size), 0, &io_state,
-		                                  DuckDBAVIOState::Read, nullptr, DuckDBAVIOState::Seek);
-		if (!avio_context) {
-			av_free(io_buffer);
-			throw OutOfMemoryException("Failed to allocate FFmpeg AVIO context");
-		}
-
 		format_context = avformat_alloc_context();
 		if (!format_context) {
 			throw OutOfMemoryException("Failed to allocate FFmpeg format context");
 		}
-		format_context->pb = avio_context;
-		format_context->flags |= AVFMT_FLAG_CUSTOM_IO;
-		// Custom pb only controls the main input. A demuxer can otherwise open
-		// referenced files/URLs through FFmpeg, bypassing DuckDB access checks.
-		format_context->opaque = &io_state;
-		format_context->io_open = DuckDBAVIOState::RejectOpen;
+		avio_context = io_state.Attach(*format_context);
 		const auto format = av_find_input_format("mov");
 		if (!format) {
 			throw IOException("FFmpeg MP4/MOV demuxer is unavailable for LeRobot video '%s'", video_path);

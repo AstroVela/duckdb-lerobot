@@ -149,7 +149,7 @@ TO {quote(root / 'frames.parquet')} (FORMAT parquet);
         thread.join()
     assert requests == [], requests
     check_valid()
-    print("Video access: 6 valid MP4 reads, 12 rejected external references, zero HTTP requests")
+    print("Video access: 6 valid MP4 reads, 12 rejected playlists, zero HTTP requests")
 
 
 def main():

@@ -85,6 +85,10 @@ not legal advice.
 - `test/conformance/test_video_access.py` remuxes the generated H.264 fixture
   into temporary DASH segments and a manifest using FFmpeg. Its HTTP checks
   use only a loopback server; no third-party media or new dependency is added.
+- `test/cpp/test_video_producer.cpp` rebuilds that fixture's MOV metadata with
+  a QuickTime alias referencing a temporary copy of the same generated media.
+  The reference movie contains no usable local samples; FFmpeg supplies the
+  independent reference reader. No additional third-party media is included.
 - SQL and C++ regression fixtures are generated within their temporary test
   directories. Benchmark result JSON records measurements of synthetic data,
   not third-party media.

@@ -46,7 +46,8 @@ add_custom_target(
 
 # Include the producer implementation in the test translation unit to exercise
 # its private lifecycle with DuckDB's real Executor::CancelTasks. Keep the
-# source-only path independent of FFmpeg and of public SQL testing hooks.
+# source-only path independent of public SQL testing hooks. FFmpeg builds also
+# exercise the decoder's I/O boundary through the same implementation.
 add_executable(
   lerobot_video_producer_test
   cpp/test_video_producer.cpp
@@ -61,6 +62,18 @@ target_include_directories(
   lerobot_video_producer_test
   PRIVATE ../src/include "${DUCKDB_MODULE_BASE_DIR}/third_party/catch")
 target_link_libraries(lerobot_video_producer_test PRIVATE lerobot_test_duckdb)
+if(LEROBOT_MEDIA_LIBRARIES)
+  if(LEROBOT_MEDIA_INCLUDE_DIRS)
+    target_include_directories(lerobot_video_producer_test SYSTEM
+                               PRIVATE ${LEROBOT_MEDIA_INCLUDE_DIRS})
+  endif()
+  target_compile_definitions(
+    lerobot_video_producer_test
+    PRIVATE LEROBOT_HAVE_FFMPEG=1
+            LEROBOT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+  target_link_libraries(lerobot_video_producer_test
+                        PRIVATE ${LEROBOT_MEDIA_LIBRARIES})
+endif()
 set_target_properties(
   lerobot_video_producer_test PROPERTIES CXX_VISIBILITY_PRESET hidden
                                          VISIBILITY_INLINES_HIDDEN ON)
