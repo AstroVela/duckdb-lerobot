@@ -81,7 +81,7 @@ def check_access(duckdb, extension, ffmpeg, workspace):
             assert diagnostic not in result.stderr, result.stderr
         return result
 
-    setup = query(f"""
+    setup_sql = f"""
 COPY (SELECT 0::BIGINT AS episode_index, 1::BIGINT AS length,
   0::BIGINT AS "data/chunk_index", 0::BIGINT AS "data/file_index",
   0::BIGINT AS "videos/camera/chunk_index", 0::BIGINT AS "videos/camera/file_index",
@@ -89,7 +89,8 @@ COPY (SELECT 0::BIGINT AS episode_index, 1::BIGINT AS length,
 TO {quote(root / 'meta/episodes/routes.parquet')} (FORMAT parquet);
 COPY (SELECT 0::BIGINT AS episode_index, 0::BIGINT AS frame_index, 0.0::DOUBLE AS timestamp)
 TO {quote(root / 'frames.parquet')} (FORMAT parquet);
-""")
+"""
+    setup = query(setup_sql)
     assert setup.returncode == 0, setup.stderr
     guard = f"SET allowed_directories=[{quote(str(root) + '/')}]; SET enable_external_access=false; "
     native = query(guard + f"SELECT content FROM read_blob({quote(outside / 'init-stream0.m4s')});")
