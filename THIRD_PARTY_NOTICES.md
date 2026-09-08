@@ -82,6 +82,9 @@ not legal advice.
 - `test/conformance/test_session_settings.py` serves generated metadata and
   Parquet over loopback and reuses the generated H.264 fixture above. Its S3
   keys are public dummy values, not credentials for an external service.
+- `test/conformance/test_video_access.py` remuxes the generated H.264 fixture
+  into temporary DASH segments and a manifest using FFmpeg. Its HTTP checks
+  use only a loopback server; no third-party media or new dependency is added.
 - SQL and C++ regression fixtures are generated within their temporary test
   directories. Benchmark result JSON records measurements of synthetic data,
   not third-party media.

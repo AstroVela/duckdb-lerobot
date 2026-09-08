@@ -29,6 +29,7 @@
 #include <functional>
 #include <iomanip>
 #include <limits>
+#include <locale>
 #include <sstream>
 
 namespace duckdb {
@@ -85,6 +86,7 @@ struct LerobotFeatureStats {
 
 string JsonEscape(const string &input) {
 	std::ostringstream result;
+	result.imbue(std::locale::classic());
 	result << '"';
 	for (const auto ch : input) {
 		switch (ch) {
@@ -127,12 +129,14 @@ string JsonNumber(double value) {
 		throw InvalidInputException("LeRobot statistics cannot contain NaN or infinity");
 	}
 	std::ostringstream result;
+	result.imbue(std::locale::classic());
 	result << std::setprecision(17) << value;
 	return result.str();
 }
 
 string PadIndex(idx_t value) {
 	std::ostringstream result;
+	result.imbue(std::locale::classic());
 	result << std::setw(3) << std::setfill('0') << value;
 	return result.str();
 }
@@ -151,6 +155,7 @@ string VideoRelativePath(const string &video_key, idx_t chunk_index, idx_t file_
 
 string FrameFileName(idx_t frame_index, bool depth) {
 	std::ostringstream result;
+	result.imbue(std::locale::classic());
 	result << "frame-" << std::setw(6) << std::setfill('0') << frame_index << (depth ? ".tiff" : ".png");
 	return result.str();
 }

@@ -704,7 +704,7 @@ struct LerobotVideoTargetsBindData final : public TableFunctionData {
 idx_t FindTargetInputColumn(TableFunctionBindInput &input, const char *name) {
 	optional_idx result;
 	for (idx_t column = 0; column < input.input_table_names.size(); column++) {
-		if (input.input_table_names[column] != name) {
+		if (!StringUtil::CIEquals(input.input_table_names[column], name)) {
 			continue;
 		}
 		if (result.IsValid()) {
@@ -735,8 +735,9 @@ unique_ptr<FunctionData> LerobotVideoTargetsBind(ClientContext &context, TableFu
 	input_columns.push_back(FindTargetInputColumn(input, "video_key"));
 	input_columns.push_back(FindTargetInputColumn(input, "delta_index"));
 	if (input.input_table_types.size() == 6) {
-		if (std::find(input.input_table_names.begin(), input.input_table_names.end(), "target_id") ==
-		    input.input_table_names.end()) {
+		if (std::find_if(input.input_table_names.begin(), input.input_table_names.end(), [](const string &name) {
+			    return StringUtil::CIEquals(name, "target_id");
+		    }) == input.input_table_names.end()) {
 			throw BinderException(
 			    "lerobot_video_targets input relation must contain exactly request_id, episode_index, "
 			    "frame_index, video_key, and delta_index, with an optional target_id");
@@ -859,7 +860,17 @@ struct DuckDBAVIOState {
 		}
 	}
 
+	static int RejectOpen(AVFormatContext *context, AVIOContext **io, const char *, int, AVDictionary **) {
+		*io = nullptr;
+		auto &state = *static_cast<DuckDBAVIOState *>(context->opaque);
+		state.secondary_open_denied = true;
+		return AVERROR(EACCES);
+	}
+
 	void ThrowIOError(const string &path) {
+		if (secondary_open_denied) {
+			throw PermissionException("LeRobot video '%s' cannot open external media references", path);
+		}
 		if (!error.empty()) {
 			throw IOException("Failed to read LeRobot video '%s': %s", path, error);
 		}
@@ -869,6 +880,7 @@ struct DuckDBAVIOState {
 	int64_t size;
 	int64_t position;
 	string error;
+	bool secondary_open_denied = false;
 	LerobotVideoDecodeMetrics &metrics;
 };
 
@@ -1044,7 +1056,15 @@ private:
 		}
 		format_context->pb = avio_context;
 		format_context->flags |= AVFMT_FLAG_CUSTOM_IO;
-		auto status = avformat_open_input(&format_context, nullptr, nullptr, nullptr);
+		// Custom pb only controls the main input. A demuxer can otherwise open
+		// referenced files/URLs through FFmpeg, bypassing DuckDB access checks.
+		format_context->opaque = &io_state;
+		format_context->io_open = DuckDBAVIOState::RejectOpen;
+		const auto format = av_find_input_format("mov");
+		if (!format) {
+			throw IOException("FFmpeg MP4/MOV demuxer is unavailable for LeRobot video '%s'", video_path);
+		}
+		auto status = avformat_open_input(&format_context, nullptr, format, nullptr);
 		io_state.ThrowIOError(video_path);
 		if (status < 0) {
 			throw IOException("FFmpeg could not open LeRobot video '%s': %s", video_path, FFmpegError(status));

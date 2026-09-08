@@ -68,6 +68,21 @@ closed GOPs: LeRobot 0.6.1's default open-GOP short clips can fail its own PyAV
 random seeks at a concatenated episode boundary. The extension also emits
 closed GOPs, and this test exercises those boundary frames explicitly.
 
+`test_video_access.py` checks that media parsing cannot bypass DuckDB's file
+access policy. It disguises a DASH manifest as an MP4 shard and points it at
+generated media outside the allowed dataset directory, then at a loopback HTTP
+server. Frames, targets and windows must reject these references with both
+normal and disabled external access, without making any HTTP requests. Valid
+MP4 files inside the allowed directory must still decode before and after the
+rejections. Both FFmpeg native CI jobs run this check, including LSan in the
+sanitizer job. It requires only Python's standard library and `ffmpeg`:
+
+```bash
+python3 test/conformance/test_video_access.py \
+  --duckdb build/release/duckdb \
+  --extension build/release/extension/lerobot/lerobot.duckdb_extension
+```
+
 `test_mixed_video.py` adds a lightweight independent FFmpeg comparison using
 only the Python standard library, `ffmpeg`, and `ffprobe`. Three COPY statements
 in one process each encode two RGB cameras of different sizes alongside depth,

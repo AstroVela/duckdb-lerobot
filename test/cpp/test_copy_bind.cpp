@@ -3,6 +3,7 @@
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/uuid.hpp"
@@ -12,9 +13,11 @@
 #include "duckdb/parser/parsed_data/create_copy_function_info.hpp"
 #include "duckdb/planner/extension_callback.hpp"
 #include "function/lerobot_copy.hpp"
+#include "function/lerobot_copy_options.hpp"
 
 #include <condition_variable>
 #include <future>
+#include <locale>
 
 using namespace duckdb;
 
@@ -248,4 +251,115 @@ TEST_CASE("COPY FEATURES validation errors preserve diagnostics and release conn
 		test.CheckClean();
 	}
 	test.CheckRetry();
+}
+
+namespace {
+
+struct CommaNumbers final : std::numpunct<char> {
+	char do_decimal_point() const override {
+		return ',';
+	}
+	char do_thousands_sep() const override {
+		return '\'';
+	}
+	std::string do_grouping() const override {
+		// Group every digit to exercise file indexes with a small dataset.
+		return "\1";
+	}
+};
+
+struct ScopedCommaLocale {
+	ScopedCommaLocale() : previous(std::locale::global(std::locale(std::locale::classic(), new CommaNumbers))) {
+	}
+	~ScopedCommaLocale() {
+		std::locale::global(previous);
+	}
+	std::locale previous;
+};
+
+} // namespace
+
+TEST_CASE("COPY JSON numbers and shard names ignore the embedding application's locale", "[copy_bind][copy_locale]") {
+	CopyBindTest test;
+	test.gate->Release();
+	const auto root = test.path + "/dataset";
+	{
+		ScopedCommaLocale locale;
+		auto result = test.connection->Query(
+		    "COPY (SELECT i::BIGINT AS episode_index, 'locale test' AS task, 1.25::FLOAT AS action "
+		    "FROM range(13) r(i) ORDER BY i) TO " +
+		    Value(root).ToSQLString() +
+		    " (FORMAT lerobot, FPS 10, DATA_FILES_SIZE_IN_MB 0.000001, VIDEO_FILES_SIZE_IN_MB 0.125, "
+		    "METADATA_BUFFER_SIZE 1, FEATURES '{\"action\":{\"dtype\":\"float32\",\"shape\":[1]}}')");
+		INFO((result->HasError() ? result->GetError() : ""));
+		REQUIRE_FALSE(result->HasError());
+	}
+	REQUIRE(test.fs->FileExists(root + "/data/chunk-000/file-012.parquet"));
+	REQUIRE(test.fs->FileExists(root + "/meta/episodes/chunk-000/file-012.parquet"));
+	auto stats = test.connection->Query(
+	    "SELECT json_extract(content, '$.action.mean')::DOUBLE[], "
+	    "json_extract(content, '$.action.min')::DOUBLE[], json_extract(content, '$.action.max')::DOUBLE[] "
+	    "FROM read_text(" +
+	    Value(root + "/meta/stats.json").ToSQLString() + ")");
+	INFO((stats->HasError() ? stats->GetError() : ""));
+	REQUIRE_FALSE(stats->HasError());
+	for (idx_t column = 0; column < 3; column++) {
+		REQUIRE(stats->GetValue(column, 0) == Value::LIST(LogicalType::DOUBLE, {Value::DOUBLE(1.25)}));
+	}
+	auto info = test.connection->Query("SELECT data_files_size_in_mb, video_files_size_in_mb FROM read_json_auto(" +
+	                                   Value(root + "/meta/info.json").ToSQLString() + ")");
+	INFO((info->HasError() ? info->GetError() : ""));
+	REQUIRE_FALSE(info->HasError());
+	REQUIRE(info->GetValue(0, 0).GetValue<double>() == 0.000001);
+	REQUIRE(info->GetValue(1, 0).GetValue<double>() == 0.125);
+}
+
+TEST_CASE("COPY index options preserve the full unsigned integer range", "[copy_bind][copy_options]") {
+	const auto value = GENERATE(uint64_t(1), uint64_t(9007199254740993ULL), NumericLimits<uint64_t>::Maximum() - 1,
+	                            NumericLimits<uint64_t>::Maximum());
+	CAPTURE(value);
+	CopyBindTest test;
+	test.gate->Release();
+	CopyInfo info;
+	info.options["chunks_size"] = {Value::UBIGINT(value)};
+	info.options["metadata_buffer_size"] = {Value::UBIGINT(value)};
+	auto function = LerobotCopyFunction::Create();
+	CopyFunctionBindInput input(info, function.function_info);
+	LerobotCopyConfig config;
+	if (value > NumericLimits<idx_t>::Maximum()) {
+		REQUIRE_THROWS_AS(ParseLerobotCopyOptionalConfig(*test.connection->context, input, config), BinderException);
+		return;
+	}
+	ParseLerobotCopyOptionalConfig(*test.connection->context, input, config);
+	REQUIRE(config.chunks_size == value);
+	REQUIRE(config.metadata_buffer_size == value);
+	// Exercise the SQL option binder and serialized info.json as well.
+	auto sql = test.SQL();
+	sql.pop_back();
+	sql += ", CHUNKS_SIZE " + std::to_string(value) + ", METADATA_BUFFER_SIZE " + std::to_string(value) + ")";
+	auto copied = test.connection->Query(sql);
+	INFO((copied->HasError() ? copied->GetError() : ""));
+	REQUIRE_FALSE(copied->HasError());
+	auto stored = test.connection->Query("SELECT chunks_size::UBIGINT FROM read_json_auto(" +
+	                                     Value(test.path + "/dataset/meta/info.json").ToSQLString() + ")");
+	INFO((stored->HasError() ? stored->GetError() : ""));
+	REQUIRE_FALSE(stored->HasError());
+	REQUIRE(stored->GetValue(0, 0).GetValue<uint64_t>() == value);
+}
+
+TEST_CASE("COPY index options retain defaults and reject zero", "[copy_bind][copy_options]") {
+	CopyBindTest test;
+	CopyInfo info;
+	auto function = LerobotCopyFunction::Create();
+	CopyFunctionBindInput input(info, function.function_info);
+	LerobotCopyConfig config;
+	ParseLerobotCopyOptionalConfig(*test.connection->context, input, config);
+	REQUIRE(config.chunks_size == 1000);
+	REQUIRE(config.metadata_buffer_size == 10);
+	for (const auto name : {"chunks_size", "metadata_buffer_size", "max_visual_frame_bytes"}) {
+		CAPTURE(name);
+		info.options.clear();
+		info.options[name] = {Value::UBIGINT(0)};
+		REQUIRE_THROWS_AS(ParseLerobotCopyOptionalConfig(*test.connection->context, input, config), BinderException);
+	}
 }
