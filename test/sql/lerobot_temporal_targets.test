@@ -317,3 +317,36 @@ FROM lerobot_temporal_targets(
 );
 ----
 input relation must contain exactly request_id, episode_index, frame_index, and delta_index
+
+# Relation column identifiers follow DuckDB's case-insensitive rules, including
+# quoted names, reordered columns and the optional caller-supplied identity.
+query III
+SELECT request_id, target_frame_index, delta_index
+FROM lerobot_temporal_targets(
+    '{TEST_DIR}/lerobot_temporal',
+    (SELECT 1 AS "FRAME_INDEX", 7 AS REQUEST_ID, 0 AS "EPISODE_INDEX",
+            0 AS DELTA_INDEX)
+);
+----
+7	1	0
+
+query IIII
+SELECT target_id, request_id, target_frame_index, delta_index
+FROM lerobot_temporal_targets(
+    '{TEST_DIR}/lerobot_temporal',
+    (SELECT 42 AS "TaRgEt_Id", 0 AS "DeLtA_InDeX", 1 AS "FrAmE_InDeX",
+            0 AS "EpIsOdE_InDeX", 7 AS "ReQuEsT_Id")
+);
+----
+42	7	1	0
+
+# The optional column alone can differ in case.
+query I
+SELECT target_id
+FROM lerobot_temporal_targets(
+    '{TEST_DIR}/lerobot_temporal',
+    (SELECT 42 AS TARGET_ID, 7 AS request_id, 0 AS episode_index,
+            0 AS frame_index, 0 AS delta_index)
+);
+----
+42

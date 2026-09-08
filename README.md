@@ -61,6 +61,10 @@ shards are encountered than can remain open. Results are small Arrow-compatible
 batches of interleaved RGB24 or single-channel float32 depth bytes, not Python
 image objects.
 
+Video shards must be self-contained MP4/MOV files. Decoding rejects playlists
+and references to additional files or URLs; every shard is opened through
+DuckDB's filesystem and remains subject to its access settings.
+
 Native dataset creation is available through DuckDB's COPY surface. `FORMAT
 lerobot` delegates data, episode metadata, and task tables to DuckDB's native
 Parquet writer, while the extension owns LeRobot's episode boundaries, shard

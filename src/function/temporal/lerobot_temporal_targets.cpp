@@ -141,7 +141,7 @@ double GetToleranceParameter(TableFunctionBindInput &input) {
 idx_t FindInputColumn(TableFunctionBindInput &input, const char *name) {
 	optional_idx result;
 	for (idx_t column = 0; column < input.input_table_names.size(); column++) {
-		if (input.input_table_names[column] != name) {
+		if (!StringUtil::CIEquals(input.input_table_names[column], name)) {
 			continue;
 		}
 		if (result.IsValid()) {
@@ -172,8 +172,9 @@ unique_ptr<FunctionData> LerobotTemporalTargetsBind(ClientContext &context, Tabl
 	input_columns.push_back(FindInputColumn(input, "frame_index"));
 	input_columns.push_back(FindInputColumn(input, "delta_index"));
 	if (input.input_table_types.size() == 5) {
-		if (std::find(input.input_table_names.begin(), input.input_table_names.end(), "target_id") ==
-		    input.input_table_names.end()) {
+		if (std::find_if(input.input_table_names.begin(), input.input_table_names.end(), [](const string &name) {
+			    return StringUtil::CIEquals(name, "target_id");
+		    }) == input.input_table_names.end()) {
 			throw BinderException(
 			    "lerobot_temporal_targets input relation must contain exactly request_id, episode_index, "
 			    "frame_index, and delta_index, with an optional target_id");

@@ -46,6 +46,21 @@ T GetNumericOption(const CopyFunctionBindInput &input, const char *name, T defau
 	return value.DefaultCastAs(LogicalType::DOUBLE).GetValue<T>();
 }
 
+idx_t GetPositiveIndexOption(const CopyFunctionBindInput &input, const char *name, idx_t default_value) {
+	const auto &option = GetSingleOption(input, name, false);
+	if (option.IsNull()) {
+		return default_value;
+	}
+	// UBIGINT options must never pass through DOUBLE: values above 2^53
+	// lose precision, and UINT64_MAX rounds outside the integer's range.
+	const auto value = option.DefaultCastAs(LogicalType::UBIGINT).GetValue<uint64_t>();
+	if (value == 0 || value > NumericLimits<idx_t>::Maximum()) {
+		throw BinderException("LeRobot %s must be a positive integer within the supported index range",
+		                      StringUtil::Upper(name));
+	}
+	return static_cast<idx_t>(value);
+}
+
 } // namespace
 
 LerobotCopyConfig ParseLerobotCopyRequiredConfig(const CopyFunctionBindInput &input) {
@@ -130,39 +145,19 @@ void ParseLerobotCopyOptionalConfig(ClientContext &context, const CopyFunctionBi
 			throw BinderException("LeRobot depth parameters are not representable in float32 metres and millimetres");
 		}
 	}
-	auto chunks_size = GetNumericOption<double>(input, "chunks_size", LEROBOT_DEFAULT_CHUNK_SIZE);
-	auto metadata_buffer_size =
-	    GetNumericOption<double>(input, "metadata_buffer_size", LEROBOT_DEFAULT_METADATA_BUFFER_SIZE);
+	result.chunks_size = GetPositiveIndexOption(input, "chunks_size", LEROBOT_DEFAULT_CHUNK_SIZE);
+	result.metadata_buffer_size =
+	    GetPositiveIndexOption(input, "metadata_buffer_size", LEROBOT_DEFAULT_METADATA_BUFFER_SIZE);
 	result.data_file_size_mb =
 	    GetNumericOption<double>(input, "data_files_size_in_mb", LEROBOT_DEFAULT_DATA_FILE_SIZE_MB);
 	result.video_file_size_mb =
 	    GetNumericOption<double>(input, "video_files_size_in_mb", LEROBOT_DEFAULT_VIDEO_FILE_SIZE_MB);
-	if (chunks_size <= 0 || std::floor(chunks_size) != chunks_size) {
-		throw BinderException("LeRobot CHUNKS_SIZE must be a positive integer");
-	}
-	if (metadata_buffer_size <= 0 || std::floor(metadata_buffer_size) != metadata_buffer_size) {
-		throw BinderException("LeRobot METADATA_BUFFER_SIZE must be a positive integer");
-	}
 	if (!std::isfinite(result.data_file_size_mb) || !std::isfinite(result.video_file_size_mb) ||
 	    !(result.data_file_size_mb > 0) || !(result.video_file_size_mb > 0)) {
 		throw BinderException("LeRobot data and video file size limits must be positive");
 	}
-	if (chunks_size > static_cast<double>(NumericLimits<idx_t>::Maximum()) ||
-	    metadata_buffer_size > static_cast<double>(NumericLimits<idx_t>::Maximum())) {
-		throw BinderException("LeRobot chunk or metadata buffer size is too large");
-	}
-	result.chunks_size = static_cast<idx_t>(chunks_size);
-	result.metadata_buffer_size = static_cast<idx_t>(metadata_buffer_size);
-
-	result.max_visual_frame_bytes = LEROBOT_DEFAULT_MAX_VISUAL_FRAME_BYTES;
-	const auto &max_visual_frame_bytes = GetSingleOption(input, "max_visual_frame_bytes", false);
-	if (!max_visual_frame_bytes.IsNull()) {
-		auto value = max_visual_frame_bytes.DefaultCastAs(LogicalType::UBIGINT).GetValue<uint64_t>();
-		if (value == 0 || value > NumericLimits<idx_t>::Maximum()) {
-			throw BinderException("LeRobot MAX_VISUAL_FRAME_BYTES must be a positive integer");
-		}
-		result.max_visual_frame_bytes = static_cast<idx_t>(value);
-	}
+	result.max_visual_frame_bytes =
+	    GetPositiveIndexOption(input, "max_visual_frame_bytes", LEROBOT_DEFAULT_MAX_VISUAL_FRAME_BYTES);
 
 	const auto &encoder_threads = GetSingleOption(input, "encoder_threads", false);
 	if (!encoder_threads.IsNull()) {
