@@ -19,10 +19,12 @@ concurrency:
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    uses: ./.github/workflows/_extension_distribution.yml
     with:
       duckdb_version: d8cdaa33fda8df955cc76ef58a280f68f4cd43fa
       ci_tools_version: v1.5-variegata
+      # Build dependencies from source so the bundle contains the exact inputs.
+      vcpkg_binary_sources: clear
       extension_name: lerobot
       exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
       extra_toolchains: 'multimedia'
@@ -36,3 +38,47 @@ jobs:
       ci_tools_version: v1.5-variegata
       extension_name: lerobot
       format_checks: 'format'
+
+  source-rebuild:
+    name: Rebuild Linux artifact with modified FFmpeg
+    needs: duckdb-stable-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: lerobot-d8cdaa33fda8df955cc76ef58a280f68f4cd43fa-extension-linux_amd64
+          path: artifact
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake ninja-build nasm pkg-config python3
+
+      - name: Verify and unpack corresponding source
+        working-directory: artifact/release
+        run: |
+          sha256sum -c SHA256SUMS
+          mkdir unpacked
+          tar -xzf lerobot-source.tar.gz -C unpacked
+          python3 unpacked/rebuild.py --verify-only
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          expected = json.loads(Path('distribution-manifest.json').read_text())['extension_sha256']
+          assert hashlib.sha256(Path('../lerobot.duckdb_extension').read_bytes()).hexdigest() == expected
+          PY
+
+      - name: Modify FFmpeg, rebuild, relink, and run portable tests
+        run: |
+          python3 artifact/release/unpacked/rebuild.py \
+            --work-dir "$RUNNER_TEMP/lerobot-rebuild" \
+            --ffmpeg-patch artifact/release/unpacked/source/test/licensing/ffmpeg-relink.patch --jobs 4
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          report = json.loads((Path(os.environ['RUNNER_TEMP']) / 'lerobot-rebuild/build/lerobot-ffmpeg-license.json').read_text())
+          assert any(lib['name'] == 'libavutil' and '--lerobot-relink-test' in lib['configuration'] for lib in report['libraries'])
+          extension = Path(os.environ['RUNNER_TEMP']) / 'lerobot-rebuild/build/extension/lerobot/lerobot.duckdb_extension'
+          assert b'--lerobot-relink-test' in extension.read_bytes()
+          PY

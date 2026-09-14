@@ -28,8 +28,11 @@ def main():
         source = (Path(entry["directory"]) / entry["file"]).resolve()
         # Both static and loadable extension commands exist. Analyze once,
         # using the static target's real FFmpeg-enabled compiler arguments.
+        # The standalone license probe also lives in src and links FFmpeg.
         command = entry.get("command", " ".join(entry.get("arguments", [])))
-        if source in sources and "lerobot_extension.dir/" in command:
+        if source in sources and any(
+            target in command for target in ("lerobot_extension.dir/", "lerobot_ffmpeg_license_probe.dir/")
+        ):
             selected[source] = entry
     missing = sources - selected.keys()
     if not sources or missing:

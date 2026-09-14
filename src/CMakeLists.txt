@@ -108,12 +108,17 @@ if(LEROBOT_MEDIA_LIBRARIES)
     target_link_options(lerobot_loadable_extension PRIVATE "LINKER:-Bsymbolic")
   endif()
   message(STATUS "LeRobot native FFmpeg video read/write support enabled")
+  include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/lerobot_distribution.cmake)
 elseif(LEROBOT_ENABLE_FFMPEG)
   message(
     FATAL_ERROR
       "LEROBOT_ENABLE_FFMPEG=ON requires the libavformat, libavcodec, "
       "libavutil, and libswscale development packages")
 else()
+  if(LEROBOT_PACKAGE_RELEASE)
+    message(
+      FATAL_ERROR "The default distribution requires LEROBOT_ENABLE_FFMPEG=ON")
+  endif()
   message(
     STATUS
       "LeRobot native FFmpeg video read/write support disabled by LEROBOT_ENABLE_FFMPEG=OFF"
