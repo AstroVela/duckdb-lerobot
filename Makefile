@@ -3,6 +3,10 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 EXT_NAME=lerobot
 EXT_CONFIG=$(PROJ_DIR)extension_config.cmake
 
+ifeq ($(LEROBOT_PACKAGE_RELEASE),1)
+override EXT_FLAGS += -DLEROBOT_PACKAGE_RELEASE=ON
+endif
+
 # GITHUB_PATH only affects later Actions steps. Export the same install path
 # here so commands in this make invocation can also find NASM after setup.
 ifeq ($(shell uname -s),Darwin)

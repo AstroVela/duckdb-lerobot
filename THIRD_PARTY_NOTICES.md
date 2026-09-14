@@ -17,25 +17,29 @@ Python distribution remain subject to that distribution's own notices.
 
 ## Optional native multimedia dependencies
 
-The extension discovers the four FFmpeg libraries with `pkg-config`. Codec
-implementations are supplied by that FFmpeg build rather than linked or
-discovered separately by this repository; none of their source is vendored.
+Development builds discover the four FFmpeg libraries with `pkg-config`.
+Default distribution builds use the pinned vcpkg manifest and statically link
+FFmpeg with libaom, dav1d, and zlib. The release source bundle includes the exact
+dependency sources, recipes, patches, and installed license texts in `licenses/`;
+see [redistribution and relinking](docs/redistribution.md).
 
 - **FFmpeg** (`libavformat`, `libavcodec`, `libavutil`, and `libswscale`) is
   primarily LGPL-2.1-or-later, but an FFmpeg build becomes GPL when GPL
   components are enabled. Binary distributors must inspect the exact FFmpeg
   configuration they link and satisfy that build's license.
-- **SVT-AV1** (`libsvtav1`) is the current RGB encoder used by the writer when
+- **SVT-AV1** (`libsvtav1`) is an optional RGB encoder used by the writer when
   FFmpeg exposes it. Older releases use BSD-2-Clause and current releases use
   BSD-3-Clause-Clear; both also include the Alliance for Open Media Patent
   License 1.0. Binary distributors must inspect the selected version.
 - **x265** is GPL-2.0-or-later (or available under separate commercial terms)
-  and is the current depth encoder. A build that enables or links x265 is not
+  and is the optional depth encoder. It is excluded from the default manifest
+  and enabled explicitly through `gpl-codecs`. A build that enables or links x265 is not
   an LGPL-only FFmpeg distribution.
 - FFmpeg builds may use **libaom** (BSD-2-Clause plus the Alliance for Open
   Media Patent License 1.0), **dav1d** (BSD-2-Clause plus the Alliance for Open
   Media Patent License 1.0), and **zlib** (Zlib) depending on the distributor's
-  configuration.
+  configuration. These three libraries are included in the default release;
+  SVT-AV1 and x265 are not.
 
 See <https://ffmpeg.org/legal.html> and the package-specific license files for
 the configuration being distributed. This inventory is informational and is

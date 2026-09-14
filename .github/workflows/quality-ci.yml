@@ -136,7 +136,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DDISABLE_UNITY=ON \
             -DDUCKDB_EXTENSION_CONFIGS="$PWD/extension_config.cmake" \
             -DOVERRIDE_GIT_DESCRIBE=v1.5.5-0-gd8cdaa33fd \
-            -DENABLE_SANITIZER=OFF -DENABLE_UBSAN=OFF -DLEROBOT_ENABLE_FFMPEG=ON
+            -DENABLE_SANITIZER=OFF -DENABLE_UBSAN=OFF \
+            -DLEROBOT_ENABLE_FFMPEG=ON -DLEROBOT_ALLOW_GPL=ON
       - name: Check every extension source file
         run: python3 test/quality/run_tidy.py --build-dir build/tidy
       - name: Preserve analysis diagnostics

@@ -17,6 +17,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  licensing-tests:
+    name: Release source and licensing checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s test/licensing -v
+
   native-tests:
     name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
@@ -46,6 +53,7 @@ jobs:
             rgb_codec: libaom-av1
             cmake_options: >-
               -DLEROBOT_ENABLE_FFMPEG=ON
+              -DLEROBOT_ALLOW_GPL=ON
               -DLEROBOT_AV1_ENCODER=libaom
               -DENABLE_SANITIZER=OFF
               -DENABLE_UBSAN=OFF
@@ -59,6 +67,7 @@ jobs:
             rgb_codec: libsvtav1
             cmake_options: >-
               -DLEROBOT_ENABLE_FFMPEG=ON
+              -DLEROBOT_ALLOW_GPL=ON
               -DLEROBOT_AV1_ENCODER=svt
               -DFORCE_ASSERT=ON
               -DENABLE_SANITIZER=ON
@@ -254,6 +263,19 @@ jobs:
             grep -q -- '-fsanitize=address' "${BUILD_DIR}/compile_commands.json"
             grep -q -- '-fsanitize=undefined' "${BUILD_DIR}/compile_commands.json"
           fi
+
+      - name: Verify system GPL FFmpeg needs explicit opt-in
+        if: matrix.ffmpeg
+        env:
+          BUILD_DIR: ${{ matrix.build_dir }}
+        run: |
+          probe="${BUILD_DIR}/extension/lerobot/src/lerobot_ffmpeg_license_probe"
+          if "${probe}" > "${BUILD_DIR}/rejected-license.json" 2> "${BUILD_DIR}/rejected-license.log"; then
+            echo 'Expected the system GPL FFmpeg build to be rejected by default'
+            exit 1
+          fi
+          grep -q 'rejected FFmpeg build' "${BUILD_DIR}/rejected-license.log"
+          "${probe}" --allow-gpl
 
       - name: Verify release-gate inputs
         if: matrix.id == 'release-no-ffmpeg'

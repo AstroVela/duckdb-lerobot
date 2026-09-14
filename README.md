@@ -590,9 +590,17 @@ manifest enables FFmpeg, dav1d, libaom, and zlib (required by the PNG encoder)
 without GPL codecs. Ninja and, on x86/x64, NASM must be available on `PATH`:
 
 ```bash
-make release GEN=ninja \
+VCPKG_BINARY_SOURCES=clear make release GEN=ninja LEROBOT_PACKAGE_RELEASE=1 \
+  VCPKG_TARGET_TRIPLET=x64-linux-release \
   VCPKG_TOOLCHAIN_PATH=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
 ```
+
+Use vcpkg at the manifest's `builtin-baseline` and choose the static triplet for
+your platform. The distribution build checks the actual linked FFmpeg license
+and creates a `release/` directory next to the extension with the corresponding
+source, dependency licenses, checksums, and a rebuild script. Publish that
+directory together with the binary. See [redistribution and relinking](docs/redistribution.md)
+for the package contents and how to rebuild with a modified FFmpeg.
 
 To opt into lossless HEVC depth-video writing, explicitly enable the
 `gpl-codecs` manifest feature. Binaries produced this way include GPL-enabled
@@ -620,12 +628,16 @@ video decoding are enabled by default, and configuration fails unless
 sudo apt-get install pkg-config libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
 ```
 
+System FFmpeg packages commonly enable GPL components. Builds reject those by
+default; explicitly use `EXT_FLAGS="-DLEROBOT_ALLOW_GPL=ON"` for such development
+builds. That option cannot be combined with default release packaging.
+
 Use `EXT_FLAGS="-DLEROBOT_ENABLE_FFMPEG=OFF"` for an intentional metadata-only
 build. The complete visual suite additionally requires FFmpeg with libaom,
 SVT-AV1, and x265:
 
 ```bash
-make release
+make release EXT_FLAGS="-DLEROBOT_ALLOW_GPL=ON"
 LEROBOT_FFMPEG_TESTS=1 make test
 ```
 
@@ -646,7 +658,7 @@ for example:
 
 ```bash
 make reldebug GEN=ninja \
-  EXT_FLAGS="-DLEROBOT_ENABLE_FFMPEG=ON -DFORCE_ASSERT=ON -DENABLE_SANITIZER=ON -DENABLE_UBSAN=ON"
+  EXT_FLAGS="-DLEROBOT_ENABLE_FFMPEG=ON -DLEROBOT_ALLOW_GPL=ON -DFORCE_ASSERT=ON -DENABLE_SANITIZER=ON -DENABLE_UBSAN=ON"
 LEROBOT_FFMPEG_TESTS=1 make test_reldebug
 ```
 

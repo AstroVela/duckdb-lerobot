@@ -1,0 +1,22 @@
+--- a/libavutil/version.c
++++ b/libavutil/version.c
+@@ -46,7 +46,7 @@
+ 
+ const char *avutil_configuration(void)
+ {
+-    return FFMPEG_CONFIGURATION;
++    return FFMPEG_CONFIGURATION " --lerobot-relink-test";
+ }
+ 
+ const char *avutil_license(void)
+--- a/libavutil/frame.c
++++ b/libavutil/frame.c
+@@ -151,7 +151,8 @@
+ {
+     AVFrame *frame = av_malloc(sizeof(*frame));
+ 
++    av_log(NULL, AV_LOG_DEBUG, "--lerobot-relink-test\n");
+     if (!frame)
+         return NULL;
+ 
+     get_frame_defaults(frame);
