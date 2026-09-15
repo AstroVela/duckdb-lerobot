@@ -8,10 +8,10 @@ training, DataLoader throughput, network I/O or GPU decoding.
 
 | Config | Engines | Delivered output |
 | :--- | :--- | :--- |
-| `video-read.toml` | DuckDB, Daft, upstream LeRobot / TorchCodec | Ordered contiguous RGB uint8 HWC NumPy arrays |
-| `tensor-batch.toml` | DuckDB / FFmpeg, DuckDB / TorchCodec | Contiguous CPU uint8 NCHW Torch batches, batch size 32 |
+| `video-read.toml` | duckdb-lerobot, duckdb-lerobot / TorchCodec, Daft, LeRobot / TorchCodec | Ordered contiguous RGB uint8 HWC NumPy arrays |
+| `tensor-batch.toml` (optional) | Both duckdb-lerobot paths | Contiguous CPU uint8 NCHW Torch batches, batch size 32 |
 | `smoke.toml` | Both tensor paths | Tiny generated fixture, correctness only |
-| `smoke-video.toml` | All three video readers | Same tiny fixture, correctness only |
+| `smoke-video.toml` | All four video readers | Same tiny fixture, correctness only |
 
 The full configs run sequential reads of 16, 100 and 632 frame rows, a seeded
 100-row random read, and a 96-row random read across three video files. Requests
@@ -22,48 +22,35 @@ every configured camera. Both random cases span episode boundaries.
 
 Measured on 2026-09-15: Linux, Xeon E5-2686 v4, CPU affinity 0–7, eight
 threads, local `pepijn223/egodex-test` (632 frames, one 1080p AV1 camera).
-Values are **median seconds (IQR)** for the entire case over five measured runs
-after a separate first call and one warmup; lower is better. For example,
-`sequential-632` at `11.374 (0.205)` means all 632 frames took a median of
-11.374 seconds, with a 0.205-second gap between the 75th and 25th percentiles.
-OS caches were retained. Every requested frame key, order, shape and pixel hash
-matched across engines within each workload.
-
-### Video reads
-
-Contiguous RGB uint8 HWC NumPy arrays, including Python transfer, reordering
-and conversion. DuckDB 1.5.5, Daft 0.7.25, LeRobot 0.6.1 / TorchCodec 0.10.0.
-
-| Case | duckdb-lerobot | Daft | LeRobot / TorchCodec |
-| :--- | ---: | ---: | ---: |
-| sequential-16 | 0.357 (0.091) | 0.692 (0.017) | 0.476 (0.062) |
-| sequential-100 | 1.341 (0.389) | 3.693 (0.048) | 2.375 (0.153) |
-| sequential-632 | 11.374 (0.205) | 22.074 (1.182) | 14.623 (0.025) |
-| random-100 | 4.654 (0.441) | 4.152 (0.030) | 2.845 (0.158) |
-| multi-file-96 | 4.630 (0.235) | 3.783 (0.085) | 2.946 (0.047) |
-
-### Torch batches
-
-Both columns use duckdb-lerobot and deliver contiguous CPU uint8 NCHW tensors,
-batch size 32, including transfer, conversion and stacking. DuckDB 1.5.5,
+All four paths deliver ordered, contiguous RGB uint8 HWC NumPy arrays, including
+Python transfer, reordering and conversion. TorchCodec tensor-to-NumPy conversion
+is included in the timed interval. DuckDB 1.5.5, Daft 0.7.25, LeRobot 0.6.1,
 PyTorch 2.10.0 CPU, TorchCodec 0.10.0.
 
-| Case | DuckDB / FFmpeg → Torch | DuckDB / TorchCodec |
-| :--- | ---: | ---: |
-| sequential-16 | 0.296 (0.001) | 0.194 (0.002) |
-| sequential-100 | 1.600 (0.177) | 1.271 (0.119) |
-| sequential-632 | 11.332 (1.000) | 7.752 (0.090) |
-| random-100 | 4.450 (0.073) | 1.840 (0.039) |
-| multi-file-96 | 4.529 (0.579) | 1.671 (0.017) |
+Values are **median seconds (IQR)** for the entire case over five measured runs
+after a separate first call and one warmup; lower is better. For example,
+`sequential-632` at `11.243 (0.483)` means all 632 frames took a median of
+11.243 seconds, with a 0.483-second gap between the 75th and 25th percentiles.
+OS caches were retained. Every requested frame key, order, shape and pixel hash
+matched across all four paths.
 
-In this run, DuckDB was fastest for sequential video reads; upstream LeRobot
-was fastest for random and derived multi-file reads. DuckDB / TorchCodec was
-faster in all five tensor cases. The multi-file fixture uses copies of the same
-source video as described below.
+| Case | duckdb-lerobot | duckdb-lerobot / TorchCodec | Daft | LeRobot / TorchCodec |
+| :--- | ---: | ---: | ---: | ---: |
+| sequential-16 | 0.346 (0.088) | 0.201 (0.016) | 0.732 (0.055) | 0.471 (0.053) |
+| sequential-100 | 1.565 (0.431) | 1.058 (0.094) | 3.807 (0.054) | 2.456 (0.176) |
+| sequential-632 | 11.243 (0.483) | 6.555 (0.091) | 20.961 (0.626) | 14.443 (0.138) |
+| random-100 | 4.586 (0.242) | 1.556 (0.097) | 4.171 (0.126) | 2.787 (0.147) |
+| multi-file-96 | 4.655 (0.250) | 1.516 (0.040) | 3.808 (0.075) | 2.761 (0.016) |
 
-Measured suite: [`f405025`](https://github.com/AstroVela/duckdb-lerobot/tree/f40502526347b4225136908adf97a85a2d495543/benchmarks).
+The two DuckDB columns use the extension's SQL FFmpeg decoder and the optional
+Python `TorchCodecReader`, respectively. All four columns were measured in the
+same run. The multi-file fixture uses copies of the same source video as
+described below. In this run, duckdb-lerobot / TorchCodec had the lowest median
+in each of the five cases.
+
+Measured suite: [`2e7111f`](https://github.com/AstroVela/duckdb-lerobot/tree/2e7111f8dfb90079b4c2318defb5673119feac84/benchmarks).
 Extension source: `93fd1237348cc616646298367fc37e86129eff6a`.
-The tables were generated from the validated reports with `report.py`; raw
+The table was generated from the validated report with `report.py`; raw
 samples and per-frame hashes remain outside the source tree.
 
 ## Setup
@@ -116,8 +103,10 @@ python3 benchmarks/report.py build/benchmarks/video-read/results.json \
   --output build/benchmarks/video-read/report.md
 ```
 
-For the tensor comparison, change the config to `tensor-batch.toml` and output
-to `build/benchmarks/tensor-batch`. For a distribution artifact, use
+The optional `tensor-batch.toml` workload delivers Torch batches instead of
+NumPy arrays; run it with output `build/benchmarks/tensor-batch` for separate
+batch diagnostics. The published table uses `video-read.toml` for every column.
+For a distribution artifact, use
 `--extension-manifest /path/to/distribution-manifest.json` instead of
 `--extension-commit`: the runner verifies its binary hash and records the
 compiler, build settings, FFmpeg libraries and exact source revision.
@@ -140,8 +129,11 @@ and IQR; raw samples and the first-call measurements remain in `results.json`.
   engine selection/routing, decoding, transfer to Python, reordering, conversion
   and delivery of the stated contiguous output. Batch consumption and lightweight
   shape/order checks are included. No resize, float normalization or augmentation.
-- DuckDB fetches actual RGB BLOBs into Python. Daft creates and collects a fresh
-  lazy plan each time. LeRobot 0.6.1 uses its unmodified public `__getitem__` with
+- duckdb-lerobot fetches actual RGB BLOBs into Python. duckdb-lerobot / TorchCodec
+  uses SQL metadata routing followed by `TorchCodecReader.batches`; its CHW
+  tensors pass through the same HWC NumPy conversion as upstream LeRobot.
+  Daft creates and collects a fresh lazy plan each time. LeRobot 0.6.1 uses its
+  unmodified public `__getitem__` with
   `return_uint8=True` and TorchCodec; the suite does not patch upstream methods.
 - Configs request eight engine/Torch threads and set OMP, MKL, OpenBLAS and Rayon
   limits. DuckDB FFmpeg and the optional reader use one thread per decoder.
@@ -161,7 +153,7 @@ remain accessible through Git history and are not comparable to this output cont
 
 Native CI runs unit checks and the tiny tensor smoke workload (sequential,
 random and multi-file), uploads its evidence, and applies no performance threshold.
-Run `smoke-video.toml` locally to check all three readers. Full performance runs
+Run `smoke-video.toml` locally to check all four readers. Full performance runs
 belong on an idle, fixed machine rather than shared PR runners.
 
 ## Other experiments

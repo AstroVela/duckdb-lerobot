@@ -127,18 +127,20 @@ clamped to its boundary and marked with `is_padding`.
 ## Benchmark
 
 Local CPU video reads into contiguous RGB uint8 NumPy arrays, including Python
-transfer and conversion. DuckDB 1.5.5, Daft 0.7.25, LeRobot 0.6.1 / TorchCodec 0.10.0.
+transfer and conversion. The DuckDB columns use the SQL FFmpeg decoder and the
+optional [TorchCodec adapter](python/README.md), respectively. DuckDB 1.5.5,
+Daft 0.7.25, LeRobot 0.6.1, TorchCodec 0.10.0.
 Median seconds over five measured runs; lower is better.
 
 <!-- benchmark-table:start -->
 
-| Case | duckdb-lerobot | Daft | LeRobot / TorchCodec |
-| :--- | ---: | ---: | ---: |
-| sequential-16 | 0.357 | 0.692 | 0.476 |
-| sequential-100 | 1.341 | 3.693 | 2.375 |
-| sequential-632 | 11.374 | 22.074 | 14.623 |
-| random-100 | 4.654 | 4.152 | 2.845 |
-| multi-file-96 | 4.630 | 3.783 | 2.946 |
+| Case | duckdb-lerobot | duckdb-lerobot / TorchCodec | Daft | LeRobot / TorchCodec |
+| :--- | ---: | ---: | ---: | ---: |
+| sequential-16 | 0.346 | 0.201 | 0.732 | 0.471 |
+| sequential-100 | 1.565 | 1.058 | 3.807 | 2.456 |
+| sequential-632 | 11.243 | 6.555 | 20.961 | 14.443 |
+| random-100 | 4.586 | 1.556 | 4.171 | 2.787 |
+| multi-file-96 | 4.655 | 1.516 | 3.808 | 2.761 |
 
 <!-- benchmark-table:end -->
 
@@ -146,7 +148,7 @@ Dataset: `pepijn223/egodex-test`, 632 frames, one 1080p AV1 camera.
 Linux / Xeon E5-2686 v4, eight pinned CPUs; one warmup after a separate first
 call, OS cache retained. Frame keys, shapes and pixels are checked across engines.
 [Reproduce the benchmarks](benchmarks/README.md) for the pinned dataset, methodology,
-random/multi-file cases and the separate Torch tensor batch comparison.
+random/multi-file cases and full results with timing variation.
 
 ## License
 

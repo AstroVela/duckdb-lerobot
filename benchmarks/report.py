@@ -17,10 +17,10 @@ from benchmarks.common import (
 )  # noqa: E402
 
 LABELS = {
-    "duckdb": "DuckDB / FFmpeg",
+    "duckdb": "duckdb-lerobot",
+    "torchcodec": "duckdb-lerobot / TorchCodec",
     "daft": "Daft",
     "lerobot": "LeRobot / TorchCodec",
-    "torchcodec": "DuckDB / TorchCodec",
 }
 
 
@@ -101,8 +101,13 @@ def validate(result, root):
                 raise ValueError("measured output counters differ from validation")
 
 
+def display_engines(result):
+    """Keep presentation order independent of the recorded run configuration."""
+    return sorted(result["config"]["engines"], key=list(LABELS).index)
+
+
 def table(result, compact=False):
-    engines = result["config"]["engines"]
+    engines = display_engines(result)
     headers = [LABELS[engine] for engine in engines]
     lines = [
         "| Case | " + " | ".join(headers) + " |",
@@ -147,7 +152,7 @@ def render(result):
         "| Engine | Packages |",
         "| :--- | :--- |",
     ]
-    for engine in config["engines"]:
+    for engine in display_engines(result):
         packages = result["cases"][0]["engines"][engine]["environment"]["packages"]
         names = (
             "duckdb",

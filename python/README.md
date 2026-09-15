@@ -81,9 +81,10 @@ LEROBOT_EXTENSION="$PWD/build/release/extension/lerobot/lerobot.duckdb_extension
   pytest python/tests
 ```
 
-The [tensor batch benchmark](../benchmarks/README.md#run) compares SQL FFmpeg
-and SQL → TorchCodec through contiguous uint8 NCHW batches, including Python
-transfer, conversion and batch assembly.
+The [video-read benchmark](../benchmarks/README.md#results) compares this adapter,
+SQL FFmpeg, Daft and upstream LeRobot through the same contiguous RGB uint8
+NumPy output, including transfer and conversion. `tensor-batch.toml` is an
+optional comparison of the two DuckDB paths through CPU NCHW Torch batches.
 
 The adapter source is Apache-2.0. Optional dependencies retain their own licenses;
 TorchCodec video decoding still uses FFmpeg.
