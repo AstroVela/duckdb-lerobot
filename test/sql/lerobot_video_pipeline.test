@@ -195,7 +195,7 @@ endloop
 # This restricted macro demonstrates the migration prerequisite: list positions
 # become caller IDs before the relation operator can reorder any work. Camera
 # keys are explicit here; the public C++ windows API still owns its full defaults
-# and validation contract. Keep this example in sync with docs/design.md.
+# and validation contract.
 statement ok
 CREATE MACRO indexed_video_windows(dataset_root, requests, camera_keys, delta_timestamps := [0.0]) AS TABLE
 SELECT decoded.request_id, decoded.target_id AS request_ordinal,

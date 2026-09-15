@@ -1,0 +1,7 @@
+av==15.1.0
+daft==0.7.25
+numpy==2.2.6
+packaging==26.3
+pillow==12.3.0
+pyarrow==25.0.1
+tqdm==4.67.3

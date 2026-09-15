@@ -95,7 +95,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq ccache ninja-build pkg-config python3-venv
 
-      - name: Check benchmark process accounting
+      - name: Check benchmark contracts and process accounting
         run: python3 -m unittest discover -s test/python -p 'test_*.py' -v
 
       - name: Install FFmpeg development packages
@@ -153,6 +153,35 @@ jobs:
             --index-url https://download.pytorch.org/whl/cpu
           build/torchcodec-venv/bin/python -m pip install './python[test]'
           build/torchcodec-venv/bin/python -m pytest python/tests -q
+
+      - name: Check benchmark correctness on a tiny local fixture
+        if: matrix.id == 'release-ffmpeg'
+        env:
+          LEROBOT_EXTENSION: ${{ github.workspace }}/build/release/extension/lerobot/lerobot.duckdb_extension
+        run: |
+          build/torchcodec-venv/bin/python -m pip install pyarrow==25.0.1
+          build/torchcodec-venv/bin/python -m unittest discover -s benchmarks/tests -v
+          build/torchcodec-venv/bin/python benchmarks/prepare.py \
+            --config benchmarks/configs/smoke.toml \
+            --extension "$LEROBOT_EXTENSION" \
+            --output build/benchmarks/datasets/smoke
+          python3 benchmarks/run.py \
+            --config benchmarks/configs/smoke.toml \
+            --data-root build/benchmarks/datasets/smoke \
+            --extension "$LEROBOT_EXTENSION" --extension-commit "$GITHUB_SHA" \
+            --python build/torchcodec-venv/bin/python \
+            --output build/benchmarks/smoke
+          python3 benchmarks/report.py build/benchmarks/smoke/results.json \
+            --output build/benchmarks/smoke/report.md
+
+      - name: Upload benchmark smoke evidence
+        if: always() && matrix.id == 'release-ffmpeg'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-smoke
+          path: build/benchmarks/smoke/
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Check codec executor growth, budgets and cancellation
         env:

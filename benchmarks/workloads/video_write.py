@@ -66,8 +66,7 @@ def copy_sql(
         # combined frame/camera ordinal therefore yields deterministic, widely
         # separated colors without repeating within realistic benchmark sizes.
         color = (
-            f"((row_index * {camera_count} + {index}) * 2654435761 + 104729) "
-            "% 16777216"
+            f"((row_index * {camera_count} + {index}) * 2654435761 + 104729) % 16777216"
         )
         camera_columns.append(
             f"from_hex(repeat(printf('%06x', ({color})::UBIGINT), {pixels})) "
@@ -98,9 +97,10 @@ def run_sql_measured(
     cli: Path, sql: str, extension: Path | None = None
 ) -> tuple[float, dict[str, int | None]]:
     started = time.perf_counter()
-    with tempfile.TemporaryFile(mode="w+t") as sql_input, tempfile.TemporaryFile(
-        mode="w+t"
-    ) as process_output:
+    with (
+        tempfile.TemporaryFile(mode="w+t") as sql_input,
+        tempfile.TemporaryFile(mode="w+t") as process_output,
+    ):
         if extension:
             sql_input.write(f"LOAD {sql_string(str(extension))};\n")
         sql_input.write(sql)
@@ -218,7 +218,7 @@ def validate_dataset(
 
     file_rows = query_csv(
         cli,
-        f"SELECT count(*) FROM glob(" f"{sql_string(str(root / 'videos/**/*.mp4'))})",
+        f"SELECT count(*) FROM glob({sql_string(str(root / 'videos/**/*.mp4'))})",
         extension,
     )
     if file_rows != [[str(camera_count)]]:
