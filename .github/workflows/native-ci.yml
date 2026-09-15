@@ -142,6 +142,18 @@ jobs:
           make "${{ matrix.test_target }}"
           ccache --show-stats
 
+      - name: Test the optional Python TorchCodec adapter
+        if: matrix.id == 'release-ffmpeg'
+        env:
+          LEROBOT_EXTENSION: ${{ github.workspace }}/build/release/extension/lerobot/lerobot.duckdb_extension
+        run: |
+          python3 -m venv build/torchcodec-venv
+          build/torchcodec-venv/bin/python -m pip install \
+            torch==2.10.0 torchcodec==0.10.0 \
+            --index-url https://download.pytorch.org/whl/cpu
+          build/torchcodec-venv/bin/python -m pip install './python[test]'
+          build/torchcodec-venv/bin/python -m pytest python/tests -q
+
       - name: Check codec executor growth, budgets and cancellation
         env:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1

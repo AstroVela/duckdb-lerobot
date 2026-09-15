@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "duckdb-lerobot"
+version = "0.1.0"
+description = "Optional TorchCodec tensor reader for the DuckDB LeRobot extension"
+requires-python = ">=3.10"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = ["duckdb==1.5.5"]
+
+[project.optional-dependencies]
+torchcodec = ["torch>=2.10", "torchcodec>=0.10"]
+test = ["pytest>=8", "numpy"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

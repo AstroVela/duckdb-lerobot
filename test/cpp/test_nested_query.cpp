@@ -380,6 +380,8 @@ TEST_CASE("An S3 setting change during metadata loading cannot publish routes un
 	const bool video = GENERATE(false, true);
 	const bool warm = GENERATE(false, true);
 	const bool refresh = GENERATE(false, true);
+	const bool distinct_episode_versions = GENERATE(false, true);
+	CAPTURE(video, warm, refresh, distinct_episode_versions);
 	NestedReadTest test(1);
 	DBConfig::GetConfig(*test.connection->context)
 	    .AddExtensionOption("s3_endpoint", "Controlled storage identity", LogicalType::VARCHAR, Value("first"));
@@ -403,7 +405,11 @@ TEST_CASE("An S3 setting change during metadata loading cannot publish routes un
 
 	class SwitchingFileSystem final : public GatedFileSystem {
 	public:
-		explicit SwitchingFileSystem(const string &path) : GatedFileSystem(path) {
+		SwitchingFileSystem(const string &path, bool distinct_episode_versions_p)
+		    : GatedFileSystem(path), distinct_episode_versions(distinct_episode_versions_p) {
+			// Cover both valid and stale cached fingerprints without depending
+			// on how quickly the two backing Parquet files were created.
+			fixed_mtime = true;
 		}
 		string Translate(const string &path) {
 			return StringUtil::Replace(path, "s3://fixture-bucket/dataset", "gate://dataset");
@@ -424,6 +430,12 @@ TEST_CASE("An S3 setting change during metadata loading cannot publish routes un
 			// local backing file must not turn that hint into POSIX O_DIRECT.
 			return GatedFileSystem::OpenFile(local, FileFlags::FILE_FLAGS_READ, opener);
 		}
+		string GetVersionTag(FileHandle &handle) override {
+			if (distinct_episode_versions && StringUtil::EndsWith(handle.GetPath(), "/alternate.parquet")) {
+				return "alternate-episode-metadata";
+			}
+			return GatedFileSystem::GetVersionTag(handle);
+		}
 		vector<OpenFileInfo> Glob(const string &path, FileOpener *opener = nullptr) override {
 			auto files = GatedFileSystem::Glob(Translate(path), opener);
 			for (auto &file : files) {
@@ -440,9 +452,10 @@ TEST_CASE("An S3 setting change during metadata loading cannot publish routes un
 		bool second = false;
 		bool switched = false;
 		bool repeat = false;
+		const bool distinct_episode_versions;
 		std::function<void()> before_open;
 	};
-	auto subsystem = make_uniq<SwitchingFileSystem>(test.directory.path);
+	auto subsystem = make_uniq<SwitchingFileSystem>(test.directory.path, distinct_episode_versions);
 	auto &fs = *subsystem;
 	FileSystem::GetFileSystem(*test.db->instance).RegisterSubSystem(std::move(subsystem));
 	auto read_path = [&](bool force_refresh) {
