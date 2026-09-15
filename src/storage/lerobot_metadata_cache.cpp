@@ -680,11 +680,16 @@ shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Get(ClientContext &co
 		}
 		if (!refresh) {
 			auto cached = cache.Get<LerobotDatasetMetadata>(cache_key);
-			if (cached && cached->root == resolved_root && cached->IsValid(context)) {
-				if (cache_key == CacheKey(context, root)) {
+			if (cached && cached->root == resolved_root) {
+				const auto valid = cached->IsValid(context);
+				// Even failed validation can observe a different endpoint. Retry
+				// before a reload can hide that change by switching back.
+				if (cache_key != CacheKey(context, root)) {
+					continue;
+				}
+				if (valid) {
 					return cached;
 				}
-				continue;
 			}
 		}
 		auto before = ReadInfoFingerprint(context, resolved_root);
