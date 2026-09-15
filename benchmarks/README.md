@@ -20,7 +20,7 @@ every configured camera. Both random cases span episode boundaries.
 
 ## Setup
 
-The checked-in locks target **Linux x86_64, Python 3.12, CPU**. Prerequisites:
+The checked-in locks target **Linux x86_64, Python 3.12.14, CPU**. Prerequisites:
 `uv 0.11.29`, a system FFmpeg runtime compatible with TorchCodec 0.10.0, and a
 Release build of `lerobot.duckdb_extension` for **DuckDB 1.5.5**. See the
 [build instructions](../README.md#build-from-source). Record the actual binary's

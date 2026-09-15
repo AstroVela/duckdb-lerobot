@@ -109,8 +109,6 @@ def table(result, compact=False):
         "| :--- | " + " | ".join(["---:"] * len(headers)) + " |",
     ]
     for case in result["cases"]:
-        if compact and not case["name"].startswith("sequential-"):
-            continue
         cells = []
         for engine in engines:
             summary = summarize(case["engines"][engine]["warm_seconds"])

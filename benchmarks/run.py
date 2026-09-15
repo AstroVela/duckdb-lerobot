@@ -44,6 +44,13 @@ def plan_requests(frames, case, seed):
     return random.Random(seed).sample(frames, case["rows"])
 
 
+def worker_python(env_root, environment, override=None):
+    # Resolving bin/python's symlink loses the virtualenv and its site-packages.
+    if override:
+        return override.absolute()
+    return env_root.resolve() / environment / "bin/python"
+
+
 class Worker:
     def __init__(self, python, job_path, log_path, threads, timeout):
         env = dict(
@@ -173,11 +180,7 @@ def run(args):
                     environment = (
                         "torchcodec" if config["workload"] == "tensor_batch" else engine
                     )
-                    python = (
-                        args.python.resolve()
-                        if args.python
-                        else args.env_root.resolve() / environment / "bin/python"
-                    )
+                    python = worker_python(args.env_root, environment, args.python)
                     worker = Worker(
                         python,
                         job_path,

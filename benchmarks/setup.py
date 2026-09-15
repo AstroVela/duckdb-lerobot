@@ -24,7 +24,7 @@ def main():
     for engine in args.engines:
         destination = args.env_root.resolve() / engine
         subprocess.run(
-            ["uv", "venv", "--python", "3.12", str(destination)], check=True, env=env
+            ["uv", "venv", "--python", "3.12.14", str(destination)], check=True, env=env
         )
         python = destination / "bin/python"
         subprocess.run(

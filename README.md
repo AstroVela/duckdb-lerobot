@@ -132,7 +132,13 @@ Median seconds over five measured runs; lower is better.
 
 <!-- benchmark-table:start -->
 
-Results are being regenerated with the common output contract.
+| Case | duckdb-lerobot | Daft | LeRobot / TorchCodec |
+| :--- | ---: | ---: | ---: |
+| sequential-16 | 0.357 | 0.692 | 0.476 |
+| sequential-100 | 1.341 | 3.693 | 2.375 |
+| sequential-632 | 11.374 | 22.074 | 14.623 |
+| random-100 | 4.654 | 4.152 | 2.845 |
+| multi-file-96 | 4.630 | 3.783 | 2.946 |
 
 <!-- benchmark-table:end -->
 

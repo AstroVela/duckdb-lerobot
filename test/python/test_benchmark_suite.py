@@ -2,18 +2,30 @@
 
 import copy
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
+import venv
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from benchmarks.common import digest, extension_info, load_config, validate_keys, verify_packages, write_json
 from benchmarks.report import summarize, validate
-from benchmarks.run import plan_requests
+from benchmarks.run import plan_requests, worker_python
 
 
 class BenchmarkSuiteTest(unittest.TestCase):
+    def test_python_override_preserves_virtual_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = Path(directory) / "venv"
+            venv.EnvBuilder(with_pip=False, symlinks=True).create(environment)
+            python = worker_python(Path(directory), "unused", environment / "bin/python")
+            prefix = subprocess.check_output(
+                [str(python), "-I", "-c", "import sys; print(sys.prefix)"], text=True
+            ).strip()
+            self.assertEqual(Path(prefix).resolve(), environment.resolve())
+
     def test_rejects_stale_environment_and_wrong_binary_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
