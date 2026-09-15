@@ -1,6 +1,6 @@
 schema_version = 1
 workload = "video_read"
-engines = ["duckdb", "daft", "lerobot"]
+engines = ["duckdb", "daft", "lerobot", "torchcodec"]
 warmups = 1
 repeats = 1
 threads = 2

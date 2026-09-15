@@ -17,7 +17,7 @@ from benchmarks.common import (
 )  # noqa: E402
 
 LABELS = {
-    "duckdb": "duckdb-lerobot",
+    "duckdb": "DuckDB / FFmpeg",
     "daft": "Daft",
     "lerobot": "LeRobot / TorchCodec",
     "torchcodec": "DuckDB / TorchCodec",

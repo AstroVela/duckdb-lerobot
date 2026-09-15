@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_VERSION = 1
 ENGINES = {
-    "video_read": {"duckdb", "daft", "lerobot"},
+    "video_read": {"duckdb", "daft", "lerobot", "torchcodec"},
     "tensor_batch": {"duckdb", "torchcodec"},
 }
 
