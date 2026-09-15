@@ -18,6 +18,51 @@ The full configs run sequential reads of 16, 100 and 632 frame rows, a seeded
 are sampled without replacement, preserve their requested order, and include
 every configured camera. Both random cases span episode boundaries.
 
+## Results
+
+Measured on 2026-09-15: Linux, Xeon E5-2686 v4, CPU affinity 0–7, eight
+threads, local `pepijn223/egodex-test` (632 frames, one 1080p AV1 camera).
+Values are **median seconds (IQR)** over five measured runs after a separate
+first call and one warmup; lower is better. IQR is the interquartile range.
+OS caches were retained. Every requested frame key, order, shape and pixel hash
+matched across engines within each workload.
+
+### Video reads
+
+Contiguous RGB uint8 HWC NumPy arrays, including Python transfer, reordering
+and conversion. DuckDB 1.5.5, Daft 0.7.25, LeRobot 0.6.1 / TorchCodec 0.10.0.
+
+| Case | duckdb-lerobot | Daft | LeRobot / TorchCodec |
+| :--- | ---: | ---: | ---: |
+| sequential-16 | 0.357 (0.091) | 0.692 (0.017) | 0.476 (0.062) |
+| sequential-100 | 1.341 (0.389) | 3.693 (0.048) | 2.375 (0.153) |
+| sequential-632 | 11.374 (0.205) | 22.074 (1.182) | 14.623 (0.025) |
+| random-100 | 4.654 (0.441) | 4.152 (0.030) | 2.845 (0.158) |
+| multi-file-96 | 4.630 (0.235) | 3.783 (0.085) | 2.946 (0.047) |
+
+### Torch batches
+
+Contiguous CPU uint8 NCHW tensors, batch size 32, including transfer, conversion
+and stacking. DuckDB 1.5.5, PyTorch 2.10.0 CPU, TorchCodec 0.10.0.
+
+| Case | DuckDB / FFmpeg → Torch | DuckDB / TorchCodec |
+| :--- | ---: | ---: |
+| sequential-16 | 0.296 (0.001) | 0.194 (0.002) |
+| sequential-100 | 1.600 (0.177) | 1.271 (0.119) |
+| sequential-632 | 11.332 (1.000) | 7.752 (0.090) |
+| random-100 | 4.450 (0.073) | 1.840 (0.039) |
+| multi-file-96 | 4.529 (0.579) | 1.671 (0.017) |
+
+In this run, DuckDB was fastest for sequential video reads; upstream LeRobot
+was fastest for random and derived multi-file reads. DuckDB / TorchCodec was
+faster in all five tensor cases. The multi-file fixture uses copies of the same
+source video as described below.
+
+Measured suite: [`f405025`](https://github.com/AstroVela/duckdb-lerobot/tree/f40502526347b4225136908adf97a85a2d495543/benchmarks).
+Extension source: `93fd1237348cc616646298367fc37e86129eff6a`.
+The tables were generated from the validated reports with `report.py`; raw
+samples and per-frame hashes remain outside the source tree.
+
 ## Setup
 
 The checked-in locks target **Linux x86_64, Python 3.12.14, CPU**. Prerequisites:
@@ -103,7 +148,7 @@ and IQR; raw samples and the first-call measurements remain in `results.json`.
   frame key, shape and SHA-256 pixel digest. Hashing, request planning, IPC and
   JSON/report writing are outside the measured interval. A mismatch fails the run.
 
-## Results and CI
+## Artifacts and CI
 
 Generated results, per-frame digests, profiles and logs belong under the ignored
 `build/benchmarks/<run-id>/` directory. Commit source, configs, locks and small
