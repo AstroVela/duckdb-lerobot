@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 # Share the independent fixture and validator with the conformance job.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "test/conformance"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "test/conformance"))
 from test_image_copy import copy_sql, quote, validate, write_input  # noqa: E402
 
 CASES = {

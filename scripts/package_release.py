@@ -369,7 +369,7 @@ def package(args):
         "source/LICENSE",
         "source/THIRD_PARTY_NOTICES.md",
         "source/scripts/rebuild_release.py",
-        "source/docs/redistribution.md",
+        "source/REDISTRIBUTION.md",
         "source/cmake/lerobot_distribution.cmake",
         "source/src/ffmpeg_license_probe.cpp",
     ):
@@ -378,7 +378,7 @@ def package(args):
     packages, libraries = collect_dependencies(source_root, vcpkg, installed, args.triplet, downloads, files)
     validate_links(build / "lerobot-ffmpeg-link-libraries.txt", libraries)
     files["rebuild.py"] = source_root / "scripts/rebuild_release.py"
-    files["README.md"] = source_root / "docs/redistribution.md"
+    files["README.md"] = source_root / "REDISTRIBUTION.md"
     files["ffmpeg-license.json"] = build / "lerobot-ffmpeg-license.json"
     files["ffmpeg-link-libraries.txt"] = build / "lerobot-ffmpeg-link-libraries.txt"
     manifest = {
@@ -420,7 +420,7 @@ def package(args):
     (output / "distribution-manifest.json").write_bytes(manifest_bytes)
     (output / "LICENSE").write_bytes((source_root / "LICENSE").read_bytes())
     (output / "THIRD_PARTY_NOTICES.md").write_bytes((source_root / "THIRD_PARTY_NOTICES.md").read_bytes())
-    (output / "REDISTRIBUTION.md").write_bytes((source_root / "docs/redistribution.md").read_bytes())
+    (output / "REDISTRIBUTION.md").write_bytes((source_root / "REDISTRIBUTION.md").read_bytes())
     release_files = (
         "LICENSE",
         "THIRD_PARTY_NOTICES.md",

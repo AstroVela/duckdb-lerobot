@@ -1,0 +1,47 @@
+schema_version = 1
+workload = "video_read"
+engines = ["duckdb", "daft", "lerobot", "torchcodec"]
+warmups = 1
+repeats = 5
+threads = 8
+codec_threads = 1
+batch_size = 32
+seed = 1729
+
+[dataset]
+kind = "huggingface"
+repo_id = "pepijn223/egodex-test"
+revision = "9ab66a91daf0d0e73f022adadb59f5c9ad7a6b16"
+cameras = ["observation.image"]
+normalized_info_sha256 = "16b772ce671c101bceebc118a6d54c0f58a943b99ab5c3787bc3b73b442c89fc"
+source_payload_sha256 = "87f409597a9c9dd4154a9f7cb2cb450bbcba902cba33de09ce2a9903ea47ea21"
+
+[[cases]]
+name = "sequential-16"
+variant = "single"
+order = "sequential"
+rows = 16
+
+[[cases]]
+name = "sequential-100"
+variant = "single"
+order = "sequential"
+rows = 100
+
+[[cases]]
+name = "sequential-632"
+variant = "single"
+order = "sequential"
+rows = 632
+
+[[cases]]
+name = "random-100"
+variant = "single"
+order = "random"
+rows = 100
+
+[[cases]]
+name = "multi-file-96"
+variant = "multi"
+order = "random"
+rows = 96
