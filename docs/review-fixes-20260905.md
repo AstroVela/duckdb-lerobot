@@ -429,7 +429,7 @@ Windows/macOS/ARM 构建。
 ## 2026-09-06：关系目标的有界时间戳索引
 
 处理 §3.3 中 `lerobot_video_targets` 的多批次重复查找。新增
-`benchmark/video_target_timestamps.py`，直接执行真实关系入口，以原生 join
+`benchmarks/workloads/target_timestamps.py`，直接执行真实关系入口，以原生 join
 核对计数和时间戳和。它覆盖稀疏、密集、重复请求，多 shard、多个输入 chunk、
 64 MB 内存限制和四线程；可选媒体路径另测解码，并在计时外联合散列请求身份、
 目标时间戳和像素。原有 `timestamp_lookup.py` 的临时表实验继续保留。
@@ -463,7 +463,7 @@ open/stat/HEAD。原生 Parquet footer count 决定分配大小，随后只读�
 ### 性能证据
 
 最终扩展的 SHA-256、DuckDB 提交、参数及 28 组前后对照结果保存在
-[`benchmark/results/timestamp-lookup-20260906.json`](../benchmark/results/timestamp-lookup-20260906.json)。
+[`benchmark/results/timestamp-lookup-20260906.json`](https://github.com/AstroVela/duckdb-lerobot/blob/26a19d85df74813402f829b388e837eb7d33d74e/benchmark/results/timestamp-lookup-20260906.json)。
 前后所有计数/时间戳结果一致，六组动态 H.264 视频对照的请求与像素散列也一致。
 媒体用 FFmpeg `testsrc2=size=32x24:rate=32` 生成 4,096 帧，libx264/ultrafast、
 yuv420p、单编码线程；每组查询 8,192 个 target。
@@ -565,7 +565,7 @@ DuckDB buffer manager 管理并按原规则溢写，现有统计缓冲区上限�
 
 ### 可复现基准
 
-新增 `benchmark/lerobot_copy_numeric.py`。每次重复启动新进程，先建立同一
+新增 `benchmarks/workloads/numeric_write.py`。每次重复启动新进程，先建立同一
 输入表，再用 DuckDB profiler 测量 COPY；计时外逐行核对所有输出帧，并对
 全部 episode/dataset 统计生成摘要。Linux 用 GNU time 的进程峰值 RSS，
 覆盖校验和退出阶段；同时记录连接累计 buffer 高水位和临时磁盘占用。
@@ -585,7 +585,7 @@ DuckDB buffer manager 管理并按原规则溢写，现有统计缓冲区上限�
 | int64 / 256 | 35.747 s | 1.478 s | 24.18× |
 
 完整 12 组及一个 96 MB 溢写组保存在
-[`benchmark/results/numeric-copy-20260906.json`](../benchmark/results/numeric-copy-20260906.json)，
+[`benchmark/results/numeric-copy-20260906.json`](https://github.com/AstroVela/duckdb-lerobot/blob/26a19d85df74813402f829b388e837eb7d33d74e/benchmark/results/numeric-copy-20260906.json)，
 包含 CLI/扩展 SHA-256、DuckDB 提交、CPU、参数、每次测量和统计摘要。
 13 组的新旧帧校验和统计摘要全部一致。256 维 float32 的进程峰值 RSS
 约为 178.2 → 177.8 MiB；float64 为 258.4 → 261.2 MiB，内存没有量级增长。
@@ -651,7 +651,7 @@ RGB 编码固定单线程，保证每次提交立即得到一个完整 PNG；重
 
 ### 基准与资源
 
-新增 `benchmark/lerobot_copy_image.py`，与新的 Pillow conformance 共用
+新增 `benchmarks/workloads/image_write.py`，与新的 Pillow conformance 共用
 输入生成和逐像素校验。输入先生成 Parquet 并由 DuckDB materialize，
 然后单独用 profiler 测 COPY。每次运行新进程，Linux GNU time 的峰值
 RSS 包含输入加载与退出，不包含 Python 进程。记录连接累计 buffer/spill
@@ -680,9 +680,9 @@ RSS 包含输入加载与退出，不包含 Python 进程。记录连接累计 b
 buffer manager 管理的硬限额内存。
 
 完整样本、机器信息、参数、扩展/源码 SHA-256 保存在
-[`benchmark/results/image-copy-20260906.json`](../benchmark/results/image-copy-20260906.json)。
+[`benchmark/results/image-copy-20260906.json`](https://github.com/AstroVela/duckdb-lerobot/blob/26a19d85df74813402f829b388e837eb7d33d74e/benchmark/results/image-copy-20260906.json)。
 脚本支持 `--baseline-extension` 自动交替顺序并检查新旧摘要；复现命令
-见 `benchmark/README.md` 的 Image COPY 段落。旧源码/二进制保存在忽略的
+见 `benchmarks/README.md` 的 Image COPY 段落。旧源码/二进制保存在忽略的
 `build/before-png-fix/`，本轮日志及原始报告位于 `build/png-*.log/json`。
 
 ### 验证与 CI

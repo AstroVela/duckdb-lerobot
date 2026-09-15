@@ -1,0 +1,32 @@
+schema_version = 1
+workload = "video_read"
+engines = ["duckdb", "daft", "lerobot"]
+warmups = 1
+repeats = 1
+threads = 2
+codec_threads = 1
+batch_size = 3
+seed = 1729
+
+[dataset]
+kind = "synthetic"
+repo_id = "benchmark/smoke"
+cameras = ["observation.image"]
+
+[[cases]]
+name = "sequential-8"
+variant = "single"
+order = "sequential"
+rows = 8
+
+[[cases]]
+name = "random-8"
+variant = "single"
+order = "random"
+rows = 8
+
+[[cases]]
+name = "multi-file-8"
+variant = "multi"
+order = "random"
+rows = 8

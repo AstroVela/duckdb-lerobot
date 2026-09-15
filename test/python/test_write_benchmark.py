@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location(
     "lerobot_copy_write",
-    Path(__file__).resolve().parents[2] / "benchmark/lerobot_copy_write.py",
+    Path(__file__).resolve().parents[2] / "benchmarks/workloads/video_write.py",
 )
 benchmark = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(benchmark)

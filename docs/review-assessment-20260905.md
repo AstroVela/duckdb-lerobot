@@ -56,7 +56,7 @@ demuxer 仍可能自行打开列表中的子文件；若要完全接管 I/O，�
 | 3.1 相对 root 被改写 | 历史行为成立，但原来只识别合法字符构成的两段 repo-id，并非所有相对路径。`ca5260c` 已删除改写；现在要求显式 `hf://`。 |
 | 3.2 六处 Connection | 构造点的计数和 LOCAL 设置不继承基本准确，目前仍是三个 metadata、一个 FEATURES parser、两个 video 构造点。取消传播与重入值得维护，但这些查询主要读取外部文件/常量 JSON，不能据此推断已发生事务一致性损坏。`lerobot_info` 的原生 bind replacement 已让它直接使用调用方设置，episodes/tasks 的元数据解析仍没有。 |
 | 3.3 每批 timestamp SQL | 成立，优先作为测量驱动的 P2 优化。批量是 `min(当前输入 chunk 剩余行数,max_pending_targets)`，默认 DuckDB vector 为 2048，4096 是上限而非稳定批大小；百万行通常约 489 批或更多，不能直接按 250 次算。BuildTargetBuffers 当前无条件调用 ReadTargetTimestamps，投影不需要像素也不能消除这一查询。 |
-| 3.3 的缓存方案 | 可研究，不能直接承诺“一帧 8 字节即可解决全部问题”。8 字节只是 timestamp payload 下限，不包括稀疏键、重复/缺失校验、索引和构建峰值。还需定义并发加载、取消、内存计账、shard 身份与失效。`bind_replace` 解决 SQL 文本构造不必然解决执行期数据访问成本。已有 `benchmark/timestamp_lookup.py` 可作为实验起点。 |
+| 3.3 的缓存方案 | 可研究，不能直接承诺“一帧 8 字节即可解决全部问题”。8 字节只是 timestamp payload 下限，不包括稀疏键、重复/缺失校验、索引和构建峰值。还需定义并发加载、取消、内存计账、shard 身份与失效。`bind_replace` 解决 SQL 文本构造不必然解决执行期数据访问成本。已有 `benchmarks/workloads/timestamp_lookup.py` 可作为实验起点。 |
 | 3.4 两种 ordinal 都不稳定 | **部分错误。** temporal/video targets 的 `target_ordinal` 确为原子分配；video windows 的 `request_ordinal` 是输入列表下标，`81db162` 就如此，稳定。当前 README 已明确前者的无序契约，并新增调用者提供的 `target_id`。无序关系在没有显式输入顺序时也不存在可凭空生成的稳定“输入行号”。 |
 | 3.5 继承全部原生参数 | 历史属实，当前改成显式参数定义。其附带说法“info/episodes/tasks 接受 refresh 但无效果”是**错误**：旧版没有在这些函数上注册该命名参数，binder 先拒绝，`ParseOption` 分支不可达。当前 refresh 已注册并会清除两个 route cache。 |
 | 3.6 COPY 输入顺序 | 契约成立，但 README 原来已有 contiguous/ordered 说明及 ORDER BY 示例，不能说完全未记录。现在仍可改善错误提示；建议按 episode_index 和原始帧顺序列排序，输出 frame_index 是扩展生成的。无序来源只能运行时发现，bind 时不能一般性证明顺序。 |

@@ -1,0 +1,8 @@
+lerobot[dataset]==0.6.1
+torch==2.10.0+cpu
+torchvision==0.25.0+cpu
+torchcodec==0.10.0
+numpy==2.2.6
+pyarrow==25.0.1
+av==15.1.0
+pillow==12.3.0

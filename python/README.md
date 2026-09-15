@@ -81,15 +81,9 @@ LEROBOT_EXTENSION="$PWD/build/release/extension/lerobot/lerobot.duckdb_extension
   pytest python/tests
 ```
 
-Compare both complete CPU paths through contiguous Torch batches:
-
-```bash
-python benchmark/torchcodec_pipeline.py \
-  --dataset /absolute/path/to/local_dataset \
-  --extension build/release/extension/lerobot/lerobot.duckdb_extension \
-  --camera observation.images.front --rows 16 100 \
-  --output build/torchcodec-pipeline.json
-```
+The [tensor batch benchmark](../benchmarks/README.md#run) compares SQL FFmpeg
+and SQL → TorchCodec through contiguous uint8 NCHW batches, including Python
+transfer, conversion and batch assembly.
 
 The adapter source is Apache-2.0. Optional dependencies retain their own licenses;
 TorchCodec video decoding still uses FFmpeg.

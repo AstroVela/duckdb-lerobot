@@ -126,38 +126,21 @@ clamped to its boundary and marked with `is_padding`.
 
 ## Benchmark
 
-Measured on 2026-09-15: Linux, Xeon E5-2686 v4, CPU affinity 0–7, local
-`pepijn223/egodex-test` snapshot (632 frames, one 1080p AV1 camera).
-Only a legacy metadata field name was normalized; video and Parquet files were unchanged.
-Times are seconds, median of five runs after one warmup; OS caches were not
-flushed. All selected frame keys, shapes, and RGB pixel hashes matched.
+Local CPU video reads into contiguous RGB uint8 NumPy arrays, including Python
+transfer and conversion. DuckDB 1.5.5, Daft 0.7.25, LeRobot 0.6.1 / TorchCodec 0.10.0.
+Median seconds over five measured runs; lower is better.
 
-**Video reads into each engine's native output:**
+<!-- benchmark-table:start -->
 
-| Frames | duckdb-lerobot / DuckDB 1.5.5 | Daft 0.7.25 | LeRobot 0.6.1 / TorchCodec | LeRobot main / TorchCodec |
-| ---: | ---: | ---: | ---: | ---: |
-| 16 | 0.122 | 0.582 | 0.189 | 0.177 |
-| 100 | 0.826 | 2.710 | 1.360 | 1.349 |
-| 632 | 4.819 | 14.841 | 7.638 | 7.214 |
+Results are being regenerated with the common output contract.
 
-DuckDB consumes RGB BLOBs in SQL; Daft collects image columns; LeRobot returns
-uint8 Torch tensors. DuckDB's Python transfer and tensor conversion are excluded.
-LeRobot main is pinned to `89236ea`; both LeRobot variants use TorchCodec 0.10.0.
+<!-- benchmark-table:end -->
 
-**SQL selection through contiguous uint8 NCHW Torch batches** (batch size 32):
-
-| Frames | SQL FFmpeg → Torch | SQL → TorchCodec |
-| ---: | ---: | ---: |
-| 16 | 0.346 | 0.192 |
-| 100 | 2.130 | 1.208 |
-| 632 | 11.499 | 7.668 |
-
-This second comparison includes Python transfer/conversion and batch assembly,
-using PyTorch 2.10.0 CPU. Both comparisons exclude imports and pixel-hash checks;
-they measure this local video workload, not model training or DataLoader throughput.
-See the [recorded results](benchmark/results/video-read-20260915.json),
-[cross-engine reproduction steps](benchmark/README.md#local-snapshot-recommended),
-and [TorchCodec benchmark command](python/README.md#verify).
+Dataset: `pepijn223/egodex-test`, 632 frames, one 1080p AV1 camera.
+Linux / Xeon E5-2686 v4, eight pinned CPUs; one warmup after a separate first
+call, OS cache retained. Frame keys, shapes and pixels are checked across engines.
+[Reproduce the benchmarks](benchmarks/README.md) for the pinned dataset, methodology,
+random/multi-file cases and the separate Torch tensor batch comparison.
 
 ## License
 

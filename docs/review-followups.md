@@ -25,7 +25,7 @@ all been reproduced or resolved.
 | --- | --- |
 | Complete windows macro replacement | Indexed request and delta expansion; exact defaults, schemas, duplicate, empty-input, invalid-input and projection behavior. The C++ path is retained. Its limit is **100,000 request/delta pairs before camera expansion**. A 12-row expansion test alone is insufficient. |
 | Shared resource governance | Separate producer I/O, decoder sessions, decode workers, per-codec threads and write workers. Admission must be shared by concurrent queries in one DatabaseInstance, cancelable and deadlock-free. Retain per-frame hard bounds independently of any aggregate budget; define which buffers/codec allocations the budget covers. SET is still public API. |
-| Database-wide timestamp cache | The query-local bounded index and real-operator benchmark are documented in README and `benchmark/README.md`. Cross-query reuse remains deferred: compare cold construction, remote I/O and eviction pressure, and define credentials/session isolation, shard identity and invalidation. info.json fingerprints alone do not detect independent shard edits. |
+| Database-wide timestamp cache | The query-local bounded index and real-operator benchmark are documented in README and `benchmarks/README.md`. Cross-query reuse remains deferred: compare cold construction, remote I/O and eviction pressure, and define credentials/session isolation, shard identity and invalidation. info.json fingerprints alone do not detect independent shard edits. |
 | V2.0/V2.1 read adapters | Start with explicit target datasets and separate fixtures for each version's tasks, statistics and path contracts. Normalize to the common route model; do not send old layouts into the v3 parser. Write support stays v3. |
 | Append and remote COPY | Define writer exclusion, immutable files versus tail reuse, commit/recovery protocol, reader snapshots and cache invalidation. A final meta-directory rename is not a complete transaction protocol. Timestamp caching is not a prerequisite. |
 | Broader codec/platform support | Test each codec/pixel-format/depth combination and official readback. Selecting a runtime encoder does not alter the license of the linked FFmpeg build. Community distribution templates and Linux ARM/macOS/Windows jobs require their own build validation. |
@@ -39,7 +39,7 @@ named-parameter contract; no undocumented `lerobot_test_*` settings are added.
 
 ## Timestamp experiment
 
-Run `benchmark/timestamp_lookup.py` with the pinned DuckDB CLI. It compares
+Run `benchmarks/workloads/timestamp_lookup.py` with the pinned DuckDB CLI. It compares
 native Parquet lookups with an explicit temporary SQL timestamp table and
 reports materialization cost, first/repeated lookup latency, peak buffer
 memory and an estimated reuse break-even point. Results must agree before
@@ -52,7 +52,7 @@ bookkeeping. SQL table measurements must not be presented as a future array
 cache's memory use. Reproduce with:
 
 ```sh
-python3 benchmark/timestamp_lookup.py --duckdb build/release/duckdb \
+python3 benchmarks/workloads/timestamp_lookup.py --duckdb build/release/duckdb \
   --rows 1000000 --targets 4 256 8192 --repeats 5 \
   --output build/timestamp-benchmark.json
 ```

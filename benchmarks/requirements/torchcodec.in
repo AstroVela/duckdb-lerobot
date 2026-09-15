@@ -1,0 +1,5 @@
+duckdb==1.5.5
+torch==2.10.0+cpu
+torchcodec==0.10.0
+numpy==2.2.6
+pyarrow==25.0.1
