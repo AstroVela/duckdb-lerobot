@@ -21,7 +21,7 @@ Development builds discover the four FFmpeg libraries with `pkg-config`.
 Default distribution builds use the pinned vcpkg manifest and statically link
 FFmpeg with libaom, dav1d, and zlib. The release source bundle includes the exact
 dependency sources, recipes, patches, and installed license texts in `licenses/`;
-see [redistribution and relinking](docs/redistribution.md).
+see [redistribution and relinking](REDISTRIBUTION.md).
 
 - **FFmpeg** (`libavformat`, `libavcodec`, `libavutil`, and `libswscale`) is
   primarily LGPL-2.1-or-later, but an FFmpeg build becomes GPL when GPL

@@ -22,8 +22,10 @@ every configured camera. Both random cases span episode boundaries.
 
 Measured on 2026-09-15: Linux, Xeon E5-2686 v4, CPU affinity 0–7, eight
 threads, local `pepijn223/egodex-test` (632 frames, one 1080p AV1 camera).
-Values are **median seconds (IQR)** over five measured runs after a separate
-first call and one warmup; lower is better. IQR is the interquartile range.
+Values are **median seconds (IQR)** for the entire case over five measured runs
+after a separate first call and one warmup; lower is better. For example,
+`sequential-632` at `11.374 (0.205)` means all 632 frames took a median of
+11.374 seconds, with a 0.205-second gap between the 75th and 25th percentiles.
 OS caches were retained. Every requested frame key, order, shape and pixel hash
 matched across engines within each workload.
 
@@ -42,8 +44,9 @@ and conversion. DuckDB 1.5.5, Daft 0.7.25, LeRobot 0.6.1 / TorchCodec 0.10.0.
 
 ### Torch batches
 
-Contiguous CPU uint8 NCHW tensors, batch size 32, including transfer, conversion
-and stacking. DuckDB 1.5.5, PyTorch 2.10.0 CPU, TorchCodec 0.10.0.
+Both columns use duckdb-lerobot and deliver contiguous CPU uint8 NCHW tensors,
+batch size 32, including transfer, conversion and stacking. DuckDB 1.5.5,
+PyTorch 2.10.0 CPU, TorchCodec 0.10.0.
 
 | Case | DuckDB / FFmpeg → Torch | DuckDB / TorchCodec |
 | :--- | ---: | ---: |
