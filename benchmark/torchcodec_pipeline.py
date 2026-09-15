@@ -75,8 +75,11 @@ def main():
         )
         native_sql = f"""
             SELECT episode_index, target_frame_index, image, height, width
-            FROM lerobot_video_targets(?, ({requests}), codec_threads := 1)
-            ORDER BY target_ordinal
+            FROM lerobot_video_targets(?, (
+                SELECT requests.*, row_number() OVER () - 1 AS target_id
+                FROM ({requests}) AS requests
+            ), codec_threads := 1)
+            ORDER BY target_id
         """
 
         def execute(engine, validate=False):

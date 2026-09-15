@@ -27,6 +27,7 @@ class VideoTarget:
     video_path: str
     video_timestamp: float
     channels: int
+    target_id: int
 
 
 @dataclass(frozen=True)
@@ -148,7 +149,9 @@ class TorchCodecReader:
         delta_index. Each input row selects one delta_timestamps entry. Use an
         explicit ORDER BY in the SELECT when request order matters. Positional
         '?' parameters are forwarded to DuckDB; identifiers are SQL, not values.
-        Padding, duplicates and order are preserved by target_ordinal.
+        The reader numbers input rows with a zero-based target_id before routing
+        and restores that order afterwards. target_ordinal is the operator's
+        execution-local counter and must not be used to align samples.
         """
         if self._active:
             raise RuntimeError("Only one batch iterator may be active per reader")
@@ -159,12 +162,21 @@ class TorchCodecReader:
         # Never select image, decoded_timestamp, width or height: these columns
         # would make DuckDB decode the video before TorchCodec sees the targets.
         columns = ", ".join(VideoTarget.__dataclass_fields__)
+        # Capture the SELECT's order before the table-in/out operator can assign
+        # counters in parallel. request_id may repeat, so it cannot identify an
+        # individual occurrence. Project only the required input columns; the
+        # adapter owns target_id, including when the SELECT has extra columns.
+        ordered_requests = f"""
+            SELECT request_id, episode_index, frame_index, video_key, delta_index,
+                   row_number() OVER () - 1 AS target_id
+            FROM ({query}) AS requests
+        """
         sql = f"""
             SELECT {columns}
             FROM lerobot_video_targets(
-                ?, ({query}), delta_timestamps := ?, tolerance := ?
+                ?, ({ordered_requests}), delta_timestamps := ?, tolerance := ?
             )
-            ORDER BY target_ordinal
+            ORDER BY target_id
         """
         # Direct Python video I/O cannot honor DuckDB's restricted filesystem.
         if not self.connection.execute(

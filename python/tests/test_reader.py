@@ -65,10 +65,13 @@ def test_pixels_windows_duplicates_order_and_batches(connection, dataset):
     deltas = [-0.1, 0, 0.1]
     expected = connection.execute(
         f"""
-        SELECT target_ordinal, request_id, target_frame_index, video_key, is_padding,
+        SELECT target_id, request_id, target_frame_index, video_key, is_padding,
                height, width, sha256(image), video_timestamp
-        FROM lerobot_video_targets(?, ({REQUESTS}), delta_timestamps := ?)
-        ORDER BY target_ordinal
+        FROM lerobot_video_targets(?, (
+            SELECT requests.*, row_number() OVER () - 1 AS target_id
+            FROM ({REQUESTS}) AS requests
+        ), delta_timestamps := ?)
+        ORDER BY target_id
     """,
         [str(dataset), *params, deltas],
     ).fetchall()
@@ -88,7 +91,7 @@ def test_pixels_windows_duplicates_order_and_batches(connection, dataset):
                 pixels = image.permute(1, 2, 0).contiguous().numpy().tobytes()
                 actual.append(
                     (
-                        target.target_ordinal,
+                        target.target_id,
                         target.request_id,
                         target.target_frame_index,
                         target.video_key,
@@ -105,6 +108,43 @@ def test_pixels_windows_duplicates_order_and_batches(connection, dataset):
     assert any(row[4] for row in actual)
     assert not reader._decoders
     assert connection.execute("SELECT 42").fetchone() == (42,)
+
+
+@pytest.mark.parametrize("threads", [1, 8])
+def test_input_order_across_parallel_chunks(connection, dataset, monkeypatch, threads):
+    # More than one DuckDB vector, producer chunk and output batch. All IDs
+    # repeat; only the sequence of frame/camera/delta occurrences identifies
+    # the input order. No video I/O is needed to exercise target routing.
+    connection.execute(f"SET threads={threads}")
+    query = """
+        SELECT 9::BIGINT AS request_id, (i % 2)::BIGINT AS episode_index,
+               (i % 4)::BIGINT AS frame_index,
+               CASE WHEN i % 3 = 0 THEN 'front' ELSE 'side' END AS video_key,
+               (i % 3)::BIGINT AS delta_index, -7::BIGINT AS target_id
+        FROM range(?) AS inputs(i)
+        ORDER BY (i * 7919) % 12289, i
+    """
+    # The expected sequence comes directly from the caller's SELECT, not from
+    # another invocation of lerobot_video_targets or its execution counter.
+    expected = connection.execute(query, [12289]).fetchall()
+    for video in dataset.rglob("*.mp4"):
+        video.unlink()
+    with TorchCodecReader(connection, dataset, batch_size=257) as reader:
+        monkeypatch.setattr(reader, "_decode", lambda targets: targets)
+        actual = [
+            target
+            for batch in reader.batches(query, [12289], delta_timestamps=[-0.1, 0, 0.1])
+            for target in batch
+        ]
+    assert [target.target_id for target in actual] == list(range(len(expected)))
+    assert [
+        (t.request_id, t.episode_index, t.frame_index, t.video_key, t.delta_index)
+        for t in actual
+    ] == [row[:5] for row in expected]
+    for target in actual:
+        resolved = target.frame_index + target.delta_index - 1
+        assert target.target_frame_index == max(0, min(3, resolved))
+        assert target.is_padding == (resolved < 0 or resolved > 3)
 
 
 def test_empty_does_not_load_decoder_and_early_close(connection, dataset, monkeypatch):

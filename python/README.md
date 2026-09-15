@@ -49,7 +49,12 @@ con.close()
 ```
 
 Each SQL row selects one camera and one delta. Output preserves duplicates and
-request order, including padded targets. Different camera sizes are supported;
+request order, including padded targets. The reader assigns a zero-based
+`target_id` to each input row before routing and orders output by that ID.
+Use it to align individual occurrences with samples; `request_id` may repeat,
+and the operator's `target_ordinal` does not describe input order. Only the five
+required SELECT columns are used; any input `target_id` is replaced by the
+reader's generated ID. Different camera sizes are supported;
 stack only tensors with the same shape. Images are views: clone before in-place
 transforms because duplicate targets may share storage.
 
