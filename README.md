@@ -124,6 +124,41 @@ ORDER BY request_ordinal, delta_ordinal;
 Offsets must align with the dataset FPS. Targets outside the episode are
 clamped to its boundary and marked with `is_padding`.
 
+## Benchmark
+
+Measured on 2026-09-15: Linux, Xeon E5-2686 v4, CPU affinity 0–7, local
+`pepijn223/egodex-test` snapshot (632 frames, one 1080p AV1 camera).
+Only a legacy metadata field name was normalized; video and Parquet files were unchanged.
+Times are seconds, median of five runs after one warmup; OS caches were not
+flushed. All selected frame keys, shapes, and RGB pixel hashes matched.
+
+**Video reads into each engine's native output:**
+
+| Frames | duckdb-lerobot / DuckDB 1.5.5 | Daft 0.7.25 | LeRobot 0.6.1 / TorchCodec | LeRobot main / TorchCodec |
+| ---: | ---: | ---: | ---: | ---: |
+| 16 | 0.122 | 0.582 | 0.189 | 0.177 |
+| 100 | 0.826 | 2.710 | 1.360 | 1.349 |
+| 632 | 4.819 | 14.841 | 7.638 | 7.214 |
+
+DuckDB consumes RGB BLOBs in SQL; Daft collects image columns; LeRobot returns
+uint8 Torch tensors. DuckDB's Python transfer and tensor conversion are excluded.
+LeRobot main is pinned to `89236ea`; both LeRobot variants use TorchCodec 0.10.0.
+
+**SQL selection through contiguous uint8 NCHW Torch batches** (batch size 32):
+
+| Frames | SQL FFmpeg → Torch | SQL → TorchCodec |
+| ---: | ---: | ---: |
+| 16 | 0.346 | 0.192 |
+| 100 | 2.130 | 1.208 |
+| 632 | 11.499 | 7.668 |
+
+This second comparison includes Python transfer/conversion and batch assembly,
+using PyTorch 2.10.0 CPU. Both comparisons exclude imports and pixel-hash checks;
+they measure this local video workload, not model training or DataLoader throughput.
+See the [recorded results](benchmark/results/video-read-20260915.json),
+[cross-engine reproduction steps](benchmark/README.md#local-snapshot-recommended),
+and [TorchCodec benchmark command](python/README.md#verify).
+
 ## License
 
 Extension source: [Apache License 2.0](LICENSE). Dependency licenses and

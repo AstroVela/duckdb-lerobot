@@ -1012,7 +1012,10 @@ def run_lerobot(
         return int(value.item()) if hasattr(value, "item") else int(value)
 
     def load_items() -> list[dict[str, Any]]:
-        items = dataset.__getitems__(list(range(count)))
+        if hasattr(dataset, "__getitems__"):
+            items = dataset.__getitems__(list(range(count)))
+        else:
+            items = [dataset[i] for i in range(count)]
         validate_lerobot_items(items, args.camera, available_cameras)
         return items
 
@@ -1064,7 +1067,7 @@ def run_lerobot(
                 "and SHA-256 are excluded"
             ),
             "validation_boundary": (
-                "LeRobot replays the native batch read, converts tensors to "
+                "LeRobot replays the native read, converts tensors to "
                 "contiguous uint8 HWC bytes in Python, and hashes those bytes"
             ),
         },

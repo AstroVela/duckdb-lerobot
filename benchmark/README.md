@@ -41,6 +41,32 @@ hf download pepijn223/egodex-test \
 export HF_HUB_OFFLINE=1
 ```
 
+The [2026-09-15 results](results/video-read-20260915.json) use a local copy
+with one legacy metadata field renamed for LeRobot 0.6.1. Apply this to the
+downloaded copy before running any engine; video and Parquet files stay unchanged:
+
+```bash
+python - <<'PY'
+import json, os
+from pathlib import Path
+path = Path(os.environ["BENCH_DATA"]) / "meta/info.json"
+info = json.loads(path.read_text())
+for feature in info["features"].values():
+    metadata = feature.get("info", {})
+    if "video.is_depth_map" in metadata:
+        metadata["is_depth_map"] = metadata.pop("video.is_depth_map")
+path.write_text(json.dumps(info, indent=2) + "\n")
+PY
+```
+
+That run used DuckDB 1.5.5, Daft 0.7.25, LeRobot 0.6.1, PyTorch 2.10.0 CPU
+and TorchCodec 0.10.0 in separate environments. The additional LeRobot main
+column uses unmodified commit `89236ea0f4f81a81ca566081e20dd1ff5f823cbe`;
+set `PYTHONPATH` to that checkout's `src` directory to reproduce it.
+The runner uses `__getitems__` when available and `__getitem__` on 0.6.1.
+Processes ran sequentially with Linux `taskset -c 0-7` and
+`OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 RAYON_NUM_THREADS=8`.
+
 `hf download` resumes partial downloads. The benchmark itself does not contact
 the Hub when given a local path, and it does not scan or hash the snapshot
 before timing. The caller is responsible for preparing the same immutable
@@ -54,8 +80,10 @@ python benchmark/lerobot_ab.py run \
   --dataset "$BENCH_DATA" \
   --revision "$BENCH_REVISION" \
   --camera observation.image \
-  --rows 100 \
-  --duckdb-cli build/benchmark/duckdb \
+  --all-episodes --rows 100 --warmups 1 --repeats 5 \
+  --cache-state warm-process --video-backend torchcodec --no-profile \
+  --duckdb-cli build/release/duckdb \
+  --extension build/release/extension/lerobot/lerobot.duckdb_extension \
   --output build/benchmark-results/duckdb.json
 
 python benchmark/lerobot_ab.py run \
@@ -63,7 +91,8 @@ python benchmark/lerobot_ab.py run \
   --dataset "$BENCH_DATA" \
   --revision "$BENCH_REVISION" \
   --camera observation.image \
-  --rows 100 \
+  --all-episodes --rows 100 --warmups 1 --repeats 5 \
+  --cache-state warm-process --video-backend torchcodec --no-profile \
   --output build/benchmark-results/daft.json
 
 python benchmark/lerobot_ab.py run \
@@ -72,8 +101,8 @@ python benchmark/lerobot_ab.py run \
   --lerobot-root "$BENCH_DATA" \
   --revision "$BENCH_REVISION" \
   --camera observation.image \
-  --rows 100 \
-  --video-backend pyav \
+  --all-episodes --rows 100 --warmups 1 --repeats 5 \
+  --cache-state warm-process --video-backend torchcodec --no-profile \
   --output build/benchmark-results/lerobot.json
 
 python benchmark/lerobot_ab.py compare \
