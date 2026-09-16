@@ -154,3 +154,4 @@ random/multi-file cases and full results with timing variation.
 
 Extension source: [Apache License 2.0](LICENSE). Dependency licenses and
 FFmpeg codec requirements: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Binary source and rebuild materials: [Releases](https://github.com/AstroVela/duckdb-lerobot/releases).
