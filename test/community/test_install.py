@@ -1,12 +1,15 @@
 """Install the signed community binary and exercise it without a source build.
 
-Run with DuckDB 1.5.5: python -m unittest discover -s test/community -v.
+Run with DuckDB 1.5.5: python test/community/test_install.py.
 The installed revision is reported because community releases advance separately
 from this repository's HEAD. Network or installation failures fail the test.
 """
 
+import argparse
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -20,9 +23,6 @@ def sql_path(path):
 class CommunityInstallTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        tmp = tempfile.TemporaryDirectory(prefix="lerobot-community-")
-        cls.addClassCleanup(tmp.cleanup)
-        cls.root = Path(tmp.name)
         cls.db = duckdb.connect(
             config={
                 "extension_directory": str(cls.root / "extensions"),
@@ -117,5 +117,20 @@ class CommunityInstallTests(unittest.TestCase):
             self.assertEqual(decoded["image"], bytes(colors[index]) * (64 * 64))
 
 
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--test-root", type=Path, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.test_root is not None:
+        CommunityInstallTests.root = args.test_root
+        unittest.main(argv=[sys.argv[0], "-v"])
+
+    # Windows keeps the loaded extension DLL locked until the process exits,
+    # even after db.close(). Let the worker exit before removing its files.
+    with tempfile.TemporaryDirectory(prefix="lerobot-community-") as root:
+        result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--test-root", root])
+    return result.returncode
+
+
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(main())
