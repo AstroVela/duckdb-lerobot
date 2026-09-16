@@ -7,7 +7,15 @@ This branch targets **DuckDB 1.5.5**.
 
 ## Install
 
-### Build from source
+```sql
+INSTALL lerobot FROM community;
+LOAD lerobot;
+```
+
+Available for Linux, macOS, and Windows on DuckDB 1.5.5.
+
+<details>
+<summary>Build from source (Linux x86_64)</summary>
 
 On Linux x86_64, install Git, a C++ compiler, CMake, Ninja, Python 3, and NASM.
 From this repository, initialize the dependencies and build:
@@ -26,8 +34,6 @@ make release GEN=ninja \
 The vcpkg revision matches `builtin-baseline` in [`vcpkg.json`](vcpkg.json).
 The default build includes LGPL FFmpeg, libaom, dav1d, and zlib.
 
-### Load
-
 Start the built DuckDB shell with unsigned extensions enabled:
 
 ```bash
@@ -37,6 +43,8 @@ Start the built DuckDB shell with unsigned extensions enabled:
 ```sql
 LOAD 'build/release/extension/lerobot/lerobot.duckdb_extension';
 ```
+
+</details>
 
 ## Usage
 
