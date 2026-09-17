@@ -5,6 +5,34 @@ links LGPL FFmpeg, libaom, dav1d, and zlib. Their licenses apply alongside the
 project's license. Selecting a codec in SQL does not change the license of
 the libraries already linked into a binary.
 
+## Published downloads
+
+[v0.1.0 for DuckDB v1.5.5](https://github.com/AstroVela/duckdb-lerobot/releases/tag/v0.1.0)
+provides the source, dependency licenses, and rebuild materials for commit
+`901f26a6639c3f3ba763a4df758d83e197694806`, the initial community release.
+Choose the platform archive matching `PRAGMA platform;` in DuckDB. For example,
+on Linux x86-64:
+
+```sh
+curl -fLO https://github.com/AstroVela/duckdb-lerobot/releases/download/v0.1.0/lerobot-v0.1.0-duckdb-v1.5.5-linux_amd64.tar.gz
+curl -fLO https://github.com/AstroVela/duckdb-lerobot/releases/download/v0.1.0/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+tar -xzf lerobot-v0.1.0-duckdb-v1.5.5-linux_amd64.tar.gz
+cd lerobot-v0.1.0-duckdb-v1.5.5-linux_amd64
+sha256sum -c SHA256SUMS
+```
+
+Each platform archive contains the signed community binary under `community/`,
+the original project CI binary, and its unchanged `release/` directory described
+below. The archive's `README.md` records both build runs, pinned inputs, and
+binary checksums. The source bundle's manifest describes the project CI build;
+the separately built community binary has its own checksum. Rebuilding does not
+require either binary or a signing key.
+
+Use these platform archives for rebuilding. GitHub's automatic **Source code**
+downloads omit submodules and dependency sources. For normal installation, use
+`INSTALL lerobot FROM community; LOAD lerobot;`.
+
 ## Default release
 
 Build from a checkout containing all source files and initialized submodules.
