@@ -290,6 +290,21 @@ struct LogicalVaneCopy : LogicalExtensionOperator {
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
 		auto &fs = FileSystem::GetFileSystem(context);
 		copy->file_path = fs.ExpandPath(copy->file_path);
+		// Match the native writer before deriving the sibling staging directory.
+		// Otherwise "dataset/" creates "dataset/.vane-*" and reserves the final root.
+		const auto separator = fs.PathSeparator(copy->file_path);
+		while (!copy->file_path.empty()) {
+			if (copy->file_path.back() == '/') {
+				copy->file_path.pop_back();
+			} else if (!separator.empty() && StringUtil::EndsWith(copy->file_path, separator)) {
+				copy->file_path.resize(copy->file_path.size() - separator.size());
+			} else {
+				break;
+			}
+		}
+		if (copy->file_path.empty()) {
+			throw IOException("LeRobot dataset root cannot be empty");
+		}
 		if (!fs.IsPathAbsolute(copy->file_path)) {
 			copy->file_path = fs.JoinPath(fs.GetWorkingDirectory(), copy->file_path);
 		}

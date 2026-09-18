@@ -169,6 +169,22 @@ shared_ptr<LerobotVideoMetadata> LerobotVaneVideoSnapshot::Restore(vector<Lerobo
 		restored.emplace_back(episode, length, key_id, file_id, fields[4].GetValue<int64_t>(),
 		                      fields[5].GetValue<int64_t>(), from, to);
 	}
+	// A camera may be absent from earlier episodes, so first-seen key order is
+	// not lexical order. Native FindRoute/ResolveRoutes use binary search on keys.
+	auto sorted_keys = keys;
+	std::sort(sorted_keys.begin(), sorted_keys.end());
+	vector<idx_t> key_indices(keys.size());
+	vector<LerobotVideoFeatureMetadata> sorted_features(features.size());
+	for (idx_t i = 0; i < keys.size(); i++) {
+		auto index = std::lower_bound(sorted_keys.begin(), sorted_keys.end(), keys[i]) - sorted_keys.begin();
+		key_indices[i] = index;
+		sorted_features[index] = features[i];
+	}
+	keys = std::move(sorted_keys);
+	features = std::move(sorted_features);
+	for (auto &route : restored) {
+		route.video_key_index = key_indices[route.video_key_index];
+	}
 	std::sort(restored.begin(), restored.end(), [](const LerobotVideoRoute &a, const LerobotVideoRoute &b) {
 		return a.episode_index < b.episode_index ||
 		       (a.episode_index == b.episode_index && a.video_key_index < b.video_key_index);

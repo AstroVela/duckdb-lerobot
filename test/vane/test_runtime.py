@@ -10,6 +10,7 @@ import shutil
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 
 def quote(value):
@@ -156,22 +157,33 @@ class LeRobotRuntime(unittest.TestCase):
             cls.runner.run_write = dispatch_write
         else:
             assert os.environ.get("VANE_RUNNER") == "local-fast"
-        cls.connection = vane.connect(
-            config={
-                "threads": "2",
-                "autoinstall_known_extensions": "false",
-                "autoload_known_extensions": "false",
-                "allow_unsigned_extensions": "true",
-            }
-        )
+        config = {
+            "threads": "2",
+            "autoinstall_known_extensions": "false",
+            "autoload_known_extensions": "false",
+            "allow_unsigned_extensions": "true",
+        }
+        cls.connection = vane.connect(config=config)
         cls.addClassCleanup(cls.connection.close)
+        # execute() also dispatches to the connection's runner. Create a separate
+        # native connection so the reference cannot silently execute through Ray.
+        with patch.dict(os.environ, {"VANE_RUNNER": "local-fast"}):
+            cls.reference = vane.connect(config=config)
+        cls.addClassCleanup(cls.reference.close)
+        assert cls.reference.sql("SELECT 1")._get_runner_type() == "local-fast"
+        assert (
+            cls.connection.sql("SELECT 1")._get_runner_type()
+            == os.environ["VANE_RUNNER"]
+        )
         # Only local developer smoke tests may load an external build artifact.
         extension = os.environ.get("LEROBOT_VANE_TEST_EXTENSION")
         if extension:
             assert not cls.distributed
-            cls.connection.execute(f"LOAD {quote(Path(extension).resolve())}")
+            load = f"LOAD {quote(Path(extension).resolve())}"
         else:
-            cls.connection.execute("LOAD lerobot")
+            load = "LOAD lerobot"
+        cls.connection.execute(load)
+        cls.reference.execute(load)
         cls.temporary = tempfile.TemporaryDirectory(prefix="vane-lerobot-")
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.workspace = Path(cls.temporary.name)
@@ -180,9 +192,13 @@ class LeRobotRuntime(unittest.TestCase):
         cls.path = quote(cls.root)
 
     def query(self, sql, expected=None):
-        if expected is None:
-            expected = self.connection.execute(sql).fetchall()
         before = self.reads
+        reference = self.reference.execute(sql).fetchall()
+        self.assertEqual(self.reads, before, "reference query used Ray")
+        if expected is None:
+            expected = reference
+        else:
+            self.assertEqual(reference, expected)
         actual = self.connection.sql(sql).fetchall()
         self.assertEqual(actual, expected)
         if self.distributed:
@@ -282,7 +298,9 @@ class LeRobotRuntime(unittest.TestCase):
             f"SELECT episode_index, frame_index, md5(image) FROM lerobot_video_frames({self.path}, [0,2]) "
             "ORDER BY episode_index, frame_index"
         )
-        expected = self.connection.execute(sql).fetchall()
+        before = self.reads
+        expected = self.reference.execute(sql).fetchall()
+        self.assertEqual(self.reads, before, "reference query used Ray")
         if self.distributed:
             plan = self.vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
                 self.connection.sql(sql), "lerobot-snapshot"
@@ -303,6 +321,49 @@ class LeRobotRuntime(unittest.TestCase):
             self.assertEqual(actual, expected)
         finally:
             hidden.rename(meta)
+
+    def test_targets_with_sparse_camera_routes(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        root = self.workspace / "sparse-cameras"
+        fixture(root)
+        info_path = root / "meta/info.json"
+        info = json.loads(info_path.read_text())
+        info["features"]["wrist"] = info["features"]["camera"].copy()
+        info["video_path"] = "videos/{video_key}/{file_index}.mp4"
+        info_path.write_text(json.dumps(info))
+        episodes_path = root / "meta/episodes/0.parquet"
+        episodes = pq.read_table(episodes_path).to_pylist()
+        for index, episode in enumerate(episodes):
+            key = "wrist" if index == 0 else "camera"
+            for field in (
+                "chunk_index",
+                "file_index",
+                "from_timestamp",
+                "to_timestamp",
+            ):
+                camera = f"videos/camera/{field}"
+                episode[f"videos/wrist/{field}"] = (
+                    episode[camera] if index == 0 else None
+                )
+                if index == 0:
+                    episode[camera] = None
+            directory = root / "videos" / key
+            directory.mkdir(exist_ok=True)
+            (root / f"videos/{index}.mp4").rename(directory / f"{index}.mp4")
+        pq.write_table(pa.Table.from_pylist(episodes), episodes_path)
+        requests = (
+            f"(SELECT index AS target_id, 7 AS request_id, episode_index, frame_index, "
+            "CASE WHEN episode_index = 0 THEN 'wrist' ELSE 'camera' END AS video_key, "
+            f"0 AS delta_index FROM lerobot_scan({quote(root)}))"
+        )
+        rows = self.query(
+            "SELECT target_id, video_key, md5(image) FROM "
+            f"lerobot_video_targets({quote(root)}, {requests}) ORDER BY target_id"
+        )
+        self.assertEqual(len(rows), 16)
+        self.assertEqual([row[1] for row in rows], ["wrist"] * 4 + ["camera"] * 12)
 
     def test_bind_errors_remain_exceptions(self):
         with self.assertRaisesRegex(Exception, "does not exist"):
@@ -400,6 +461,21 @@ class LeRobotRuntime(unittest.TestCase):
         )
         with self.assertRaisesRegex(Exception, "injected worker error"):
             self.copy(source, failed)
+        self.assertFalse(failed.exists())
+        self.assertEqual(list(self.workspace.glob("*.vane-*")), [])
+        self.assertEqual(list(self.workspace.glob("*.tmp-*")), [])
+
+    def test_copy_destination_with_trailing_separator(self):
+        destination = self.workspace / "trailing-copy"
+        source = "SELECT 0::BIGINT AS episode_index, 'pick' AS task, 1::FLOAT AS action"
+        self.assertEqual(self.copy(source, str(destination) + "///"), [(1,)])
+        self.query(
+            f"SELECT count(*), sum(action) FROM lerobot_scan({quote(destination)})",
+            [(1, 1.0)],
+        )
+        failed = self.workspace / "trailing-failed"
+        with self.assertRaisesRegex(Exception, "contiguous and ordered"):
+            self.copy(source.replace("0::BIGINT", "2::BIGINT"), str(failed) + "/")
         self.assertFalse(failed.exists())
         self.assertEqual(list(self.workspace.glob("*.vane-*")), [])
         self.assertEqual(list(self.workspace.glob("*.tmp-*")), [])
