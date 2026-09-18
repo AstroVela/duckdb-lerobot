@@ -66,9 +66,7 @@ def fixture(root):
             pa.Table.from_pylist(frames[shard * 8 : (shard + 1) * 8]),
             root / f"data/{shard}.parquet",
         )
-    pq.write_table(
-        pa.table({"task_index": [0], "task": ["pick"]}), root / "meta/tasks.parquet"
-    )
+    pq.write_table(pa.table({"task_index": [0], "task": ["pick"]}), root / "meta/tasks.parquet")
     (root / "meta/info.json").write_text(
         json.dumps(
             {
@@ -86,9 +84,7 @@ def fixture(root):
             }
         )
     )
-    (root / "meta/stats.json").write_text(
-        json.dumps({"action": {"count": [16], "min": [0], "max": [15]}})
-    )
+    (root / "meta/stats.json").write_text(json.dumps({"action": {"count": [16], "min": [0], "max": [15]}}))
 
 
 class WorkerBarrier:
@@ -132,9 +128,7 @@ class LeRobotRuntime(unittest.TestCase):
             os.environ["VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION"] = "1"
             cls.cluster = Cluster(shutdown_at_exit=False)
             cls.addClassCleanup(cls.cluster.shutdown)
-            cls.cluster.add_node(
-                num_cpus=0, include_dashboard=False, object_store_memory=1024**3
-            )
+            cls.cluster.add_node(num_cpus=0, include_dashboard=False, object_store_memory=1024**3)
             for _ in range(2):
                 cls.cluster.add_node(
                     num_cpus=1,
@@ -171,10 +165,7 @@ class LeRobotRuntime(unittest.TestCase):
         }
         cls.connection = vane.connect(config=config)
         cls.addClassCleanup(cls.connection.close)
-        assert (
-            cls.connection.sql("SELECT 1")._get_runner_type()
-            == os.environ["VANE_RUNNER"]
-        )
+        assert cls.connection.sql("SELECT 1")._get_runner_type() == os.environ["VANE_RUNNER"]
         # Only local developer smoke tests may load an external build artifact.
         extension = os.environ.get("LEROBOT_VANE_TEST_EXTENSION")
         if extension:
@@ -200,17 +191,13 @@ class LeRobotRuntime(unittest.TestCase):
 
     def test_scan_metadata_and_join(self):
         p = self.path
-        self.query(
-            f"SELECT count(*), sum(action) FROM lerobot_scan({p})", [(16, 120.0)]
-        )
+        self.query(f"SELECT count(*), sum(action) FROM lerobot_scan({p})", [(16, 120.0)])
         self.query(
             f"SELECT episode_index, frame_index, action FROM lerobot_scan({p}, episode_indices := [2,9]) "
             "WHERE frame_index >= 2 ORDER BY episode_index, frame_index",
             [(2, 2, 6.0), (2, 3, 7.0), (9, 2, 14.0), (9, 3, 15.0)],
         )
-        self.query(
-            f"SELECT total_episodes, total_frames FROM lerobot_info({p})", [(4, 16)]
-        )
+        self.query(f"SELECT total_episodes, total_frames FROM lerobot_info({p})", [(4, 16)])
         self.query(
             f"SELECT episode_index, length FROM lerobot_episodes({p}) ORDER BY episode_index",
             [(0, 4), (2, 4), (5, 4), (9, 4)],
@@ -242,10 +229,7 @@ class LeRobotRuntime(unittest.TestCase):
         )
         self.query(
             f"SELECT root, component, cached, entries, bytes > 0 FROM lerobot_cache_info({p}) ORDER BY component",
-            [
-                (str(self.root), component, True, 1, True)
-                for component in ("data", "video")
-            ],
+            [(str(self.root), component, True, 1, True) for component in ("data", "video")],
         )
 
     def test_frames_windows_and_empty_splits(self):
@@ -254,23 +238,16 @@ class LeRobotRuntime(unittest.TestCase):
         rows = self.query(
             f"SELECT episode_index, frame_index, width, height, md5(image) FROM {frames} "
             "ORDER BY episode_index, frame_index",
-            [
-                (episode, frame, 8, 8, black_frame_digest(8, 8))
-                for episode in (0, 2, 5, 9)
-                for frame in (0, 3)
-            ],
+            [(episode, frame, 8, 8, black_frame_digest(8, 8)) for episode in (0, 2, 5, 9) for frame in (0, 3)],
         )
         self.assertEqual(len(rows), 8)
-        self.query(
-            f"SELECT count(*) FROM lerobot_video_frames({p}, []::BIGINT[])", [(0,)]
-        )
+        self.query(f"SELECT count(*) FROM lerobot_video_frames({p}, []::BIGINT[])", [(0,)])
         self.query(
             f"SELECT count(*) FROM lerobot_video_frames({p}, [0], frame_indices := []::BIGINT[])",
             [(0,)],
         )
         requests = (
-            "[{'request_id':7,'episode_index':9,'frame_index':3},"
-            "{'request_id':7,'episode_index':0,'frame_index':0}]"
+            "[{'request_id':7,'episode_index':9,'frame_index':3}," "{'request_id':7,'episode_index':0,'frame_index':0}]"
         )
         self.query(
             f"SELECT request_id, request_ordinal, delta_ordinal, episode_index, target_frame_index, "
@@ -287,9 +264,9 @@ class LeRobotRuntime(unittest.TestCase):
             ],
         )
         relation = self.connection.sql(f"SELECT * FROM {frames}")
-        plan = self.vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
-            relation, "lerobot-splits"
-        ).to_physical_plan(self.connection)
+        plan = self.vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "lerobot-splits").to_physical_plan(
+            self.connection
+        )
         self.assertGreaterEqual(sum(map(len, plan.scan_split_batch_map().values())), 4)
 
     def test_targets_have_global_ordinals(self):
@@ -308,9 +285,7 @@ class LeRobotRuntime(unittest.TestCase):
             f"FROM {temporal}",
             [(16, 16, 0, 15)],
         )
-        video_requests = requests.replace(
-            "0 AS delta_index", "'camera' AS video_key, 0 AS delta_index"
-        )
+        video_requests = requests.replace("0 AS delta_index", "'camera' AS video_key, 0 AS delta_index")
         video = f"lerobot_video_targets({p}, {video_requests})"
         self.query(
             f"SELECT target_id, target_frame_index, md5(image) FROM {video} ORDER BY target_id",
@@ -327,15 +302,9 @@ class LeRobotRuntime(unittest.TestCase):
             f"SELECT episode_index, frame_index, md5(image) FROM lerobot_video_frames({self.path}, [0,2]) "
             "ORDER BY episode_index, frame_index"
         )
-        expected = [
-            (episode, frame, black_frame_digest())
-            for episode in (0, 2)
-            for frame in range(4)
-        ]
+        expected = [(episode, frame, black_frame_digest()) for episode in (0, 2) for frame in range(4)]
         if self.distributed:
-            plan = self.vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
-                self.connection.sql(sql), "lerobot-snapshot"
-            )
+            plan = self.vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(self.connection.sql(sql), "lerobot-snapshot")
         else:
             self.connection.execute("PREPARE lerobot_snapshot AS " + sql)
         meta, hidden = self.root / "meta", self.root / "bound-meta"
@@ -343,9 +312,7 @@ class LeRobotRuntime(unittest.TestCase):
         try:
             if self.distributed:
                 actual = [
-                    tuple(row.values())
-                    for table in self.runner.run_iter_tables(plan)
-                    for row in table.to_pylist()
+                    tuple(row.values()) for table in self.runner.run_iter_tables(plan) for row in table.to_pylist()
                 ]
             else:
                 actual = self.connection.execute("EXECUTE lerobot_snapshot").fetchall()
@@ -375,9 +342,7 @@ class LeRobotRuntime(unittest.TestCase):
                 "to_timestamp",
             ):
                 camera = f"videos/camera/{field}"
-                episode[f"videos/wrist/{field}"] = (
-                    episode[camera] if index == 0 else None
-                )
+                episode[f"videos/wrist/{field}"] = episode[camera] if index == 0 else None
                 if index == 0:
                     episode[camera] = None
             directory = root / "videos" / key
@@ -392,10 +357,7 @@ class LeRobotRuntime(unittest.TestCase):
         rows = self.query(
             "SELECT target_id, video_key, md5(image) FROM "
             f"lerobot_video_targets({quote(root)}, {requests}) ORDER BY target_id",
-            [
-                (index, "wrist" if index < 4 else "camera", black_frame_digest())
-                for index in range(16)
-            ],
+            [(index, "wrist" if index < 4 else "camera", black_frame_digest()) for index in range(16)],
         )
         self.assertEqual(len(rows), 16)
         self.assertEqual([row[1] for row in rows], ["wrist"] * 4 + ["camera"] * 12)
@@ -404,15 +366,11 @@ class LeRobotRuntime(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "does not exist"):
             self.connection.execute("SELECT * FROM lerobot_no_such_function()")
         with self.assertRaises(Exception):
-            self.connection.execute(
-                f"SELECT * FROM lerobot_video_frames({self.path}, [0], width := -1)"
-            )
+            self.connection.execute(f"SELECT * FROM lerobot_video_frames({self.path}, [0], width := -1)")
 
     def copy(self, source, destination, extra=""):
         if not extra:
-            extra = ", FEATURES " + quote(
-                json.dumps({"action": {"dtype": "float32", "shape": [1]}})
-            )
+            extra = ", FEATURES " + quote(json.dumps({"action": {"dtype": "float32", "shape": [1]}}))
         before = self.writes
         result = self.connection.execute(
             f"COPY ({source}) TO {quote(destination)} (FORMAT lerobot, FPS 30{extra})"
@@ -542,20 +500,14 @@ class LeRobotRuntime(unittest.TestCase):
                 .fetchall()
             )
         expected_nodes = {
-            str(n["NodeID"])
-            for n in ray.nodes()
-            if n.get("Alive") and n.get("Resources", {}).get("CPU", 0) >= 1
+            str(n["NodeID"]) for n in ray.nodes() if n.get("Alive") and n.get("Resources", {}).get("CPU", 0) >= 1
         }
         self.assertEqual({row[2] for row in rows}, expected_nodes)
         self.assertEqual(len(expected_nodes), 2)
         self.assertEqual(len(rows), 16)
         self.assertEqual(
             sorted((row[0], row[1]) for row in rows),
-            [
-                (episode, black_frame_digest())
-                for episode in (0, 2, 5, 9)
-                for _ in range(4)
-            ],
+            [(episode, black_frame_digest()) for episode in (0, 2, 5, 9) for _ in range(4)],
         )
         stats = ray.get(self.runner.query_driver_client.runner.fragment_stats.remote())
         self.assertEqual(len(stats["workers"]), 2)

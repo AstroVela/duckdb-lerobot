@@ -15,8 +15,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  code-quality-check:
+    name: Code quality
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@72e76e99cd7fee45a99739cd118ec2db64e034ec
+    with:
+      duckdb_version: d8cdaa33fda8df955cc76ef58a280f68f4cd43fa
+      ci_tools_version: 72e76e99cd7fee45a99739cd118ec2db64e034ec
+      extension_name: lerobot
+      format_checks: 'format'
+
   upstream:
     name: Upstream DuckDB / FFmpeg ${{ matrix.ffmpeg }}
+    needs: code-quality-check
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -66,6 +76,7 @@ jobs:
 
   vane-build:
     name: Vane native extension and linked wheel
+    needs: code-quality-check
     uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@d7316f29add0cc893c5fd126a971ffb78cc39c78
     with:
       ci_tools_version: d7316f29add0cc893c5fd126a971ffb78cc39c78
