@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,11 +11,16 @@ import shutil
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
 
 
 def quote(value):
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def black_frame_digest(width=16, height=16):
+    # The committed long-20701.mp4 fixture contains uniformly black frames.
+    # Derive the expected RGB24 bytes directly, independently of either runner.
+    return hashlib.md5(bytes(width * height * 3)).hexdigest()
 
 
 def fixture(root):
@@ -165,12 +171,6 @@ class LeRobotRuntime(unittest.TestCase):
         }
         cls.connection = vane.connect(config=config)
         cls.addClassCleanup(cls.connection.close)
-        # execute() also dispatches to the connection's runner. Create a separate
-        # native connection so the reference cannot silently execute through Ray.
-        with patch.dict(os.environ, {"VANE_RUNNER": "local-fast"}):
-            cls.reference = vane.connect(config=config)
-        cls.addClassCleanup(cls.reference.close)
-        assert cls.reference.sql("SELECT 1")._get_runner_type() == "local-fast"
         assert (
             cls.connection.sql("SELECT 1")._get_runner_type()
             == os.environ["VANE_RUNNER"]
@@ -183,7 +183,6 @@ class LeRobotRuntime(unittest.TestCase):
         else:
             load = "LOAD lerobot"
         cls.connection.execute(load)
-        cls.reference.execute(load)
         cls.temporary = tempfile.TemporaryDirectory(prefix="vane-lerobot-")
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.workspace = Path(cls.temporary.name)
@@ -191,14 +190,8 @@ class LeRobotRuntime(unittest.TestCase):
         fixture(cls.root)
         cls.path = quote(cls.root)
 
-    def query(self, sql, expected=None):
+    def query(self, sql, expected):
         before = self.reads
-        reference = self.reference.execute(sql).fetchall()
-        self.assertEqual(self.reads, before, "reference query used Ray")
-        if expected is None:
-            expected = reference
-        else:
-            self.assertEqual(reference, expected)
         actual = self.connection.sql(sql).fetchall()
         self.assertEqual(actual, expected)
         if self.distributed:
@@ -212,13 +205,15 @@ class LeRobotRuntime(unittest.TestCase):
         )
         self.query(
             f"SELECT episode_index, frame_index, action FROM lerobot_scan({p}, episode_indices := [2,9]) "
-            "WHERE frame_index >= 2 ORDER BY episode_index, frame_index"
+            "WHERE frame_index >= 2 ORDER BY episode_index, frame_index",
+            [(2, 2, 6.0), (2, 3, 7.0), (9, 2, 14.0), (9, 3, 15.0)],
         )
         self.query(
             f"SELECT total_episodes, total_frames FROM lerobot_info({p})", [(4, 16)]
         )
         self.query(
-            f"SELECT episode_index, length FROM lerobot_episodes({p}) ORDER BY episode_index"
+            f"SELECT episode_index, length FROM lerobot_episodes({p}) ORDER BY episode_index",
+            [(0, 4), (2, 4), (5, 4), (9, 4)],
         )
         self.query(f"SELECT task_index, task FROM lerobot_tasks({p})", [(0, "pick")])
         self.query(
@@ -229,9 +224,28 @@ class LeRobotRuntime(unittest.TestCase):
             f"SELECT count(*) FROM lerobot_scan({p}) JOIN lerobot_tasks({p}) USING (task_index)",
             [(16,)],
         )
-        self.query(f"SELECT * FROM lerobot_cache_info({p}) ORDER BY component")
         self.query(
-            f"SELECT * FROM lerobot_video_routes({p}, [0,2,5,9]) ORDER BY episode_index, video_key"
+            f"SELECT * FROM lerobot_video_routes({p}, [0,2,5,9]) ORDER BY episode_index, video_key",
+            [
+                (
+                    episode,
+                    "camera",
+                    str(self.root / f"videos/{index}.mp4"),
+                    0,
+                    index,
+                    0.0,
+                    4 / 30,
+                    30,
+                )
+                for index, episode in enumerate((0, 2, 5, 9))
+            ],
+        )
+        self.query(
+            f"SELECT root, component, cached, entries, bytes > 0 FROM lerobot_cache_info({p}) ORDER BY component",
+            [
+                (str(self.root), component, True, 1, True)
+                for component in ("data", "video")
+            ],
         )
 
     def test_frames_windows_and_empty_splits(self):
@@ -239,7 +253,12 @@ class LeRobotRuntime(unittest.TestCase):
         frames = f"lerobot_video_frames({p}, [0,2,5,9], width := 8, height := 8, frame_indices := [0,3])"
         rows = self.query(
             f"SELECT episode_index, frame_index, width, height, md5(image) FROM {frames} "
-            "ORDER BY episode_index, frame_index"
+            "ORDER BY episode_index, frame_index",
+            [
+                (episode, frame, 8, 8, black_frame_digest(8, 8))
+                for episode in (0, 2, 5, 9)
+                for frame in (0, 3)
+            ],
         )
         self.assertEqual(len(rows), 8)
         self.query(
@@ -257,7 +276,15 @@ class LeRobotRuntime(unittest.TestCase):
             f"SELECT request_id, request_ordinal, delta_ordinal, episode_index, target_frame_index, "
             f"is_padding, md5(image) FROM lerobot_video_windows({p}, {requests}, "
             "delta_timestamps := [-0.03333333333333333, 0.0, 0.03333333333333333]) "
-            "ORDER BY request_ordinal, delta_ordinal"
+            "ORDER BY request_ordinal, delta_ordinal",
+            [
+                (7, 0, 0, 9, 2, False, black_frame_digest()),
+                (7, 0, 1, 9, 3, False, black_frame_digest()),
+                (7, 0, 2, 9, 3, True, black_frame_digest()),
+                (7, 1, 0, 0, 0, True, black_frame_digest()),
+                (7, 1, 1, 0, 0, False, black_frame_digest()),
+                (7, 1, 2, 0, 1, False, black_frame_digest()),
+            ],
         )
         relation = self.connection.sql(f"SELECT * FROM {frames}")
         plan = self.vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
@@ -273,7 +300,8 @@ class LeRobotRuntime(unittest.TestCase):
         )
         temporal = f"lerobot_temporal_targets({p}, {requests})"
         self.query(
-            f"SELECT target_id, target_frame_index, is_padding FROM {temporal} ORDER BY target_id"
+            f"SELECT target_id, target_frame_index, is_padding FROM {temporal} ORDER BY target_id",
+            [(index, index % 4, False) for index in range(16)],
         )
         self.query(
             f"SELECT count(*), count(DISTINCT target_ordinal), min(target_ordinal), max(target_ordinal) "
@@ -285,7 +313,8 @@ class LeRobotRuntime(unittest.TestCase):
         )
         video = f"lerobot_video_targets({p}, {video_requests})"
         self.query(
-            f"SELECT target_id, target_frame_index, md5(image) FROM {video} ORDER BY target_id"
+            f"SELECT target_id, target_frame_index, md5(image) FROM {video} ORDER BY target_id",
+            [(index, index % 4, black_frame_digest()) for index in range(16)],
         )
         self.query(
             f"SELECT count(*), count(DISTINCT target_ordinal), min(target_ordinal), max(target_ordinal) "
@@ -298,9 +327,11 @@ class LeRobotRuntime(unittest.TestCase):
             f"SELECT episode_index, frame_index, md5(image) FROM lerobot_video_frames({self.path}, [0,2]) "
             "ORDER BY episode_index, frame_index"
         )
-        before = self.reads
-        expected = self.reference.execute(sql).fetchall()
-        self.assertEqual(self.reads, before, "reference query used Ray")
+        expected = [
+            (episode, frame, black_frame_digest())
+            for episode in (0, 2)
+            for frame in range(4)
+        ]
         if self.distributed:
             plan = self.vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
                 self.connection.sql(sql), "lerobot-snapshot"
@@ -360,7 +391,11 @@ class LeRobotRuntime(unittest.TestCase):
         )
         rows = self.query(
             "SELECT target_id, video_key, md5(image) FROM "
-            f"lerobot_video_targets({quote(root)}, {requests}) ORDER BY target_id"
+            f"lerobot_video_targets({quote(root)}, {requests}) ORDER BY target_id",
+            [
+                (index, "wrist" if index < 4 else "camera", black_frame_digest())
+                for index in range(16)
+            ],
         )
         self.assertEqual(len(rows), 16)
         self.assertEqual([row[1] for row in rows], ["wrist"] * 4 + ["camera"] * 12)
@@ -514,6 +549,14 @@ class LeRobotRuntime(unittest.TestCase):
         self.assertEqual({row[2] for row in rows}, expected_nodes)
         self.assertEqual(len(expected_nodes), 2)
         self.assertEqual(len(rows), 16)
+        self.assertEqual(
+            sorted((row[0], row[1]) for row in rows),
+            [
+                (episode, black_frame_digest())
+                for episode in (0, 2, 5, 9)
+                for _ in range(4)
+            ],
+        )
         stats = ray.get(self.runner.query_driver_client.runner.fragment_stats.remote())
         self.assertEqual(len(stats["workers"]), 2)
 

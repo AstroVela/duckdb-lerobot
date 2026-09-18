@@ -43,6 +43,10 @@ and the installed Vane wheel with both `local-fast` and a two-worker Ray cluster
 It uses read-only GitHub permissions and pins reusable workflows and actions.
 Workers load the extension from the built wheel; runtime tests disable extension
 autoinstall and autoload and do not download extensions.
+Each runtime job opens one test connection for its selected runner. Expected
+rows come from the deterministic fixture, including pixel hashes computed from
+its known black RGB frames. The Ray job checks query dispatch and worker node
+IDs without opening a local-fast reference connection.
 
 ```sh
 python -m venv build/runtime
