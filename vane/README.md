@@ -32,6 +32,10 @@ make -f Makefile.vane vane_wheel VANE_BUILD_JOBS=4
 ```
 
 The Vane native build produces `build/vane-native/extension/lerobot/lerobot.duckdb_extension`.
+It links Parquet and JSON, the extensions required by LeRobot, and uses this
+repository's FFmpeg dependency manifest. The native test host does not build
+`httpfs`. The wheel retains Vane's default extensions, including `httpfs`, whose
+CURL dependency is supplied by Vane's own dependency manifest.
 The wheel build produces `build/vane-wheel/dist/*.whl` with LeRobot linked into
 the Vane engine, including worker engines. These artifacts use Vane's build
 identity and must not be loaded into upstream DuckDB. The upstream extension is

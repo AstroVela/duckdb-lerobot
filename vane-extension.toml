@@ -1,7 +1,9 @@
 schema_version = 2
 name = "lerobot"
 extension_config = "extension_config_vane.cmake"
-build_extensions = ["httpfs", "parquet", "json"]
+# Native LeRobot needs only these extensions. The wheel retains Vane's defaults,
+# including httpfs, with dependencies provided by Vane's own vcpkg manifest.
+build_extensions = ["parquet", "json"]
 native_test_selection = "test/sql/lerobot*"
 
 [vane]
