@@ -22,6 +22,12 @@ namespace duckdb {
 namespace {
 static const char *VANE_COPY_ORDINAL = "__lerobot_vane_ordinal";
 
+void RejectRemoteCopyDestination(const string &path) {
+	if (FileSystem::IsRemoteFile(path)) {
+		throw NotImplementedException("Vane FORMAT lerobot requires a shared local filesystem");
+	}
+}
+
 struct VaneStageBind {
 	string directory;
 	vector<string> names;
@@ -135,7 +141,7 @@ public:
 		return_type = CopyFunctionReturnType::CHANGED_ROWS;
 		partition_output = false;
 		write_partition_columns = false;
-		write_empty_file = true;
+		write_empty_file = copy.write_empty_file;
 		hive_file_pattern = true;
 		names = copy.names;
 		expected_types = copy.expected_types;
@@ -165,7 +171,9 @@ public:
 		if (fs.IsRemoteFile(file_path)) {
 			throw NotImplementedException("Distributed FORMAT lerobot requires a shared local filesystem");
 		}
-		if (fs.FileExists(file_path) || fs.DirectoryExists(file_path)) {
+		// With WRITE_EMPTY_FILE false, an empty input is a no-op even if the
+		// destination exists. The native writer checks again on the first row.
+		if (write_empty_file && (fs.FileExists(file_path) || fs.DirectoryExists(file_path))) {
 			throw IOException("LeRobot dataset root already exists: '%s'", file_path);
 		}
 		if (fs.FileExists(stage.directory) || fs.DirectoryExists(stage.directory)) {
@@ -222,7 +230,7 @@ public:
 				}
 			}
 			const auto &bind = bind_data->Cast<LerobotCopyBindData>();
-			LerobotCopyGlobalData writer(context, bind, file_path);
+			unique_ptr<LerobotCopyGlobalData> writer;
 			idx_t rows = 0;
 			if (!paths.empty()) {
 				string sql = "SELECT ";
@@ -237,19 +245,30 @@ public:
 				       VANE_COPY_ORDINAL;
 				LerobotNestedQuery query(context, sql, true);
 				while (auto chunk = query.Fetch()) {
+					if (!chunk->size()) {
+						continue;
+					}
 					for (idx_t row = 0; row < chunk->size(); row++) {
 						auto ordinal = chunk->GetValue(bind.input_types.size(), row);
 						if (ordinal.IsNull() || ordinal.GetValue<int64_t>() != NumericCast<int64_t>(++rows)) {
 							throw IOException("Distributed LeRobot COPY input order has missing or duplicate rows");
 						}
 					}
-					writer.Process(*chunk);
+					if (!writer) {
+						writer = make_uniq<LerobotCopyGlobalData>(context, bind, file_path);
+					}
+					writer->Process(*chunk);
 				}
 			}
 			if (rows != expected_rows) {
 				throw IOException("LeRobot COPY fragment row count mismatch");
 			}
-			writer.Finalize();
+			if (!writer && write_empty_file) {
+				writer = make_uniq<LerobotCopyGlobalData>(context, bind, file_path);
+			}
+			if (writer) {
+				writer->Finalize();
+			}
 			Cleanup(context);
 			return rows;
 		} catch (...) {
@@ -290,6 +309,9 @@ struct LogicalVaneCopy : LogicalExtensionOperator {
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
 		auto &fs = FileSystem::GetFileSystem(context);
 		copy->file_path = fs.ExpandPath(copy->file_path);
+		// Validate the URI before trimming separators or making a relative path
+		// absolute: otherwise s3://... becomes a local path below the working directory.
+		RejectRemoteCopyDestination(copy->file_path);
 		// Match the native writer before deriving the sibling staging directory.
 		// Otherwise "dataset/" creates "dataset/.vane-*" and reserves the final root.
 		const auto separator = fs.PathSeparator(copy->file_path);
@@ -397,6 +419,7 @@ void VaneCopyOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 	if (copy.function.name != "lerobot") {
 		return;
 	}
+	RejectRemoteCopyDestination(copy.file_path);
 	if (copy.partition_output || copy.per_thread_output || copy.rotate || copy.file_size_bytes.IsValid() ||
 	    copy.use_tmp_file || copy.return_type != CopyFunctionReturnType::CHANGED_ROWS) {
 		throw NotImplementedException("Vane FORMAT lerobot supports one new dataset with a row-count result");

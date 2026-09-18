@@ -90,13 +90,16 @@ absolute paths on the coordinator and every worker. It writes a new dataset;
 remote destinations, partitioned COPY, per-thread output and file rotation are
 not supported by this adapter. Input must satisfy the original writer's episode
 ordering and schema requirements. Use an explicit `ORDER BY` in the COPY query.
+With `WRITE_EMPTY_FILE false`, empty input returns zero without creating a
+dataset or changing an existing dataset. Non-empty input still requires a new
+destination. Remote URIs are rejected before resolving a local destination.
 
 Each worker attempt writes unique staging artifacts. The coordinator consumes
 only the results selected by Vane, validates row counts and a global input
 ordinal, then calls the original writer to produce data, video, tasks and stats.
 The original staging directory is published only after finalization. Failure
-aborts the write and cleans its owned staging files; existing datasets are
-rejected. Cleanup cannot recover files after the entire coordinator process is
+aborts the write and cleans its owned staging files; writes to existing datasets
+are rejected. Cleanup cannot recover files after the entire coordinator process is
 forcibly terminated.
 
 This first implementation distributes input processing and video reads. COPY's

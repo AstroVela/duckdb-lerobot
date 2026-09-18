@@ -473,6 +473,57 @@ class LeRobotRuntime(unittest.TestCase):
         self.assertEqual(list(self.workspace.glob("*.vane-*")), [])
         self.assertEqual(list(self.workspace.glob("*.tmp-*")), [])
 
+    def test_copy_rejects_remote_destinations_before_creating_local_paths(self):
+        source = "SELECT 0::BIGINT AS episode_index, 'remote' AS task, 1::FLOAT AS action"
+        previous = Path.cwd()
+        with tempfile.TemporaryDirectory(dir=self.workspace) as directory:
+            try:
+                os.chdir(directory)
+                for destination in (
+                    "s3://vane-copy-test/dataset",
+                    "https://example.invalid/dataset",
+                    "http://example.invalid/dataset/",
+                    "s3://",
+                ):
+                    with self.subTest(destination=destination):
+                        with self.assertRaisesRegex(Exception, "requires a shared local filesystem"):
+                            self.copy(source, destination)
+                        self.assertEqual(list(Path(directory).iterdir()), [])
+            finally:
+                os.chdir(previous)
+
+    def test_copy_write_empty_file_false(self):
+        source = (
+            f"SELECT index // 4 AS episode_index, 'pick' AS task, action::FLOAT AS action "
+            f"FROM lerobot_scan({self.path})"
+        )
+        empty_sources = {
+            "constant": "SELECT 0::BIGINT AS episode_index, 'empty' AS task, 0::FLOAT AS action WHERE false",
+            "filtered": source + " WHERE md5(index::VARCHAR) = 'never'",
+        }
+        options = ", FEATURES " + quote(json.dumps({"action": {"dtype": "float32", "shape": [1]}}))
+        options += ", WRITE_EMPTY_FILE false"
+        for name, empty_source in empty_sources.items():
+            with self.subTest(source=name):
+                destination = self.workspace / f"empty-disabled-{name}"
+                for _ in range(2):
+                    self.assertEqual(self.copy(empty_source, destination, options), [(0,)])
+                    self.assertFalse(destination.exists())
+                    self.assertEqual(list(self.workspace.glob("*.vane-*")), [])
+                    self.assertEqual(list(self.workspace.glob("*.tmp-*")), [])
+                self.assertEqual(self.copy(source + " ORDER BY index", destination, options), [(16,)])
+                metadata = (destination / "meta/info.json").read_bytes()
+                self.assertEqual(self.copy(empty_source, destination, options), [(0,)])
+                self.assertEqual((destination / "meta/info.json").read_bytes(), metadata)
+                self.query(
+                    f"SELECT count(*), sum(action) FROM lerobot_scan({quote(destination)})",
+                    [(16, 120.0)],
+                )
+                with self.assertRaisesRegex(Exception, "already exists"):
+                    self.copy(source + " ORDER BY index", destination, options)
+                self.assertEqual(list(self.workspace.glob("*.vane-*")), [])
+                self.assertEqual(list(self.workspace.glob("*.tmp-*")), [])
+
     def test_worker_topology(self):
         if not self.distributed:
             self.skipTest("worker topology requires VANE_RUNNER=ray")
