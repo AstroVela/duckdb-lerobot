@@ -1,0 +1,105 @@
+name: Vane LeRobot
+
+on:
+  push:
+    branches: [v1.5-variegata_vane]
+  pull_request:
+    branches: [v1.5-variegata_vane]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vane-lerobot-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  upstream:
+    name: Upstream DuckDB / FFmpeg ${{ matrix.ffmpeg }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        ffmpeg: ['ON', 'OFF']
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build pkg-config ccache libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+      - name: Prepare the existing pinned test-host fix
+        run: |
+          test "$(git -C duckdb rev-parse HEAD)" = d8cdaa33fda8df955cc76ef58a280f68f4cd43fa
+          git clone --shared duckdb build/native-source
+          git -C build/native-source apply ../../test/patches/duckdb-1.5.5-cached-eof.patch
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/ccache
+          key: upstream-lerobot-${{ runner.os }}-${{ matrix.ffmpeg }}-${{ github.sha }}
+          restore-keys: upstream-lerobot-${{ runner.os }}-${{ matrix.ffmpeg }}-
+      - name: Build the unchanged upstream extension
+        run: |
+          cmake -S build/native-source -B build/native-compat -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DDUCKDB_EXTENSION_CONFIGS="$PWD/extension_config.cmake" \
+            -DUNITTEST_ROOT_DIRECTORY="$PWD" -DENABLE_UNITTEST_CPP_TESTS=OFF \
+            -DENABLE_SANITIZER=OFF -DENABLE_UBSAN=OFF \
+            -DLEROBOT_ENABLE_FFMPEG=${{ matrix.ffmpeg }} -DLEROBOT_ALLOW_GPL=ON
+          cmake --build build/native-compat --parallel 4 --target \
+            unittest lerobot_loadable_extension lerobot_codec_executor_test \
+            lerobot_video_producer_test lerobot_nested_query_test lerobot_video_io_test
+      - name: Run upstream SQL and lifecycle regressions
+        env:
+          FFMPEG: ${{ matrix.ffmpeg }}
+        run: |
+          if [[ "$FFMPEG" == ON ]]; then export LEROBOT_FFMPEG_TESTS=1; fi
+          build/native-compat/test/unittest 'test/sql/lerobot*'
+          for test in codec_executor video_producer nested_query video_io; do
+            timeout 180s "build/native-compat/extension/lerobot/test/lerobot_${test}_test"
+          done
+          git -C duckdb diff --exit-code
+
+  vane-build:
+    name: Vane native extension and linked wheel
+    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@d7316f29add0cc893c5fd126a971ffb78cc39c78
+    with:
+      ci_tools_version: d7316f29add0cc893c5fd126a971ffb78cc39c78
+      manifest: vane-extension.toml
+      python_version: '3.12'
+      build_jobs: 4
+      run_native_tests: true
+
+  vane-runtime:
+    name: Packaged Vane / ${{ matrix.runner }}
+    needs: vane-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [local-fast, ray]
+    env:
+      VANE_RUNNER: ${{ matrix.runner }}
+      VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION: '1'
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: vane-lerobot-wheel
+          path: build/wheels
+      - name: Install the verified wheel in a clean environment
+        run: |
+          python -m venv build/runtime
+          build/runtime/bin/python -m pip install build/wheels/*.whl
+      - name: Read, decode, write, rollback and verify worker topology
+        run: build/runtime/bin/python -I test/vane/test_runtime.py

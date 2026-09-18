@@ -1,0 +1,13 @@
+schema_version = 2
+name = "lerobot"
+extension_config = "extension_config_vane.cmake"
+build_extensions = ["httpfs", "parquet", "json"]
+native_test_selection = "test/sql/lerobot*"
+
+[vane]
+repository = "AstroVela/vane"
+revision = "4da7d5b45c3b34dcd882c893a6ed278620601748"
+
+[vcpkg]
+repository = "microsoft/vcpkg"
+revision = "84bab45d415d22042bd0b9081aea57f362da3f35"
