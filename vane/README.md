@@ -37,10 +37,21 @@ the Vane engine, including worker engines. These artifacts use Vane's build
 identity and must not be loaded into upstream DuckDB. The upstream extension is
 still built with the original `make release` command.
 
-The CI workflow `.github/workflows/VaneExtension.yml` runs on this branch and
-checks upstream DuckDB with FFmpeg enabled and disabled, the Vane native build,
-and the installed Vane wheel with both `local-fast` and a two-worker Ray cluster.
-It uses read-only GitHub permissions and pins reusable workflows and actions.
+The CI workflow `.github/workflows/VaneExtension.yml` runs for pushes and PRs
+targeting `v1.5-variegata_vane`. The original native workflows still target
+`v1.5-variegata`. Format checks, upstream DuckDB builds with FFmpeg enabled and
+disabled, Vane native regressions, and the packaged Vane build run independently.
+The installed Vane wheel is then tested with both `local-fast` and a two-worker
+Ray cluster.
+
+The Vane regression job uses system FFmpeg with the GPL opt-in for HEVC depth
+tests and sets `LEROBOT_FFMPEG_TESTS=1`, enabling all six media SQL suites. It
+also builds and runs the codec-executor, video-producer, nested-query and video-I/O
+C++ suites against Vane, including the guarded producer and nested-query wrappers.
+This test build is separate from the native extension and wheel artifacts built
+with the pinned vcpkg dependency profile.
+
+The workflow uses read-only GitHub permissions and pins reusable workflows and actions.
 Workers load the extension from the built wheel; runtime tests disable extension
 autoinstall and autoload and do not download extensions.
 Each runtime job opens one test connection for its selected runner. Expected

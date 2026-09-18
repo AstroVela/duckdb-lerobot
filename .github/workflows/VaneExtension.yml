@@ -26,7 +26,6 @@ jobs:
 
   upstream:
     name: Upstream DuckDB / FFmpeg ${{ matrix.ffmpeg }}
-    needs: code-quality-check
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -74,9 +73,84 @@ jobs:
           done
           git -C duckdb diff --exit-code
 
+  vane-regressions:
+    name: Vane DuckDB / FFmpeg and lifecycle regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      VANE_SOURCE_DIR: ${{ github.workspace }}/build/vane-source
+      VANE_TEST_BUILD_DIR: ${{ github.workspace }}/build/vane-regressions
+      LEROBOT_FFMPEG_TESTS: '1'
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Read the pinned Vane manifest
+        id: manifest
+        run: |
+          python vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest vane-extension.toml --extension-root "$PWD" \
+            manifest --github-output "$GITHUB_OUTPUT"
+      - name: Checkout exact Vane source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: build/vane-source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate Vane identity
+        id: identity
+        run: |
+          python vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest vane-extension.toml --extension-root "$PWD" \
+            identity --vane-source "$VANE_SOURCE_DIR" --github-output "$GITHUB_OUTPUT"
+      - name: Install regression build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build pkg-config ccache libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+          python -m pip install 'cmake>=3.29'
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/ccache
+          key: vane-lerobot-regressions-${{ runner.os }}-${{ steps.manifest.outputs.vane_revision }}-${{ github.sha }}
+          restore-keys: vane-lerobot-regressions-${{ runner.os }}-${{ steps.manifest.outputs.vane_revision }}-
+      - name: Build Vane SQL and C++ regressions with system FFmpeg
+        env:
+          VANE_UPSTREAM_VERSION: ${{ steps.identity.outputs.upstream_version }}
+          VANE_FORK_VERSION: ${{ steps.identity.outputs.fork_version }}
+          VANE_SOURCE_ID: ${{ steps.identity.outputs.source_id }}
+        run: |
+          # The media regressions include HEVC depth encoding. GPL opt-in is
+          # confined to this test build; packaged artifacts use pinned vcpkg.
+          cmake -S "$VANE_SOURCE_DIR/external/duckdb" -B "$VANE_TEST_BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_STANDARD=20 -DBUILD_DISTRIBUTED_EXCHANGE=OFF \
+            -DDUCKDB_SOURCE_PATH="$VANE_SOURCE_DIR/external/duckdb" \
+            -DDUCKDB_EXTENSION_CONFIGS="$PWD/extension_config_vane.cmake" \
+            -DUNITTEST_ROOT_DIRECTORY="$PWD" -DBUILD_UNITTESTS=ON -DENABLE_UNITTEST_CPP_TESTS=OFF \
+            -DENABLE_EXTENSION_AUTOLOADING=OFF -DENABLE_EXTENSION_AUTOINSTALL=OFF \
+            -DENABLE_SANITIZER=OFF -DENABLE_UBSAN=OFF \
+            -DLEROBOT_ENABLE_FFMPEG=ON -DLEROBOT_ALLOW_GPL=ON -DLEROBOT_AV1_ENCODER=libaom \
+            -DOVERRIDE_GIT_DESCRIBE="${VANE_UPSTREAM_VERSION}-0-g${VANE_SOURCE_ID:0:10}" \
+            -DDUCKDB_EXPLICIT_VERSION="$VANE_FORK_VERSION" -DGIT_COMMIT_HASH="${VANE_SOURCE_ID:0:10}"
+          cmake --build "$VANE_TEST_BUILD_DIR" --parallel 4 --target \
+            unittest lerobot_loadable_extension lerobot_codec_executor_test \
+            lerobot_video_producer_test lerobot_nested_query_test lerobot_video_io_test
+      - name: Run Vane SQL including the six FFmpeg suites
+        run: '"$VANE_TEST_BUILD_DIR/test/unittest" "test/sql/lerobot*"'
+      - name: Run Vane producer, nested-query and lifecycle C++ suites
+        run: |
+          for test in codec_executor video_producer nested_query video_io; do
+            timeout 180s "$VANE_TEST_BUILD_DIR/extension/lerobot/native/test/lerobot_${test}_test"
+          done
+
   vane-build:
     name: Vane native extension and linked wheel
-    needs: code-quality-check
     uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@d7316f29add0cc893c5fd126a971ffb78cc39c78
     with:
       ci_tools_version: d7316f29add0cc893c5fd126a971ffb78cc39c78
