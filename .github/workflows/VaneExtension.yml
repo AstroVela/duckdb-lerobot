@@ -151,9 +151,9 @@ jobs:
 
   vane-build:
     name: Vane native extension and linked wheel
-    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@d7316f29add0cc893c5fd126a971ffb78cc39c78
+    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@03276922f87e714fd18faf67b458a55813ad475d
     with:
-      ci_tools_version: d7316f29add0cc893c5fd126a971ffb78cc39c78
+      ci_tools_version: 03276922f87e714fd18faf67b458a55813ad475d
       manifest: vane-extension.toml
       python_version: '3.12'
       build_jobs: 4
