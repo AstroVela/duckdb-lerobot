@@ -5,3 +5,6 @@
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools.git
 	branch = v1.5-variegata
+[submodule "vane-extension-ci-tools"]
+	path = vane-extension-ci-tools
+	url = https://github.com/AstroVela/vane-extension-ci-tools.git

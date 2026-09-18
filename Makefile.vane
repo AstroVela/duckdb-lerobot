@@ -1,0 +1,2 @@
+VANE_EXTENSION_ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+include $(VANE_EXTENSION_ROOT)vane-extension-ci-tools/makefiles/vane_extension.Makefile
