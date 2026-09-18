@@ -458,6 +458,50 @@ class LeRobotRuntime(unittest.TestCase):
         self.assertEqual(list(self.workspace.glob("*.vane-*")), [])
         self.assertEqual(list(self.workspace.glob("*.tmp-*")), [])
 
+    def test_copy_preserves_values_under_hive_style_directory(self):
+        import pyarrow.parquet as pq
+
+        parent = self.workspace / "c2=999"
+        parent.mkdir()
+        destination = parent / "copy"
+        source = "SELECT i // 2 AS episode_index, 'pick' AS task, i::FLOAT AS action FROM range(4) r(i) ORDER BY i"
+        self.assertEqual(self.copy(source, destination), [(4,)])
+        # Read physical files without interpreting the parent directory as a partition.
+        rows = [
+            row for path in (destination / "data").rglob("*.parquet") for row in pq.ParquetFile(path).read().to_pylist()
+        ]
+        self.assertEqual(
+            sorted((row["index"], row["episode_index"], row["frame_index"], row["action"]) for row in rows),
+            [(i, i // 2, i % 2, float(i)) for i in range(4)],
+        )
+        self.assertEqual(list(parent.glob("*.vane-*")), [])
+        self.assertEqual(list(parent.glob("*.tmp-*")), [])
+
+    def test_copy_video_ignores_binary_as_string(self):
+        destination = self.workspace / "binary-video-copy"
+        source = (
+            "SELECT i // 2 AS episode_index, 'camera' AS task, "
+            "unhex(repeat('ff0080', 16*16)) AS camera FROM range(4) r(i) ORDER BY i"
+        )
+        features = json.dumps({"camera": {"dtype": "video", "shape": [16, 16, 3]}})
+        previous = self.connection.execute("SELECT current_setting('binary_as_string')").fetchone()[0]
+        try:
+            self.connection.execute("SET binary_as_string=true")
+            self.assertEqual(
+                self.copy(source, destination, f", FEATURES {quote(features)}, RGB_CODEC 'libaom-av1'"),
+                [(4,)],
+            )
+            self.assertTrue(self.connection.execute("SELECT current_setting('binary_as_string')").fetchone()[0])
+        finally:
+            self.connection.execute(f"SET binary_as_string={str(previous).lower()}")
+        self.query(
+            f"SELECT episode_index, frame_index, width, height, octet_length(image) "
+            f"FROM lerobot_video_frames({quote(destination)}, [0,1]) ORDER BY episode_index, frame_index",
+            [(i // 2, i % 2, 16, 16, 768) for i in range(4)],
+        )
+        self.assertEqual(list(self.workspace.glob("*.vane-*")), [])
+        self.assertEqual(list(self.workspace.glob("*.tmp-*")), [])
+
     def test_copy_destination_with_trailing_separator(self):
         destination = self.workspace / "trailing-copy"
         source = "SELECT 0::BIGINT AS episode_index, 'pick' AS task, 1::FLOAT AS action"

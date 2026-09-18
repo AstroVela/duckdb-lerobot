@@ -240,9 +240,11 @@ public:
 					}
 					sql += "CAST(c" + std::to_string(i) + " AS " + bind.input_types[i].ToString() + ")";
 				}
+				// Staging must preserve the physical schema and values regardless of parent
+				// directory names or the session's Parquet binary-to-string setting.
 				sql += ", " + string(VANE_COPY_ORDINAL) + " FROM read_parquet(" +
-				       Value::LIST(LogicalType::VARCHAR, std::move(paths)).ToSQLString() + ") ORDER BY " +
-				       VANE_COPY_ORDINAL;
+				       Value::LIST(LogicalType::VARCHAR, std::move(paths)).ToSQLString() +
+				       ", hive_partitioning=false, binary_as_string=false) ORDER BY " + VANE_COPY_ORDINAL;
 				LerobotNestedQuery query(context, sql, true);
 				while (auto chunk = query.Fetch()) {
 					if (!chunk->size()) {
