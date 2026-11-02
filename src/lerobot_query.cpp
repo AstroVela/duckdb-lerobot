@@ -3,6 +3,8 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/thread.hpp"
+#include "duckdb/catalog/catalog_transaction.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
@@ -12,6 +14,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 
 namespace duckdb {
 
@@ -150,12 +153,95 @@ void InheritLerobotReaderSettings(ClientContext &parent, ClientContext &reader) 
 	}
 }
 
+void InitializeLerobotReaderTransaction(ClientContext &parent, Connection &reader) {
+	if (parent.IsInterrupted()) {
+		throw InterruptException();
+	}
+	if (parent.transaction.IsAutoCommit()) {
+		return;
+	}
+	// BEGIN and the catalog lookup below pin the reader's system transaction.
+	// Keep it open through all queries/fetches; Connection/TransactionContext
+	// destruction rolls it back, including during constructor unwinding.
+	reader.BeginTransaction();
+	try {
+		auto &manager = SecretManager::Get(parent);
+		auto parent_secrets = manager.AllSecrets(CatalogTransaction::GetSystemCatalogTransaction(parent));
+		vector<SecretEntry> reader_secrets;
+		reader.context->RunFunctionInTransaction([&] {
+			reader_secrets = manager.AllSecrets(CatalogTransaction::GetSystemCatalogTransaction(*reader.context));
+		});
+		auto validate_and_sort = [](const vector<SecretEntry> &entries) {
+			vector<const KeyValueSecret *> secrets;
+			for (const auto &entry : entries) {
+				const auto *secret = entry.secret.get();
+				// Only DuckDB's built-in temporary storage has the catalog MVCC
+				// semantics required here. Do not serialize arbitrary secret classes:
+				// custom serializers need not encode all lookup behavior.
+				// macOS can give the same class different hidden type_info objects
+				// across loadable extensions (notably HTTPFS). Compare exact ABI
+				// type names rather than type_info identity; derived classes still
+				// have distinct names and must not bypass this check.
+				if (entry.storage_mode != SecretManager::TEMPORARY_STORAGE_NAME ||
+				    entry.persist_type != SecretPersistType::TEMPORARY || !secret ||
+				    std::strcmp(typeid(*secret).name(), typeid(KeyValueSecret).name()) != 0) {
+					throw NotImplementedException(
+					    "LeRobot explicit transactions support only built-in temporary "
+					    "KeyValueSecret storage; persistent and third-party secrets are unsupported");
+				}
+				secrets.push_back(static_cast<const KeyValueSecret *>(secret));
+			}
+			std::sort(secrets.begin(), secrets.end(),
+			          [](const KeyValueSecret *a, const KeyValueSecret *b) { return a->GetName() < b->GetName(); });
+			return secrets;
+		};
+		auto parent_view = validate_and_sort(parent_secrets);
+		auto reader_view = validate_and_sort(reader_secrets);
+		bool equal = parent_view.size() == reader_view.size();
+		for (idx_t i = 0; equal && i < parent_view.size(); i++) {
+			const auto &a = *parent_view[i];
+			const auto &b = *reader_view[i];
+			equal = a.GetName() == b.GetName() && a.GetType() == b.GetType() && a.GetProvider() == b.GetProvider() &&
+			        a.GetScope() == b.GetScope() && a.redact_keys == b.redact_keys &&
+			        a.secret_map.size() == b.secret_map.size();
+			auto left = a.secret_map.begin();
+			auto right = b.secret_map.begin();
+			for (; equal && left != a.secret_map.end(); ++left, ++right) {
+				equal = left->first == right->first && left->second.type() == right->second.type() &&
+				        Value::NotDistinctFrom(left->second, right->second);
+			}
+		}
+		if (!equal) {
+			throw InvalidInputException("LeRobot explicit transaction has different secret catalog views in the caller "
+			                            "and internal reader; commit or roll back secret changes before reading");
+		}
+	} catch (const NotImplementedException &) {
+		if (parent.IsInterrupted()) {
+			throw InterruptException();
+		}
+		throw NotImplementedException("LeRobot explicit transactions support only built-in temporary KeyValueSecret "
+		                              "storage; persistent and third-party secrets are unsupported");
+	} catch (...) {
+		if (parent.IsInterrupted()) {
+			throw InterruptException();
+		}
+		// Backend and Value errors can contain credentials. Never forward them.
+		throw InvalidInputException("LeRobot explicit transaction cannot verify equal secret catalog views in the "
+		                            "caller and internal reader; commit or roll back secret changes before reading");
+	}
+	if (parent.IsInterrupted()) {
+		throw InterruptException();
+	}
+}
+
 struct LerobotNestedQuery::Impl {
 	Impl(ClientContext &context, const string &sql, bool stream)
 	    : connection(*context.db), cancellation(context, *connection.context) {
 		cancellation.CheckInterrupted();
 		InheritLerobotReaderSettings(context, *connection.context);
 		try {
+			InitializeLerobotReaderTransaction(context, connection);
+			cancellation.CheckInterrupted();
 			if (stream) {
 				result = connection.SendQuery(sql);
 			} else {

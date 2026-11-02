@@ -5,6 +5,8 @@
 #include "lerobot_path.hpp"
 #include "lerobot_query.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
@@ -14,10 +16,13 @@
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/query_result.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <tuple>
 #include <utility>
 
 namespace duckdb {
@@ -26,6 +31,20 @@ namespace {
 
 static const char *LEROBOT_INFO_SUFFIX = "/meta/info.json";
 static const char *LEROBOT_EPISODES_SUFFIX = "/meta/episodes/**/*.parquet";
+
+void CheckVideoStorageFormat(ClientContext &context, const string &storage_format, bool for_video) {
+	if (!for_video || storage_format != "lance") {
+		return;
+	}
+	EnsureLerobotLanceExtension(context);
+	auto &catalog = Catalog::GetSystemCatalog(context);
+	if (!catalog.GetEntry<ScalarFunctionCatalogEntry>(context, DEFAULT_SCHEMA, "lance_blob_uri",
+	                                                  OnEntryNotFound::RETURN_NULL)) {
+		throw NotImplementedException("LeRobot Lance videos require a lance extension with lance_blob_uri and the "
+		                              "Lance Blob filesystem. Load a compatible AstroVela/lance-duckdb build; "
+		                              "DuckDB 1.5.5's official lance extension only supports frame scans");
+	}
+}
 
 string MetadataQueryPath(const string &path) {
 	return Value(path).ToSQLString();
@@ -176,7 +195,7 @@ void AppendColumn(LerobotScanSchema &schema, string name, LogicalType type) {
 	schema.types.push_back(std::move(type));
 }
 
-void BuildEmptyDatasetSchemas(LerobotDatasetInfo &info, const vector<ParsedLerobotFeature> &features) {
+void BuildFrameSchema(LerobotDatasetInfo &info, const vector<ParsedLerobotFeature> &features) {
 	if (features.empty()) {
 		throw BinderException("LeRobot info.json features must not be empty");
 	}
@@ -196,10 +215,20 @@ void BuildEmptyDatasetSchemas(LerobotDatasetInfo &info, const vector<ParsedLerob
 			throw BinderException("LeRobot visual feature '%s' requires %d HWC channel(s)", feature.name,
 			                      feature.is_depth ? 1 : 3);
 		}
-		if (feature.dtype != "video") {
+		if (feature.dtype == "language" && info.storage_format == "lance" && info.total_episodes > 0 &&
+		    (feature.name == "language_persistent" || feature.name == "language_events") && feature.shape.size() == 1 &&
+		    feature.shape[0] == 1) {
+			// Annotation writers infer nested language types from the payload. Defer
+			// these types to the frame scan without opening Lance for metadata reads.
+			AppendColumn(info.frame_schema, feature.name, LogicalType::ANY);
+		} else if (feature.dtype != "video") {
 			AppendColumn(info.frame_schema, feature.name, LerobotFeatureScanType(feature.dtype, feature.shape));
 		}
 	}
+}
+
+void BuildEmptyDatasetSchemas(LerobotDatasetInfo &info, const vector<ParsedLerobotFeature> &features) {
+	BuildFrameSchema(info, features);
 
 	static const char *base_names[] = {"episode_index",    "tasks",           "length",
 	                                   "data/chunk_index", "data/file_index", "dataset_from_index",
@@ -264,7 +293,8 @@ LerobotDatasetInfo ParseLerobotInfo(ClientContext &context, const string &info_p
 	        "CAST(json_extract(features.value, '$.info.\"video.use_log\"') AS BOOLEAN), "
 	        "json_extract_string(features.value, '$.info.\"video.pix_fmt\"'), "
 	        "json_extract_string(features.value, '$.info.\"video.is_depth_map\"'), "
-	        "json_extract_string(features.value, '$.video_info.\"video.is_depth_map\"') "
+	        "json_extract_string(features.value, '$.video_info.\"video.is_depth_map\"'), "
+	        "json_extract_string(info.json, '$.storage_format') "
 	        "FROM info LEFT JOIN LATERAL "
 	        "json_each(json_extract(info.json, '$.features')) features ON true ORDER BY record_index, features.id");
 	const auto &info_result = info_query.GetResult();
@@ -291,6 +321,13 @@ LerobotDatasetInfo ParseLerobotInfo(ClientContext &context, const string &info_p
 				throw BinderException("LeRobot info.json must contain exactly one metadata record: '%s'", info_path);
 			}
 			if (!found_record) {
+				if (!chunk->GetValue(19, row).IsNull()) {
+					info.storage_format = StringValue::Get(chunk->GetValue(19, row));
+				}
+				if (info.storage_format != "lerobot" && info.storage_format != "lance") {
+					throw BinderException("Unsupported LeRobot storage_format '%s'; expected 'lerobot' or 'lance'",
+					                      info.storage_format);
+				}
 				if (chunk->GetValue(1, row).IsNull() || chunk->GetValue(2, row).IsNull() ||
 				    chunk->GetValue(4, row).IsNull() || chunk->GetValue(5, row).IsNull() ||
 				    chunk->GetValue(6, row).IsNull() || chunk->GetValue(7, row).IsNull()) {
@@ -339,7 +376,10 @@ LerobotDatasetInfo ParseLerobotInfo(ClientContext &context, const string &info_p
 					features.push_back(std::move(feature));
 					continue;
 				}
-				if (!chunk->GetValue(17, row).IsNull() || !chunk->GetValue(18, row).IsNull()) {
+				// Public RGB datasets can retain an explicit false legacy marker.
+				// Only a depth claim needs the canonical quantizer metadata.
+				if ((!chunk->GetValue(17, row).IsNull() && StringValue::Get(chunk->GetValue(17, row)) != "false") ||
+				    (!chunk->GetValue(18, row).IsNull() && StringValue::Get(chunk->GetValue(18, row)) != "false")) {
 					throw BinderException(
 					    "LeRobot video feature '%s' uses a legacy depth marker; use info.is_depth_map instead",
 					    feature.name);
@@ -435,6 +475,16 @@ LerobotDatasetInfo ParseLerobotInfo(ClientContext &context, const string &info_p
 	}
 	if (info.total_episodes == 0) {
 		BuildEmptyDatasetSchemas(info, features);
+	} else if (info.storage_format == "lance") {
+		BuildFrameSchema(info, features);
+	}
+	if (info.storage_format == "lance") {
+		case_insensitive_set_t lance_names;
+		for (const auto &name : info.frame_schema.names) {
+			if (!lance_names.insert(StringUtil::Replace(name, ".", "_")).second) {
+				throw BinderException("LeRobot Lance feature names collide after replacing '.' with '_': '%s'", name);
+			}
+		}
 	}
 	return info;
 }
@@ -444,6 +494,53 @@ LerobotDatasetInfo ParseLerobotInfo(ClientContext &context, const string &info_p
 LerobotDatasetInfo ReadLerobotDatasetInfo(ClientContext &context, const string &root) {
 	const auto info_path = ResolveLerobotRoot(context, root) + LEROBOT_INFO_SUFFIX;
 	return ParseLerobotInfo(context, info_path);
+}
+
+void EnsureLerobotLanceExtension(ClientContext &context) {
+	if (!context.config.use_replacement_scans) {
+		throw BinderException("LeRobot Lance datasets require replacement scans to be enabled in the client context");
+	}
+	try {
+		ExtensionHelper::AutoLoadExtension(context, "lance");
+	} catch (const AutoloadException &error) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		throw MissingExtensionException(
+		    "LeRobot Lance datasets require the lance extension. Run INSTALL lance; LOAD lance;\n%s", error.what());
+	}
+	if (!context.db->ExtensionIsLoaded("lance")) {
+		throw MissingExtensionException(
+		    "LeRobot Lance datasets require the lance extension. Run INSTALL lance; LOAD lance;");
+	}
+}
+
+void LerobotCheckLanceFrameCount(ClientContext &context, const LerobotDatasetMetadata &metadata) {
+	LerobotNestedQuery frame_query(context,
+	                               "SELECT count(*) FROM " + LerobotFrameSourceSQL(metadata.GetDataFiles(), true));
+	if (frame_query.GetResult().HasError()) {
+		frame_query.GetResult().ThrowError();
+	}
+	auto chunk = frame_query.Fetch();
+	const auto count = chunk->GetValue(0, 0).GetValue<int64_t>();
+	if (count != metadata.GetTotalFrames()) {
+		throw BinderException("LeRobot info.json declares %lld frames, but frames.lance contains %lld rows",
+		                      metadata.GetTotalFrames(), count);
+	}
+}
+
+string LerobotFrameSourceSQL(const vector<string> &paths, bool is_lance) {
+	if (is_lance) {
+		if (paths.size() != 1) {
+			throw InternalException("A LeRobot Lance frame source must contain exactly one table");
+		}
+		return Value(paths[0]).ToSQLString();
+	}
+	string result = "read_parquet([";
+	for (idx_t index = 0; index < paths.size(); index++) {
+		result += (index ? "," : "") + Value(paths[index]).ToSQLString();
+	}
+	return result + "])";
 }
 
 LerobotDatasetMetadata::LerobotDatasetMetadata(string root_p, LerobotDatasetInfo info_p,
@@ -465,8 +562,8 @@ string LerobotDatasetMetadata::GetObjectType() {
 
 optional_idx LerobotDatasetMetadata::GetEstimatedCacheMemory() const {
 	idx_t memory = sizeof(*this);
-	memory += root.capacity() + info.codebase_version.capacity() + info.data_path_template.capacity() +
-	          info.video_path_template.capacity();
+	memory += root.capacity() + info.storage_format.capacity() + info.codebase_version.capacity() +
+	          info.data_path_template.capacity() + info.video_path_template.capacity();
 	memory += info.video_keys.capacity() * sizeof(string);
 	for (const auto &video_key : info.video_keys) {
 		memory += video_key.capacity();
@@ -574,13 +671,20 @@ bool LerobotDatasetMetadata::EpisodeFilesAreValid(ClientContext &context) const 
 }
 
 shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Load(ClientContext &context, const string &root,
-                                                                const FileFingerprint &info_fingerprint) {
+                                                                const FileFingerprint &info_fingerprint,
+                                                                bool for_video) {
 	auto info = ReadLerobotDatasetInfo(context, root);
+	CheckVideoStorageFormat(context, info.storage_format, for_video);
 	vector<LerobotEpisodeRoute> routes;
 	vector<string> data_files;
 	if (info.total_episodes == 0) {
 		return make_shared_ptr<LerobotDatasetMetadata>(root, std::move(info), std::move(routes), std::move(data_files),
 		                                               info_fingerprint);
+	}
+	const bool is_lance = info.storage_format == "lance";
+	if (is_lance) {
+		// Metadata-only callers never open frames.lance; lerobot_scan validates it.
+		data_files.push_back(root + "/frames.lance");
 	}
 
 	// Revalidate remote metadata on reuse even when client credentials and the
@@ -591,10 +695,11 @@ shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Load(ClientContext &c
 		episode_files = ReadEpisodeFiles(context, root);
 	}
 	const auto episodes_path = root + LEROBOT_EPISODES_SUFFIX;
-	LerobotNestedQuery episode_query(
-	    context, "SELECT CAST(episode_index AS BIGINT), CAST(length AS BIGINT), CAST(\"data/chunk_index\" AS BIGINT), "
-	             "CAST(\"data/file_index\" AS BIGINT) FROM read_parquet(" +
-	                 MetadataQueryPath(episodes_path) + ")");
+	const string routing_columns =
+	    is_lance ? "" : ", CAST(\"data/chunk_index\" AS BIGINT), CAST(\"data/file_index\" AS BIGINT)";
+	LerobotNestedQuery episode_query(context, "SELECT CAST(episode_index AS BIGINT), CAST(length AS BIGINT)" +
+	                                              routing_columns + " FROM read_parquet(" +
+	                                              MetadataQueryPath(episodes_path) + ")");
 	const auto &episode_result = episode_query.GetResult();
 	if (episode_result.HasError()) {
 		ThrowQueryError("episode metadata", episode_result);
@@ -607,15 +712,13 @@ shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Load(ClientContext &c
 			break;
 		}
 		for (idx_t row = 0; row < chunk->size(); row++) {
-			for (idx_t column = 0; column < 4; column++) {
+			for (idx_t column = 0; column < (is_lance ? 2 : 4); column++) {
 				if (chunk->GetValue(column, row).IsNull()) {
 					throw BinderException("LeRobot episode routing columns must not contain NULL");
 				}
 			}
 			const auto episode_index = chunk->GetValue(0, row).GetValue<int64_t>();
 			const auto episode_length = chunk->GetValue(1, row).GetValue<int64_t>();
-			const auto chunk_index = chunk->GetValue(2, row).GetValue<int64_t>();
-			const auto file_index = chunk->GetValue(3, row).GetValue<int64_t>();
 			if (episode_index < 0) {
 				throw BinderException("LeRobot episode indices must be non-negative");
 			}
@@ -623,6 +726,12 @@ shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Load(ClientContext &c
 				throw BinderException("LeRobot episode %d length must be positive", episode_index);
 			}
 
+			if (is_lance) {
+				routes.emplace_back(episode_index, episode_length, 0);
+				continue;
+			}
+			const auto chunk_index = chunk->GetValue(2, row).GetValue<int64_t>();
+			const auto file_index = chunk->GetValue(3, row).GetValue<int64_t>();
 			auto data_file = ResolveDataPath(root, info.data_path_template, chunk_index, file_index);
 			auto entry = data_file_indexes.find(data_file);
 			idx_t data_file_index;
@@ -666,8 +775,8 @@ shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Load(ClientContext &c
 	                                               info_fingerprint, std::move(episode_files));
 }
 
-shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Get(ClientContext &context, const string &root,
-                                                               bool refresh) {
+shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Get(ClientContext &context, const string &root, bool refresh,
+                                                               bool for_video) {
 	auto &cache = ObjectCache::GetObjectCache(context);
 	// Treat info.json as the dataset commit marker. A changing marker retries
 	// once. Also recheck the access configuration after I/O: identical manifests
@@ -688,12 +797,13 @@ shared_ptr<LerobotDatasetMetadata> LerobotDatasetMetadata::Get(ClientContext &co
 					continue;
 				}
 				if (valid) {
+					CheckVideoStorageFormat(context, cached->info.storage_format, for_video);
 					return cached;
 				}
 			}
 		}
 		auto before = ReadInfoFingerprint(context, resolved_root);
-		auto loaded = Load(context, resolved_root, before);
+		auto loaded = Load(context, resolved_root, before, for_video);
 		const auto files_valid = loaded->EpisodeFilesAreValid(context);
 		auto after = ReadInfoFingerprint(context, resolved_root);
 		if (before == after && files_valid && cache_key == CacheKey(context, root)) {
@@ -803,6 +913,44 @@ shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Load(ClientContext &conte
 		    std::move(routes), std::move(video_files), dataset.GetInfoFingerprint(), dataset.GetEpisodeFiles());
 	}
 
+	using VideoKey = std::tuple<string, int64_t, int64_t>;
+	std::map<VideoKey, string> lance_videos;
+	if (dataset.IsLance()) {
+		const auto path = Value(dataset.GetRoot() + "/videos.lance").ToSQLString();
+		// Capture row IDs and their snapshot-bound URIs in the same nested query.
+		LerobotNestedQuery videos(context, "SELECT video_key, CAST(chunk_index AS BIGINT), "
+		                                   "CAST(file_index AS BIGINT), CAST(file_size AS BIGINT), "
+		                                   "video_bytes.size, lance_blob_uri(" +
+		                                       path + ", 'video_bytes', _rowid) FROM " + path);
+		if (videos.GetResult().HasError()) {
+			ThrowQueryError("Lance video metadata", videos.GetResult());
+		}
+		while (auto chunk = videos.Fetch()) {
+			for (idx_t row = 0; row < chunk->size(); row++) {
+				for (idx_t column = 0; column < 6; column++) {
+					if (chunk->GetValue(column, row).IsNull()) {
+						throw BinderException("LeRobot videos.lance routing columns and blobs must not be NULL");
+					}
+				}
+				const auto key = chunk->GetValue(0, row).GetValue<string>();
+				const auto chunk_index = chunk->GetValue(1, row).GetValue<int64_t>();
+				const auto file_index = chunk->GetValue(2, row).GetValue<int64_t>();
+				const auto size = chunk->GetValue(3, row).GetValue<int64_t>();
+				const auto blob_size = chunk->GetValue(4, row).GetValue<uint64_t>();
+				if (key.empty() || chunk_index < 0 || file_index < 0 || size <= 0 ||
+				    static_cast<uint64_t>(size) != blob_size) {
+					throw BinderException("Invalid LeRobot videos.lance route or file_size for key '%s'", key);
+				}
+				if (!lance_videos
+				         .emplace(VideoKey(key, chunk_index, file_index), chunk->GetValue(5, row).GetValue<string>())
+				         .second) {
+					throw BinderException("Duplicate LeRobot videos.lance route for key '%s', chunk %lld, file %lld",
+					                      key, chunk_index, file_index);
+				}
+			}
+		}
+	}
+
 	string query = "SELECT CAST(episode_index AS BIGINT), CAST(length AS BIGINT)";
 	for (const auto &video_key : video_keys) {
 		const auto prefix = "videos/" + video_key;
@@ -868,8 +1016,18 @@ shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Load(ClientContext &conte
 					                      episode_index, video_keys[video_key_index]);
 				}
 
-				auto video_file = ResolveVideoPath(dataset.GetRoot(), dataset.GetVideoPathTemplate(),
-				                                   video_keys[video_key_index], chunk_index, file_index);
+				string video_file;
+				if (dataset.IsLance()) {
+					auto video = lance_videos.find(VideoKey(video_keys[video_key_index], chunk_index, file_index));
+					if (video == lance_videos.end()) {
+						throw BinderException("LeRobot videos.lance has no route for key '%s', chunk %lld, file %lld",
+						                      video_keys[video_key_index], chunk_index, file_index);
+					}
+					video_file = video->second;
+				} else {
+					video_file = ResolveVideoPath(dataset.GetRoot(), dataset.GetVideoPathTemplate(),
+					                              video_keys[video_key_index], chunk_index, file_index);
+				}
 				auto entry = video_file_indexes.find(video_file);
 				idx_t video_file_index;
 				if (entry == video_file_indexes.end()) {
@@ -916,18 +1074,20 @@ shared_ptr<LerobotVideoMetadata> LerobotVideoMetadata::Get(ClientContext &contex
 	auto &cache = ObjectCache::GetObjectCache(context);
 	for (idx_t attempt = 0; attempt < 2; attempt++) {
 		const auto cache_key = CacheKey(context, root);
-		auto dataset = LerobotDatasetMetadata::Get(context, root, refresh && attempt == 0);
+		auto dataset = LerobotDatasetMetadata::Get(context, root, refresh && attempt == 0, true);
 		if (cache_key != CacheKey(context, root)) {
 			continue;
 		}
-		if (!refresh) {
+		// Lance routes capture a videos.lance snapshot. The shared metadata cache
+		// has no Lance version identity, so rebuild these routes for each binding.
+		if (!refresh && !dataset->IsLance()) {
 			auto cached = cache.Get<LerobotVideoMetadata>(cache_key);
 			if (cached && cached->IsValid(*dataset)) {
 				return cached;
 			}
 		}
 		auto loaded = Load(context, *dataset);
-		auto current = LerobotDatasetMetadata::Get(context, root, false);
+		auto current = LerobotDatasetMetadata::Get(context, root, false, true);
 		if (loaded->IsValid(*current) && cache_key == CacheKey(context, root)) {
 			cache.Put(cache_key, loaded);
 			return loaded;

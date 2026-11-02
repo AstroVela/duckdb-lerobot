@@ -6,6 +6,7 @@
 namespace duckdb {
 
 class ClientContext;
+class Connection;
 class DataChunk;
 class QueryResult;
 
@@ -14,6 +15,12 @@ class QueryResult;
 //! before it starts querying. Global settings and secrets remain shared.
 //! This does not copy transactions, profiling or arbitrary session state.
 void InheritLerobotReaderSettings(ClientContext &parent, ClientContext &reader);
+
+//! Before querying a fresh reader, pin its transaction when the parent uses an
+//! explicit transaction and require equal temporary KeyValueSecret views.
+//! Persistent and third-party secret storage are unsupported in this mode.
+//! The connection owns the read-only transaction and rolls it back on destruction.
+void InitializeLerobotReaderTransaction(ClientContext &parent, Connection &reader);
 
 //! A nested read with cancellation inherited from its caller. Keep the result
 //! and connection together: cancellation registration outlives result cleanup,

@@ -22,7 +22,7 @@ string NormalizeLerobotRoot(string root);
 string ResolveLerobotRoot(ClientContext &context, const string &root);
 
 //! Cache identity includes local search paths and a SHA-256 fingerprint of S3
-//! access settings and secrets overlapping any path in the dataset. Does not
+//! access settings and S3/Lance secrets overlapping any path in the dataset. Does not
 //! inspect dataset files or retain plaintext credentials in the key.
 string LerobotRootCacheKey(ClientContext &context, const string &root);
 

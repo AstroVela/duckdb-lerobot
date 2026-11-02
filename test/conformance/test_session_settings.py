@@ -107,7 +107,8 @@ def s3_server(
                 root = ET.Element("ListBucketResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
                 ET.SubElement(root, "IsTruncated").text = "false"
                 prefix = query.get("prefix", [""])[0]
-                for key, value in objects.items():
+                # General-purpose S3 buckets list keys in lexicographical order.
+                for key, value in sorted(objects.items()):
                     if key.startswith(prefix):
                         entry = ET.SubElement(root, "Contents")
                         ET.SubElement(entry, "Key").text = key

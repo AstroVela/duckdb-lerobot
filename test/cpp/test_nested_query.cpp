@@ -10,12 +10,21 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "duckdb/main/extension_helper.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
+#include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 #include <future>
 #include <functional>
 
 using namespace duckdb;
+
+TEST_CASE("LeRobot Lance requires replacement scans", "[lerobot_lance]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	con.context->config.use_replacement_scans = false;
+	REQUIRE_THROWS_AS(EnsureLerobotLanceExtension(*con.context), BinderException);
+}
 
 namespace {
 
@@ -524,6 +533,172 @@ TEST_CASE("An S3 setting change during metadata loading cannot publish routes un
 	test.connection->Commit();
 }
 
+namespace {
+
+void RegisterTransactionTestSecrets(ClientContext &context) {
+	auto &manager = SecretManager::Get(context);
+	SecretType type;
+	type.name = "lerobot_transaction_test";
+	type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
+	type.default_provider = "config";
+	manager.RegisterSecretType(type);
+	CreateSecretFunction provider;
+	provider.secret_type = type.name;
+	provider.provider = "config";
+	provider.named_parameters["token"] = LogicalType::VARCHAR;
+	provider.function = [](ClientContext &, CreateSecretInput &input) -> unique_ptr<BaseSecret> {
+		auto result = make_uniq<KeyValueSecret>(input.scope, input.type, input.provider, input.name);
+		for (const auto &entry : input.options) {
+			result->secret_map[entry.first] = entry.second;
+		}
+		result->redact_keys.insert("token");
+		return std::move(result);
+	};
+	manager.RegisterSecretFunction(std::move(provider), OnCreateConflict::ERROR_ON_CONFLICT);
+}
+
+} // namespace
+
+TEST_CASE("Explicit nested readers reject secret view differences without exposing credentials",
+          "[lerobot][nested_query][secret_transaction]") {
+	NestedReadTest test(1);
+	RegisterTransactionTestSecrets(*test.connection->context);
+	const auto change = GENERATE(0, 1, 2, 3, 4);
+	const string create = "CREATE SECRET private_secret_name (TYPE lerobot_transaction_test, "
+	                      "SCOPE 'private-scope', TOKEN 'private-credential-value')";
+	if (change != 0) {
+		test.Query(create);
+	}
+	test.Query("BEGIN");
+	// Exercise SQL before invoking the production reader, without re-entering
+	// ClientContext::Query from a bind callback.
+	if (change == 0) {
+		test.Query(create);
+	} else if (change == 1) {
+		test.Query("DROP SECRET private_secret_name");
+	} else if (change == 2) {
+		test.Query("CREATE OR REPLACE SECRET private_secret_name (TYPE lerobot_transaction_test, "
+		           "SCOPE 'private-scope', TOKEN 'replacement-credential-value')");
+	} else if (change == 4) {
+		test.Query("CREATE OR REPLACE SECRET private_secret_name (TYPE lerobot_transaction_test, "
+		           "SCOPE 'changed-private-scope', TOKEN 'private-credential-value')");
+	} else {
+		// A different connection commits after the caller's snapshot is pinned.
+		test.connection->context->RunFunctionInTransaction([&] {
+			SecretManager::Get(*test.connection->context)
+			    .AllSecrets(CatalogTransaction::GetSystemCatalogTransaction(*test.connection->context));
+		});
+		Connection other(*test.db);
+		REQUIRE_FALSE(other.Query("DROP SECRET private_secret_name")->HasError());
+	}
+	try {
+		ReadLerobotDatasetInfo(*test.connection->context, test.root);
+		FAIL("Different secret views must reject metadata reads");
+	} catch (const InvalidInputException &error) {
+		const string message = error.what();
+		REQUIRE(message.find("secret catalog views") != string::npos);
+		for (const auto *private_text :
+		     {"private_secret_name", "private-scope", "private-credential-value", "replacement-credential-value"}) {
+			REQUIRE(message.find(private_text) == string::npos);
+		}
+	}
+	REQUIRE(test.ConnectionCount() == 1);
+	test.Query("ROLLBACK");
+	REQUIRE(test.Read(ReadStage::INFO) == 2);
+	// Unchanged committed temporary secrets remain compatible with explicit reads.
+	test.Query("BEGIN");
+	REQUIRE(test.Read(ReadStage::DATA_ROUTES) == 1);
+	test.Query("ROLLBACK");
+}
+
+TEST_CASE("Explicit readers reject persistent and custom secret entries",
+          "[lerobot][nested_query][secret_transaction]") {
+	NestedReadTest test(1);
+	const auto kind = GENERATE(0, 1, 2, 3);
+	// Keep persistent test credentials in the fixture, never in the user's store.
+	test.Query("SET secret_directory=" + Value(test.directory.path + "/secrets").ToSQLString());
+	RegisterTransactionTestSecrets(*test.connection->context);
+	auto &manager = SecretManager::Get(*test.connection->context);
+	if (kind == 0) {
+		test.Query("CREATE PERSISTENT SECRET unsupported "
+		           "(TYPE lerobot_transaction_test, TOKEN 'unsupported-private-value')");
+	} else {
+		if (kind == 1) {
+			class TestSecretStorage final : public CatalogSetSecretStorage {
+			public:
+				explicit TestSecretStorage(DatabaseInstance &db) : CatalogSetSecretStorage(db, "custom", 30) {
+					secrets = make_uniq<CatalogSet>(Catalog::GetSystemCatalog(db));
+				}
+			};
+			manager.LoadSecretStorage(make_uniq<TestSecretStorage>(*test.db->instance));
+			test.Query("CREATE TEMPORARY SECRET unsupported IN custom "
+			           "(TYPE lerobot_transaction_test, TOKEN 'unsupported-private-value')");
+		} else {
+			test.connection->context->RunFunctionInTransaction([&] {
+				class DerivedSecret final : public KeyValueSecret {
+				public:
+					DerivedSecret() : KeyValueSecret({}, "lerobot_transaction_test", "config", "unsupported") {
+					}
+					unique_ptr<const BaseSecret> Clone() const override {
+						return make_uniq<DerivedSecret>();
+					}
+					int64_t MatchScore(const string &) const override {
+						return 100;
+					}
+				};
+				unique_ptr<const BaseSecret> secret;
+				if (kind == 2) {
+					secret =
+					    make_uniq<BaseSecret>(vector<string> {}, "lerobot_transaction_test", "config", "unsupported");
+				} else {
+					secret = make_uniq<DerivedSecret>();
+				}
+				manager.RegisterSecret(CatalogTransaction::GetSystemCatalogTransaction(*test.connection->context),
+				                       std::move(secret), OnCreateConflict::ERROR_ON_CONFLICT,
+				                       SecretPersistType::TEMPORARY);
+			});
+		}
+	}
+	test.Query("BEGIN");
+	REQUIRE_THROWS_WITH(ReadLerobotDatasetInfo(*test.connection->context, test.root),
+	                    Catch::Contains("support only built-in temporary KeyValueSecret"));
+	REQUIRE(test.ConnectionCount() == 1);
+	test.Query("ROLLBACK");
+	REQUIRE(test.Read(ReadStage::INFO) == 2);
+}
+
+TEST_CASE("Explicit reader keeps its verified secret snapshot until destruction",
+          "[lerobot][nested_query][secret_transaction]") {
+	NestedReadTest test(1);
+	RegisterTransactionTestSecrets(*test.connection->context);
+	test.Query("CREATE SECRET pinned (TYPE lerobot_transaction_test, TOKEN 'original')");
+	test.Query("BEGIN");
+	{
+		Connection reader(*test.db);
+		InitializeLerobotReaderTransaction(*test.connection->context, reader);
+		Connection other(*test.db);
+		REQUIRE_FALSE(other
+		                  .Query("CREATE OR REPLACE SECRET pinned "
+		                         "(TYPE lerobot_transaction_test, TOKEN 'new')")
+		                  ->HasError());
+		auto visible_token = [](ClientContext &context) {
+			string token;
+			context.RunFunctionInTransaction([&] {
+				auto entry = SecretManager::Get(context).GetSecretByName(
+				    CatalogTransaction::GetSystemCatalogTransaction(context), "pinned");
+				token = static_cast<const KeyValueSecret &>(*entry->secret).TryGetValue("token").GetValue<string>();
+			});
+			return token;
+		};
+		REQUIRE(visible_token(*reader.context) == "original");
+		REQUIRE_FALSE(reader.Query("SELECT 42")->HasError());
+		REQUIRE(visible_token(*reader.context) == "original");
+	}
+	REQUIRE(test.ConnectionCount() == 1);
+	test.Query("ROLLBACK");
+	REQUIRE(test.Read(ReadStage::INFO) == 2);
+}
+
 TEST_CASE("Nested native readers inherit session extension settings without changing other connections",
           "[lerobot][nested_query][reader_settings]") {
 	NestedReadTest test(GENERATE(1, 4));
@@ -581,7 +756,15 @@ TEST_CASE("Video producer reads Parquet with its caller's session access", "[ler
 	NestedReadTest test(GENERATE(1, 4));
 	test.fs->require_access = true;
 	test.Query("SET SESSION lerobot_test_access='fixture-session-access'");
+	const auto transaction_mode = GENERATE(0, 1, 2);
+	if (transaction_mode != 0) {
+		test.Query("BEGIN");
+	}
 	auto metadata = LerobotVideoMetadata::Get(*test.connection->context, test.root, false);
+	if (transaction_mode == 2) {
+		RegisterTransactionTestSecrets(*test.connection->context);
+		test.Query("CREATE SECRET producer_private (TYPE lerobot_transaction_test, TOKEN 'producer-private-value')");
+	}
 	vector<LerobotVideoRoute> routes {LerobotVideoRoute(0, 2, 0, 0, 0, 0, 0.0, 0.5)};
 	vector<string> queries {
 	    "SELECT episode_index, frame_index, timestamp FROM read_parquet('gate://dataset/data.parquet')"};
@@ -598,6 +781,14 @@ TEST_CASE("Video producer reads Parquet with its caller's session access", "[ler
 		REQUIRE(task->Execute(TaskExecutionMode::PROCESS_ALL) == TaskExecutionResult::TASK_FINISHED);
 	}
 	unique_ptr<LerobotDecodeBuffer> buffer;
+	if (transaction_mode == 2) {
+		REQUIRE_THROWS_WITH(state->ClaimBuffer(buffer), Catch::Contains("secret catalog views"));
+		REQUIRE(test.ConnectionCount() == 1);
+		executor.CancelTasks();
+		test.Query("ROLLBACK");
+		REQUIRE(test.Read(ReadStage::INFO) == 2);
+		return;
+	}
 	REQUIRE(state->ClaimBuffer(buffer) == LerobotBufferClaimResult::CLAIMED);
 	REQUIRE(buffer->targets.size() == 2);
 	REQUIRE(buffer->targets[0].frame_timestamp == 0);
@@ -658,8 +849,12 @@ TEST_CASE("Nested native reads propagate cancellation and finish their own I/O",
 TEST_CASE("Nested streaming fetch remains cancellable after query construction", "[lerobot][nested_query]") {
 	const auto threads = GENERATE(1, 4);
 	const auto reset_interrupt = GENERATE(false, true);
-	CAPTURE(threads, reset_interrupt);
+	const bool explicit_transaction = GENERATE(false, true);
+	CAPTURE(threads, reset_interrupt, explicit_transaction);
 	NestedReadTest test(threads);
+	if (explicit_transaction) {
+		test.Query("BEGIN");
+	}
 	test.fs->gate.clear_first_interrupt = reset_interrupt;
 	test.future = std::async(std::launch::async, [&]() -> idx_t {
 		LerobotNestedQuery query(*test.connection->context, "SELECT * FROM nested_gate()", true);

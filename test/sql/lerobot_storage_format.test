@@ -1,0 +1,91 @@
+# name: test/sql/lerobot_storage_format.test
+# description: Storage-format validation and empty Lance scans need no Lance extension
+# group: [sql]
+
+require parquet
+
+require json
+
+require lerobot
+
+statement ok
+COPY (SELECT 0::BIGINT AS episode_index, 'move' AS task, 1::FLOAT AS action WHERE false)
+    TO '{TEST_DIR}/lerobot_storage_format' (FORMAT lerobot, FPS 10,
+    FEATURES '{"action":{"dtype":"float32","shape":[1]}}');
+
+statement ok
+CREATE TABLE dataset_info AS SELECT *, 'unsupported' AS storage_format
+    FROM lerobot_info('{TEST_DIR}/lerobot_storage_format');
+
+statement ok
+COPY dataset_info TO '{TEST_DIR}/lerobot_storage_format/meta/info.json' (FORMAT JSON, ARRAY false);
+
+statement error
+SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_storage_format');
+----
+Unsupported LeRobot storage_format 'unsupported'
+
+statement ok
+UPDATE dataset_info SET storage_format = 'lance';
+
+statement ok
+COPY dataset_info TO '{TEST_DIR}/lerobot_storage_format/meta/info.json' (FORMAT JSON, ARRAY false);
+
+statement ok
+SET autoinstall_known_extensions = false;
+
+query I
+SELECT count(*) FROM lerobot_scan('{TEST_DIR}/lerobot_storage_format');
+----
+0
+
+query I
+SELECT count(*) FROM lerobot_scan('{TEST_DIR}/lerobot_storage_format', episode_indices := []);
+----
+0
+
+query T
+SELECT column_type FROM (DESCRIBE SELECT action FROM lerobot_scan('{TEST_DIR}/lerobot_storage_format'));
+----
+FLOAT
+
+statement error
+SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_storage_format', filename := false);
+----
+only supported for Parquet datasets
+
+# Public RGB datasets retain explicit false legacy depth markers.
+statement ok
+CREATE TABLE rgb_info AS SELECT * EXCLUDE (features, video_path, storage_format), 'lerobot' AS storage_format,
+    'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
+    {'camera': {'dtype': 'video', 'shape': [16,16,3], 'video_info': {'video.is_depth_map': false}},
+     'action': {'dtype': 'float32', 'shape': [1]}} AS features FROM dataset_info;
+
+foreach layout lerobot lance
+
+statement ok
+UPDATE rgb_info SET storage_format = '${layout}';
+
+statement ok
+COPY rgb_info TO '{TEST_DIR}/lerobot_storage_format/meta/info.json' (FORMAT JSON, ARRAY false);
+
+query I
+SELECT count(*) FROM lerobot_scan('{TEST_DIR}/lerobot_storage_format', refresh := true);
+----
+0
+
+endloop
+
+# Case-insensitive DuckDB identifiers must remain distinct after dot normalization.
+statement ok
+CREATE TABLE collision_info AS SELECT * EXCLUDE (features),
+    {'a.b': {'dtype': 'float32', 'shape': [1]}, 'a_B': {'dtype': 'float32', 'shape': [1]}} AS features
+    FROM dataset_info;
+
+statement ok
+COPY collision_info TO '{TEST_DIR}/lerobot_storage_format/meta/info.json' (FORMAT JSON, ARRAY false);
+
+statement error
+SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_storage_format', refresh := true);
+----
+LeRobot Lance feature names collide after replacing '.' with '_'

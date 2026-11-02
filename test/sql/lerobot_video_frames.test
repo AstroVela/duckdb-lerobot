@@ -86,6 +86,16 @@ COPY (
     FROM read_blob('{TEST_DIR}/lerobot_video_frames/video-000.mp4')
 ) TO '{TEST_DIR}/lerobot_video_frames/video-001.mp4' (FORMAT BLOB);
 
+# Compare temporal APIs against ordinary decoding from this FFmpeg build.
+# Independent CLI pixel and resize parity is covered by test_video_pixels.py.
+statement ok
+CREATE TEMP TABLE video_frame_reference AS
+SELECT frame_index AS ref_frame_index, image AS ref_pixels
+FROM lerobot_video_frames(
+    '{TEST_DIR}/lerobot_video_frames', [0, 1],
+    video_keys := ['observation.images.front'], frame_indices := [0, 1, 2, 3]
+);
+
 query IIRRIIIII
 SELECT episode_index, frame_index, video_timestamp, decoded_timestamp,
        width, height, channels, octet_length(image), length(md5(image))
@@ -152,10 +162,10 @@ FROM lerobot_video_frames(
 ----
 8	8	144	144
 
-# These hashes are the PyAV rgb24 output resized with Pillow NEAREST, matching
-# the current Daft LeRobot decoder's pixel contract.
-query IT
-SELECT frame_index, md5(image)
+# Keep shape and frame identity checks here; the independent CLI conformance
+# checks exact RGB bytes and Pillow-compatible NEAREST coordinates.
+query III
+SELECT frame_index, octet_length(image), length(md5(image))
 FROM lerobot_video_frames(
     '{TEST_DIR}/lerobot_video_frames',
     [0],
@@ -166,8 +176,8 @@ FROM lerobot_video_frames(
 )
 ORDER BY frame_index;
 ----
-0	499a430c62bdd056e51ccd6dab4ea9c3
-1	6fc8ed6bd6221ef2e8f6303f2d34c5bf
+0	144	32
+1	144	32
 
 # A target exactly between two frames resolves to the earlier frame, matching
 # LeRobot/PyTorch argmin tie behaviour.
@@ -203,8 +213,8 @@ ORDER BY request_ordinal, delta_ordinal;
 
 # Repeated padded targets select the same decoded frame. A one-byte output
 # budget forces one image per output chunk without changing the result.
-query IIRT
-SELECT delta_ordinal, target_frame_index, decoded_timestamp, md5(image)
+query IIRI
+SELECT delta_ordinal, target_frame_index, decoded_timestamp, image = ref_pixels
 FROM lerobot_video_windows(
     '{TEST_DIR}/lerobot_video_frames',
     [struct_pack(request_id := 10::BIGINT, episode_index := 0::BIGINT, frame_index := 0::BIGINT)],
@@ -212,18 +222,19 @@ FROM lerobot_video_windows(
     delta_timestamps := [-0.5, 0.0, 0.5],
     max_output_bytes := 1
 )
+JOIN video_frame_reference ON target_frame_index = ref_frame_index
 ORDER BY delta_ordinal;
 ----
-0	0	0.0	520e780c7e7644f58eac8ad5c259a341
-1	0	0.0	520e780c7e7644f58eac8ad5c259a341
-2	1	0.5	09b3f62794209739b33ee60adadcae39
+0	0	0.0	true
+1	0	0.0	true
+2	1	0.5	true
 
 # Relation targets decode in shard/timestamp order while target_ordinal keeps
 # duplicate occurrences distinct for rejoin. The first two requests fan out
 # from one RGB conversion.
-query IIIIRT
+query IIIIRI
 SELECT request_id, target_ordinal, delta_index, target_frame_index,
-       decoded_timestamp, md5(image)
+       decoded_timestamp, image = ref_pixels
 FROM lerobot_video_targets(
     '{TEST_DIR}/lerobot_video_frames',
     (SELECT * FROM (VALUES
@@ -237,15 +248,16 @@ FROM lerobot_video_targets(
     max_pending_targets := 2,
     max_output_bytes := 1
 )
+JOIN video_frame_reference ON target_frame_index = ref_frame_index
 ORDER BY target_ordinal;
 ----
-30	0	0	0	0.0	520e780c7e7644f58eac8ad5c259a341
-31	1	1	0	0.0	520e780c7e7644f58eac8ad5c259a341
-32	2	2	1	0.5	09b3f62794209739b33ee60adadcae39
+30	0	0	0	0.0	true
+31	1	1	0	0.0	true
+32	2	2	1	0.5	true
 
 # Stable IDs accompany decoded pixels, including duplicate padded frames.
-query IIRT
-SELECT target_id, delta_index, decoded_timestamp, md5(image)
+query IIRI
+SELECT target_id, delta_index, decoded_timestamp, image = ref_pixels
 FROM lerobot_video_targets(
     '{TEST_DIR}/lerobot_video_frames',
     (SELECT * FROM (VALUES
@@ -260,12 +272,13 @@ FROM lerobot_video_targets(
     max_pending_targets := 2,
     max_output_bytes := 1
 )
+JOIN video_frame_reference ON target_frame_index = ref_frame_index
 ORDER BY target_id;
 ----
--5	0	0.0	520e780c7e7644f58eac8ad5c259a341
-42	1	0.0	520e780c7e7644f58eac8ad5c259a341
-42	1	0.0	520e780c7e7644f58eac8ad5c259a341
-99	2	0.5	09b3f62794209739b33ee60adadcae39
+-5	0	0.0	true
+42	1	0.0	true
+42	1	0.0	true
+99	2	0.5	true
 
 # Standard source APIs publish decoder/open/seek/bytes/frame/conversion counters
 # through DuckDB's native JSON profiler.

@@ -138,18 +138,6 @@ vector<string> GetVideoKeys(TableFunctionBindInput &input, const LerobotVideoMet
 	return result;
 }
 
-string ValueListSQL(const vector<string> &values) {
-	string result = "[";
-	for (idx_t index = 0; index < values.size(); index++) {
-		if (index > 0) {
-			result += ", ";
-		}
-		result += Value(values[index]).ToSQLString();
-	}
-	result += "]";
-	return result;
-}
-
 string IntegerListSQL(const vector<int64_t> &values) {
 	string result = "(";
 	for (idx_t index = 0; index < values.size(); index++) {
@@ -468,9 +456,9 @@ unique_ptr<FunctionData> LerobotVideoFramesBind(ClientContext &context, TableFun
 			D_ASSERT(partition.first < data_files.size());
 			vector<string> partition_file {data_files[partition.first]};
 			string frame_query = "SELECT CAST(episode_index AS BIGINT), CAST(frame_index AS BIGINT), "
-			                     "CAST(timestamp AS DOUBLE) FROM read_parquet(" +
-			                     ValueListSQL(partition_file) + ") WHERE episode_index IN " +
-			                     IntegerListSQL(partition.second);
+			                     "CAST(timestamp AS DOUBLE) FROM " +
+			                     LerobotFrameSourceSQL(partition_file, dataset_metadata->IsLance()) +
+			                     " WHERE episode_index IN " + IntegerListSQL(partition.second);
 			if (frame_filter != input.named_parameters.end()) {
 				frame_query += " AND frame_index IN " + IntegerListSQL(frame_indices);
 			}
@@ -534,7 +522,7 @@ GroupWindowRequestsByDataFile(const LerobotDatasetMetadata &metadata,
 string BuildVideoWindowQuery(const vector<LerobotVideoWindowRequest> &requests,
                              const vector<LerobotTemporalDelta> &deltas,
                              const unordered_map<int64_t, int64_t> &episode_lengths, const vector<string> &data_files,
-                             const vector<int64_t> &episode_indices) {
+                             const vector<int64_t> &episode_indices, bool is_lance = false) {
 	if (requests.empty() || deltas.empty() || data_files.empty()) {
 		return string();
 	}
@@ -585,8 +573,8 @@ string BuildVideoWindowQuery(const vector<LerobotVideoWindowRequest> &requests,
 	    "CAST(requested.episode_index AS BIGINT), CAST(requested.frame_index AS BIGINT), "
 	    "CAST(requested.target_frame_index AS BIGINT), CAST(frames.timestamp AS DOUBLE), "
 	    "CAST(count(frames.frame_index) OVER (PARTITION BY requested.request_ordinal, requested.delta_ordinal) "
-	    "AS BIGINT) FROM requested LEFT JOIN (SELECT episode_index, frame_index, timestamp FROM read_parquet(" +
-	    ValueListSQL(data_files) + ") WHERE episode_index IN " + IntegerListSQL(episode_indices) +
+	    "AS BIGINT) FROM requested LEFT JOIN (SELECT episode_index, frame_index, timestamp FROM " +
+	    LerobotFrameSourceSQL(data_files, is_lance) + " WHERE episode_index IN " + IntegerListSQL(episode_indices) +
 	    " AND frame_index IN " + IntegerListSQL(target_frame_indices) +
 	    ") frames ON frames.episode_index = requested.episode_index AND "
 	    "frames.frame_index = requested.target_frame_index ORDER BY requested.request_ordinal, "
@@ -672,8 +660,8 @@ unique_ptr<FunctionData> LerobotVideoWindowsBind(ClientContext &context, TableFu
 			partition_episodes.erase(std::unique(partition_episodes.begin(), partition_episodes.end()),
 			                         partition_episodes.end());
 			vector<string> partition_file {data_files[partition.first]};
-			frame_queries.push_back(
-			    BuildVideoWindowQuery(partition.second, deltas, episode_lengths, partition_file, partition_episodes));
+			frame_queries.push_back(BuildVideoWindowQuery(partition.second, deltas, episode_lengths, partition_file,
+			                                              partition_episodes, dataset_metadata->IsLance()));
 		}
 	}
 	return make_uniq<LerobotVideoFramesBindData>(std::move(video_metadata), std::move(routes), std::move(frame_queries),
@@ -1782,11 +1770,12 @@ unordered_map<string, double> ReadTargetTimestamps(ClientContext &context, const
 	std::sort(episode_indices.begin(), episode_indices.end());
 	episode_indices.erase(std::unique(episode_indices.begin(), episode_indices.end()), episode_indices.end());
 	auto data_files = bind_data.dataset->ResolveDataFiles(episode_indices);
+	const auto storage = bind_data.dataset->IsLance() ? "Lance" : "Parquet";
 	if (data_files.empty()) {
-		throw InvalidInputException("LeRobot target episodes do not resolve to a Parquet data shard");
+		throw InvalidInputException("LeRobot target episodes do not resolve to a %s data shard", storage);
 	}
 
-	auto matches = lookup.Lookup(context, data_files, frame_keys, targets.size());
+	auto matches = lookup.Lookup(context, data_files, frame_keys, targets.size(), bind_data.dataset->IsLance());
 	unordered_map<string, double> timestamps;
 	for (idx_t key = 0; key < frame_keys.size(); key++) {
 		const auto episode_index = frame_keys[key].first;
@@ -1794,11 +1783,11 @@ unordered_map<string, double> ReadTargetTimestamps(ClientContext &context, const
 		const auto &match = matches[key];
 		if (match.count != 1 || !match.has_timestamp) {
 			if (match.count == 0) {
-				throw InvalidInputException("LeRobot episode %d has no Parquet row for frame %d", episode_index,
+				throw InvalidInputException("LeRobot episode %d has no %s row for frame %d", episode_index, storage,
 				                            frame_index);
 			}
-			throw InvalidInputException("LeRobot episode %d has %d Parquet rows for frame %d", episode_index,
-			                            match.count, frame_index);
+			throw InvalidInputException("LeRobot episode %d has %d %s rows for frame %d", episode_index, match.count,
+			                            storage, frame_index);
 		}
 		if (!std::isfinite(match.timestamp) || match.timestamp < 0) {
 			throw InvalidInputException("Invalid LeRobot timestamp for episode %d, frame %d", episode_index,
@@ -2455,6 +2444,10 @@ public:
 						frame_connection = make_shared_ptr<Connection>(*database);
 						InheritLerobotReaderSettings(executor.context, *frame_connection->context);
 						state->RegisterConnection(frame_connection);
+						InitializeLerobotReaderTransaction(executor.context, *frame_connection);
+						if (executor.context.IsInterrupted() || state->ShouldStop()) {
+							throw InterruptException();
+						}
 					}
 					frame_result = frame_connection->SendQuery(query);
 					if (frame_result->HasError()) {

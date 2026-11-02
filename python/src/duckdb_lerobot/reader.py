@@ -44,12 +44,12 @@ class DecodedBatch:
 
 
 class TorchCodecReader:
-    """Resolve targets in DuckDB and decode local constant-frame-rate videos.
+    """Resolve targets in DuckDB and decode constant-frame-rate RGB videos.
 
     The caller owns the connection and loads the matching lerobot extension.
-    Use a dedicated connection while iterating: another query replaces its active
-    result. Instances are single-threaded and must be constructed in each worker.
-    Python opens trusted local videos directly, outside DuckDB's filesystem.
+    Instances are single-threaded and must be constructed in each worker. Local
+    video files open directly; Lance blobs use the caller's DuckDB filesystem
+    and credentials, then pass bounded, complete encoded videos to TorchCodec.
     """
 
     def __init__(
@@ -60,6 +60,7 @@ class TorchCodecReader:
         device: str = "cpu",
         batch_size: int = 32,
         max_cached_decoders: int = 4,
+        max_video_bytes: int = 64 * 1024 * 1024,
         num_ffmpeg_threads: int = 1,
         tolerance: float = 1e-4,
     ) -> None:
@@ -71,6 +72,7 @@ class TorchCodecReader:
         for name, value in (
             ("batch_size", batch_size),
             ("max_cached_decoders", max_cached_decoders),
+            ("max_video_bytes", max_video_bytes),
             ("num_ffmpeg_threads", num_ffmpeg_threads),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -90,6 +92,7 @@ class TorchCodecReader:
         self.device = device
         self.batch_size = batch_size
         self.max_cached_decoders = max_cached_decoders
+        self.max_video_bytes = max_video_bytes
         self.num_ffmpeg_threads = num_ffmpeg_threads
         self.tolerance = tolerance
         self._decoders: OrderedDict[str, Any] = OrderedDict()
@@ -110,10 +113,42 @@ class TorchCodecReader:
         self.close()
 
     def _decoder(self, path: str) -> Any:
-        resolved = Path(path).resolve(strict=True)
-        if not resolved.is_relative_to(self.dataset):
-            raise ValueError("Video files must be inside the local dataset directory")
-        key = str(resolved)
+        is_blob = path.startswith("lance-blob://")
+        payload = None
+        if is_blob:
+            key = path
+            # Check the bound before reading bytes, including on cache hits.
+            # Metadata access alone does not establish payload GET permission.
+            row = self.connection.execute(
+                "SELECT size FROM read_blob(?)", [path]
+            ).fetchone()
+            if row is None or row[0] is None or row[0] <= 0:
+                raise ValueError("Lance video blob must have a positive size")
+            size = row[0]
+            if size > self.max_video_bytes:
+                raise ValueError(
+                    f"Lance video blob size {size} exceeds max_video_bytes "
+                    f"({self.max_video_bytes}); increase the limit or use SQL decoding"
+                )
+            # read_blob has no range-read interface. Read the bounded payload
+            # before reusing a decoder so server-side GET revocation is honored.
+            row = self.connection.execute(
+                "SELECT content FROM read_blob(?)", [path]
+            ).fetchone()
+            if row is None or row[0] is None or len(row[0]) != size:
+                raise ValueError("Lance video blob size changed while reading")
+            payload = row[0]
+        else:
+            if "://" in path:
+                raise ValueError(
+                    "Video paths must be local files or lance-blob:// URIs"
+                )
+            resolved = Path(path).resolve(strict=True)
+            if not resolved.is_relative_to(self.dataset):
+                raise ValueError(
+                    "Video files must be inside the local dataset directory"
+                )
+            key = str(resolved)
         if key in self._decoders:
             self._decoders.move_to_end(key)
             return self._decoders[key]
@@ -126,8 +161,9 @@ class TorchCodecReader:
             ) from exc
         if len(self._decoders) >= self.max_cached_decoders:
             self._decoders.popitem(last=False)
+        source: str | bytes = payload if payload is not None else key
         decoder = VideoDecoder(
-            key,
+            source,
             device=self.device,
             dimension_order="NCHW",
             num_ffmpeg_threads=self.num_ffmpeg_threads,
@@ -184,15 +220,24 @@ class TorchCodecReader:
         ).fetchone()[0]:
             raise ValueError("TorchCodecReader requires enable_external_access=true")
         self._active = True
+        result = None
         try:
-            result = self.connection.execute(
-                sql, [str(self.dataset), *parameters, deltas, self.tolerance]
-            )
+            # A relation owns its result independently of connection.execute().
+            # Blob reads can therefore use the original session (including its
+            # settings and secrets) without replacing the pending target rows.
+            result = self.connection.sql(
+                sql,
+                params=[str(self.dataset), *parameters, deltas, self.tolerance],
+            ).execute()
             while rows := result.fetchmany(self.batch_size):
                 targets = tuple(VideoTarget(*row) for row in rows)
                 yield self._decode(targets)
         finally:
-            self._active = False
+            try:
+                if result is not None:
+                    result.close()
+            finally:
+                self._active = False
 
     def _decode(self, targets: tuple[VideoTarget, ...]) -> DecodedBatch:
         images: list[Any] = [None] * len(targets)

@@ -66,9 +66,10 @@ struct LerobotScanSchema {
 };
 
 struct LerobotDatasetInfo {
-	LerobotDatasetInfo() : fps(0), total_episodes(0), total_frames(0), total_tasks(0) {
+	LerobotDatasetInfo() : storage_format("lerobot"), fps(0), total_episodes(0), total_frames(0), total_tasks(0) {
 	}
 
+	string storage_format;
 	string codebase_version;
 	string data_path_template;
 	string video_path_template;
@@ -83,10 +84,14 @@ struct LerobotDatasetInfo {
 };
 
 LerobotDatasetInfo ReadLerobotDatasetInfo(ClientContext &context, const string &root);
+void EnsureLerobotLanceExtension(ClientContext &context);
+
+//! A single Lance table or the native Parquet reader for a group of shards.
+string LerobotFrameSourceSQL(const vector<string> &paths, bool is_lance = false);
 
 //! Immutable, dataset-level metadata used to route an episode to a small set
-//! of Parquet shards. Parquet footers and row-group statistics remain owned by
-//! DuckDB's native Parquet caches.
+//! of Parquet shards or a single Lance table. Reader-specific caches remain
+//! owned by the underlying extensions.
 class LerobotDatasetMetadata final : public ObjectCacheEntry {
 public:
 	struct FileFingerprint {
@@ -118,7 +123,9 @@ public:
 	                       vector<string> data_files_p, FileFingerprint info_fingerprint_p,
 	                       vector<MetadataFile> episode_files_p = {});
 
-	static shared_ptr<LerobotDatasetMetadata> Get(ClientContext &context, const string &root, bool refresh);
+	//! Video callers reject unsupported layouts before loading frame storage.
+	static shared_ptr<LerobotDatasetMetadata> Get(ClientContext &context, const string &root, bool refresh,
+	                                              bool for_video = false);
 	//! Return an existing cache entry without reading dataset storage or creating
 	//! a new entry.
 	static shared_ptr<LerobotDatasetMetadata> Peek(ClientContext &context, const string &root);
@@ -137,6 +144,9 @@ public:
 
 	const string &GetRoot() const {
 		return root;
+	}
+	bool IsLance() const {
+		return info.storage_format == "lance";
 	}
 	const string &GetVideoPathTemplate() const {
 		return info.video_path_template;
@@ -162,13 +172,16 @@ public:
 	idx_t GetEpisodeCount() const {
 		return static_cast<idx_t>(info.total_episodes);
 	}
+	int64_t GetTotalFrames() const {
+		return info.total_frames;
+	}
 
 private:
 	static string CacheKey(ClientContext &context, const string &root);
 	static FileFingerprint ReadInfoFingerprint(ClientContext &context, const string &root);
 	static vector<MetadataFile> ReadEpisodeFiles(ClientContext &context, const string &root);
 	static shared_ptr<LerobotDatasetMetadata> Load(ClientContext &context, const string &root,
-	                                               const FileFingerprint &info_fingerprint);
+	                                               const FileFingerprint &info_fingerprint, bool for_video);
 	bool IsValid(ClientContext &context) const;
 	bool EpisodeFilesAreValid(ClientContext &context) const;
 
@@ -180,6 +193,10 @@ private:
 	FileFingerprint info_fingerprint;
 	vector<MetadataFile> episode_files;
 };
+
+//! Compare frames.lance with info.json. Only frame scans call this, so
+//! metadata-only functions do not require the lance extension.
+void LerobotCheckLanceFrameCount(ClientContext &context, const LerobotDatasetMetadata &metadata);
 
 //! Lazily loaded video control plane. Keeping this separate prevents ordinary
 //! frame scans from materializing one route per episode and camera.

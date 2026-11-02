@@ -43,32 +43,14 @@ string CacheDigest(const string &input) {
 	return result;
 }
 
-string S3StorageCacheKey(ClientContext &context, const string &root) {
-	if (!StringUtil::StartsWith(root, "s3://") && !StringUtil::StartsWith(root, "s3a://") &&
-	    !StringUtil::StartsWith(root, "s3n://") && !StringUtil::StartsWith(root, "r2://") &&
-	    !StringUtil::StartsWith(root, "gcs://") && !StringUtil::StartsWith(root, "gs://")) {
-		return string();
-	}
-	// A public info.json fingerprint proves neither storage identity nor access
-	// to episode metadata. Fingerprint HTTPFS's S3 settings and every secret whose
-	// scope overlaps this dataset, including scopes below meta/episodes/. Looking
-	// up only the manifest's winning secret misses file-specific overrides.
-	string key = "lerobot_s3_access_v1";
-	for (const auto name : {"s3_endpoint", "s3_region", "s3_url_style", "s3_use_ssl", "s3_access_key_id",
-	                        "s3_secret_access_key", "s3_session_token", "s3_kms_key_id", "s3_requester_pays",
-	                        "s3_url_compatibility_mode", "enable_global_s3_configuration"}) {
-		Value value;
-		auto setting = context.TryGetCurrentSetting(name, value);
-		AppendCacheComponent(key, setting ? to_string(static_cast<uint8_t>(setting.GetScope())) : "unset");
-		AppendCacheComponent(key, value.ToSQLString());
-	}
+string StorageSecretsCacheKey(ClientContext &context, const string &root, bool lance_only) {
 	auto &manager = SecretManager::Get(context);
 	auto secrets = manager.AllSecrets(CatalogTransaction::GetSystemCatalogTransaction(context));
 	vector<string> entries;
 	for (const auto &entry : secrets) {
 		const auto &secret = *entry.secret;
 		const auto &type = secret.GetType();
-		if (type != "s3" && type != "r2" && type != "gcs" && type != "aws") {
+		if (lance_only ? type != "lance" : (type != "s3" && type != "r2" && type != "gcs" && type != "aws")) {
 			continue;
 		}
 		bool overlaps = false;
@@ -95,9 +77,42 @@ string S3StorageCacheKey(ClientContext &context, const string &root) {
 		entries.push_back(CacheDigest(encoded));
 	}
 	std::sort(entries.begin(), entries.end());
+	string key;
 	for (const auto &entry : entries) {
 		AppendCacheComponent(key, entry);
 	}
+	return key;
+}
+
+string LanceStorageCacheKey(ClientContext &context, const string &root) {
+	// Keep the optional dependency out of ordinary v3-only connections.
+	if (!context.db->ExtensionIsLoaded("lance")) {
+		return string();
+	}
+	const auto secrets = StorageSecretsCacheKey(context, root, true);
+	return secrets.empty() ? string() : ",lance_access=" + CacheDigest(secrets);
+}
+
+string S3StorageCacheKey(ClientContext &context, const string &root) {
+	if (!StringUtil::StartsWith(root, "s3://") && !StringUtil::StartsWith(root, "s3a://") &&
+	    !StringUtil::StartsWith(root, "s3n://") && !StringUtil::StartsWith(root, "r2://") &&
+	    !StringUtil::StartsWith(root, "gcs://") && !StringUtil::StartsWith(root, "gs://")) {
+		return string();
+	}
+	// A public info.json fingerprint proves neither storage identity nor access
+	// to episode metadata. Fingerprint HTTPFS's S3 settings and every secret whose
+	// scope overlaps this dataset, including scopes below meta/episodes/. Looking
+	// up only the manifest's winning secret misses file-specific overrides.
+	string key = "lerobot_s3_access_v1";
+	for (const auto name : {"s3_endpoint", "s3_region", "s3_url_style", "s3_use_ssl", "s3_access_key_id",
+	                        "s3_secret_access_key", "s3_session_token", "s3_kms_key_id", "s3_requester_pays",
+	                        "s3_url_compatibility_mode", "enable_global_s3_configuration"}) {
+		Value value;
+		auto setting = context.TryGetCurrentSetting(name, value);
+		AppendCacheComponent(key, setting ? to_string(static_cast<uint8_t>(setting.GetScope())) : "unset");
+		AppendCacheComponent(key, value.ToSQLString());
+	}
+	key += StorageSecretsCacheKey(context, root, false);
 	return ",s3_access=" + CacheDigest(key);
 }
 
@@ -193,15 +208,19 @@ string LerobotRootCacheKey(ClientContext &context, const string &root) {
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto expanded = fs.ExpandPath(NormalizeLerobotRoot(root));
 	if (IsQualifiedRoot(fs, expanded)) {
-		return Value(expanded).ToSQLString() + S3StorageCacheKey(context, expanded);
+		return Value(expanded).ToSQLString() + S3StorageCacheKey(context, expanded) +
+		       LanceStorageCacheKey(context, expanded);
 	}
 	// Quote each component so roots and search lists cannot collide. No storage
 	// lookup is needed: Peek describes the last cached result, not freshness.
-	auto key = Value(fs.JoinPath(FileSystem::GetWorkingDirectory(), expanded)).ToSQLString();
+	const auto local_root = fs.JoinPath(FileSystem::GetWorkingDirectory(), expanded);
+	auto key = Value(local_root).ToSQLString() + LanceStorageCacheKey(context, local_root);
 	const auto search_path = GetFileSearchPath(context);
 	if (!search_path.empty()) {
 		for (const auto &path : StringUtil::Split(search_path, ',')) {
-			key += "," + Value(fs.ExpandPath(path)).ToSQLString();
+			const auto search_root = fs.ExpandPath(path);
+			key += "," + Value(search_root).ToSQLString() +
+			       LanceStorageCacheKey(context, fs.JoinPath(search_root, expanded));
 		}
 	}
 	return key;

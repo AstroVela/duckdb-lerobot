@@ -40,7 +40,8 @@ public:
 	//! Keys must be sorted and unique. Results have the same order. Counts are
 	//! combined across *all* selected files, including misplaced duplicate rows.
 	vector<LerobotTimestampMatch> Lookup(ClientContext &context, const vector<string> &files,
-	                                     const vector<LerobotTimestampKey> &keys, idx_t request_count = 0);
+	                                     const vector<LerobotTimestampKey> &keys, idx_t request_count = 0,
+	                                     bool is_lance = false);
 	LerobotTimestampLookupStats GetStats() const;
 
 private:

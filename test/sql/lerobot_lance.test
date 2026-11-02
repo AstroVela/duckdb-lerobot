@@ -1,0 +1,181 @@
+# name: test/sql/lerobot_lance.test
+# description: LeRobot Lance frames preserve the Parquet scan contract
+# group: [sql]
+
+require parquet
+
+require json
+
+require lerobot
+
+require lance
+
+statement ok
+CREATE VIEW input_frames AS SELECT (i // 3)::BIGINT AS episode_index, 'move' AS task,
+    [i, i + 1]::FLOAT[2] AS "observation.state", i::FLOAT AS action,
+    (i % 2 = 0) AS "next.done" FROM range(6) t(i) ORDER BY i;
+
+foreach layout parquet lance
+
+statement ok
+COPY input_frames TO '{TEST_DIR}/lerobot_${layout}' (FORMAT lerobot, FPS 10,
+    FEATURES '{"observation.state":{"dtype":"float32","shape":[2]},"action":{"dtype":"float32","shape":[1]},"next.done":{"dtype":"bool","shape":[1]}}');
+
+endloop
+
+statement ok
+CREATE TABLE lance_info AS SELECT *, 'lance' AS storage_format FROM lerobot_info('{TEST_DIR}/lerobot_lance');
+
+# The retained Parquet path is deliberately unusable in the Lance layout.
+statement ok
+UPDATE lance_info SET data_path = 'missing/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet';
+
+statement ok
+COPY lance_info TO '{TEST_DIR}/lerobot_lance/meta/info.json' (FORMAT JSON, ARRAY false);
+
+statement ok
+CREATE VIEW lance_frames_input AS SELECT "observation.state"::FLOAT[2] AS observation_state, action,
+    "next.done" AS next_done, timestamp, frame_index, episode_index, "index", task_index
+    FROM lerobot_scan('{TEST_DIR}/lerobot_parquet');
+
+# Separate writes exercise episode filtering across multiple Lance fragments.
+statement ok
+COPY (SELECT * FROM lance_frames_input WHERE "index" < 3 ORDER BY "index")
+    TO '{TEST_DIR}/lerobot_lance/frames.lance' (FORMAT lance);
+
+statement ok
+COPY (SELECT * FROM lance_frames_input WHERE "index" >= 3 ORDER BY "index")
+    TO '{TEST_DIR}/lerobot_lance/frames.lance' (FORMAT lance, mode 'append');
+
+query I
+SELECT count(*) FROM lerobot_scan('{TEST_DIR}/lerobot_lance');
+----
+6
+
+query I
+SELECT count(*) FROM ((SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_parquet')
+    EXCEPT ALL SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_lance')) UNION ALL
+    (SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_lance')
+    EXCEPT ALL SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_parquet')));
+----
+0
+
+query I
+SELECT count(*) FROM ((DESCRIBE SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_parquet'))
+    EXCEPT ALL (DESCRIBE SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_lance')));
+----
+0
+
+query II
+SELECT episode_index, count(*) FROM lerobot_scan('{TEST_DIR}/lerobot_lance', episode_indices := [1, 1]) GROUP BY ALL;
+----
+1	3
+
+query I
+SELECT count(*) FROM lerobot_scan('{TEST_DIR}/lerobot_lance', episode_indices := []);
+----
+0
+
+query I
+SELECT count(*) FROM lerobot_scan('{TEST_DIR}/lerobot_lance') WHERE action >= 4;
+----
+2
+
+query I
+SELECT count(*) FROM lerobot_scan('{TEST_DIR}/lerobot_lance', episode_indices := [2]);
+----
+0
+
+foreach option union_by_name binary_as_string filename file_row_number
+
+statement error
+SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_lance', ${option} := false);
+----
+only supported for Parquet datasets
+
+endloop
+
+# Video decoding and blob capability errors are covered by the conformance tests.
+
+# A frame table that disagrees with info.json fails the frame scan, while
+# metadata-only temporal targets never open frames.lance.
+statement ok
+COPY (SELECT * FROM lance_frames_input WHERE "index" = 5)
+    TO '{TEST_DIR}/lerobot_lance/frames.lance' (FORMAT lance, mode 'append');
+
+statement error
+SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_lance', refresh := true);
+----
+info.json declares 6 frames, but frames.lance contains 7 rows
+
+query I
+SELECT target_frame_index FROM lerobot_temporal_targets('{TEST_DIR}/lerobot_lance',
+    (SELECT 1 AS request_id, 0 AS episode_index, 1 AS frame_index, 0 AS delta_index));
+----
+1
+
+statement ok
+COPY (SELECT * FROM lance_frames_input ORDER BY "index")
+    TO '{TEST_DIR}/lerobot_lance/frames.lance' (FORMAT lance, mode 'overwrite');
+
+query I
+SELECT count(*) FROM lerobot_scan('{TEST_DIR}/lerobot_lance', refresh := true);
+----
+6
+
+# Image features stay frame columns, matching the Parquet layout. Fresh paths
+# avoid the lance extension's per-connection dataset cache.
+foreach layout parquet lance
+
+statement ok
+COPY input_frames TO '{TEST_DIR}/lerobot_image_${layout}' (FORMAT lerobot, FPS 10,
+    FEATURES '{"observation.state":{"dtype":"float32","shape":[2]},"action":{"dtype":"float32","shape":[1]},"next.done":{"dtype":"bool","shape":[1]}}');
+
+statement ok
+CREATE OR REPLACE TABLE image_info AS SELECT * EXCLUDE (features),
+    replace('${layout}', 'parquet', 'lerobot') AS storage_format,
+    struct_insert(features, "observation.image" := {'dtype': 'image', 'shape': [2, 3, 3], 'names': NULL::JSON})
+    AS features FROM lerobot_info('{TEST_DIR}/lerobot_image_${layout}');
+
+statement ok
+COPY image_info TO '{TEST_DIR}/lerobot_image_${layout}/meta/info.json' (FORMAT JSON, ARRAY false);
+
+endloop
+
+statement ok
+CREATE TABLE image_frames AS SELECT *, {'bytes': ('png-' || "index")::BLOB, 'path': NULL::VARCHAR}
+    AS "observation.image" FROM read_parquet('{TEST_DIR}/lerobot_image_parquet/data/chunk-000/file-000.parquet');
+
+statement ok
+COPY (SELECT * FROM image_frames ORDER BY "index")
+    TO '{TEST_DIR}/lerobot_image_parquet/data/chunk-000/file-000.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT "observation.state"::FLOAT[2] AS observation_state, action, "next.done" AS next_done, timestamp,
+    frame_index, episode_index, "index", task_index, "observation.image" AS observation_image
+    FROM image_frames ORDER BY "index") TO '{TEST_DIR}/lerobot_image_lance/frames.lance' (FORMAT lance);
+
+query T
+SELECT column_type FROM (DESCRIBE SELECT "observation.image" FROM lerobot_scan('{TEST_DIR}/lerobot_image_lance'));
+----
+STRUCT(bytes BLOB, path VARCHAR)
+
+query I
+SELECT count(*) FROM ((DESCRIBE SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_image_parquet'))
+    EXCEPT ALL (DESCRIBE SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_image_lance')));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_image_parquet')
+    EXCEPT ALL SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_image_lance')) UNION ALL
+    (SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_image_lance')
+    EXCEPT ALL SELECT * FROM lerobot_scan('{TEST_DIR}/lerobot_image_parquet')));
+----
+0
+
+query T
+SELECT "observation.image".bytes::VARCHAR FROM lerobot_scan('{TEST_DIR}/lerobot_image_lance', episode_indices := [1])
+    ORDER BY "index" LIMIT 1;
+----
+png-3

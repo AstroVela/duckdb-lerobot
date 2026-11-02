@@ -63,15 +63,37 @@ path is tested. Create a separate connection/reader per worker and avoid CUDA
 decoding in forked workers. The reader keeps at most `max_cached_decoders` video
 decoders (default 4); `batch_size` limits output rows, not total process memory.
 
-This first version reads trusted local, constant-frame-rate RGB videos at their
-original size. It checks decoded timestamps against `tolerance` (default 1e-4 s)
-and rejects misalignment. Download remote datasets first. Python opens videos
-directly; DuckDB filesystem credentials and sandbox rules do not apply. Restricted
-DuckDB connections (`enable_external_access=false`) are rejected.
+The reader supports trusted local dataset roots containing Parquet or Lance
+storage and constant-frame-rate RGB videos at their original size. It checks
+decoded timestamps against `tolerance` (default 1e-4 s) and rejects misalignment.
+Depth videos and remote dataset roots are unsupported. Local MP4 files open
+directly in Python; DuckDB filesystem credentials and sandbox rules do not apply
+to those files. Restricted DuckDB connections
+(`enable_external_access=false`) are rejected.
+
+For Lance datasets, load a matching AstroVela/lance-duckdb extension providing
+`lance_blob_uri` and the Lance Blob filesystem before creating the reader. The
+reader passes `lance-blob://` paths unchanged to DuckDB's `read_blob` on the
+original connection, including its session settings, secrets and filesystem
+access checks. Blob payloads can reside remotely if the connection authorizes
+their storage. Before every decoder reuse, the reader reads the complete
+size-bounded payload again to enforce current GET permissions; a metadata-only
+check cannot detect payload GET revocation. Decoder caching saves decoder
+initialization, not these payload reads. Do not mutate secrets or settings
+concurrently with decoding.
+
+Lance decoding loads each complete encoded video into memory before passing it
+to TorchCodec. `max_video_bytes` (default 64 MiB) rejects larger blobs before
+reading their payload. Increase this explicitly for larger video shards, or use
+SQL video decoding for filesystem-backed random access. At most
+`max_cached_decoders` complete encoded videos remain cached; peak memory also
+includes DuckDB/Python/TorchCodec copies, decode buffers and retained output
+batches. The byte limit applies to encoded Lance blobs, not decoded frame memory.
 
 Use a dedicated connection during iteration. Close a partially consumed iterator
 before closing the reader; `contextlib.closing(reader.batches(...))` is useful
-when breaking early. `reader.close()` releases cached decoders, not the connection.
+when breaking early. The reader releases its target result on exhaustion, error
+or iterator close. `reader.close()` releases cached decoders, not the connection.
 
 ## Verify
 
@@ -80,6 +102,13 @@ pip install './python[test]'
 LEROBOT_EXTENSION="$PWD/build/release/extension/lerobot/lerobot.duckdb_extension" \
   pytest python/tests
 ```
+
+Lance integration tests additionally require `pylance`, `pyarrow`,
+`lerobot-lancedb`, and `LANCE_EXTENSION` pointing to the matching AstroVela Lance
+extension. They compare pixels for inline, packed, dedicated and external blobs,
+exercise more than 12,000 pending targets, and check decoder release and
+warm-cache authorization after dropping or replacing a private-storage secret.
+The authenticated storage fixture uses a loopback server and public test keys.
 
 The [video-read benchmark](../benchmarks/README.md#results) compares this adapter,
 SQL FFmpeg, Daft and upstream LeRobot through the same contiguous RGB uint8

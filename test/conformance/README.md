@@ -235,3 +235,77 @@ also run the native visual SQL suite, including malformed-image and quantizer
 tests; they do not instrument the external Python codec stack. These jobs establish
 compatibility for the pinned versions and tested formats, not universal
 bit-for-bit equivalence across codecs, versions, or platforms.
+
+## Lance frame conformance
+
+`test_lance.py` converts a COPY-created dataset with
+`lerobot-lancedb==0.3.1` and `lancedb==0.37.1`. It compares all five tabular
+functions, frame column order/types, exact int64 values and episode selections.
+It also checks on-demand loading with automatic installation disabled, the
+missing-extension message, unsupported Blob capability diagnostics, temporal targets without Lance,
+and Lance secret cache isolation.
+The converter creates its own `frames.lance`, `videos.lance` and `meta.lance`;
+no Lance fixtures are checked in. Both release conformance jobs run this check.
+
+```bash
+build/release/duckdb -c "INSTALL lance;"
+build/release/conformance-venv/bin/python test/conformance/test_lance.py \
+  --duckdb build/release/duckdb \
+  --extension build/release/extension/lerobot/lerobot.duckdb_extension
+```
+
+`test/sql/lerobot_lance.test` additionally covers row-count validation, image
+feature parity and Parquet-only parameters; it uses `require lance` and
+skips when the test runner cannot load that extension.
+`test/sql/lerobot_storage_format.test` covers unknown formats, empty Lance
+results, normalized-name collisions and legacy false RGB depth markers without
+requiring Lance.
+
+## Lance video conformance
+
+`test_lance_video.py` requires a FFmpeg-enabled LeRobot build and the
+AstroVela Lance extension at `f791817e7b5dce775118e93cd00c34d20f973b0c`, built
+against the same DuckDB source. It converts a two-camera dataset whose episodes
+share video shards, compares routes and decoded frames/windows/targets against
+v3, and verifies actual inline, packed, dedicated and external blob storage.
+It also checks multiple video fragments, stable row IDs and depth pixels,
+rejects missing/duplicate/NULL mappings and mismatched sizes, and runs 5,000
+targets across repeated timestamp batches. Explicit transactions with equal
+built-in temporary secret views are allowed; uncommitted secret changes that
+make the caller and internal reader disagree are rejected.
+
+`test_lance_remote.py` uses the same converter environment and a loopback S3
+fixture. It compares all four video functions against local results using
+separate scoped HTTPFS and Lance secrets. In one connection, it warms the
+caches, drops or replaces credentials, and requires subsequent reads to fail.
+It also changes only the server's access policy while preserving credentials
+and object versions. External blob payloads require their own scoped secret;
+revoking that secret must reject decoding even with warm caches. These checks
+run with the external file cache enabled and disabled. All keys are public
+fixture values; authorization headers are never recorded.
+
+Run `test_lance_remote.py` with the same three artifact arguments shown below.
+It additionally needs DuckDB 1.5.5's HTTPFS extension, installed normally or
+passed with `--httpfs-extension /path/to/httpfs.duckdb_extension`.
+
+`test_video_pixels.py` checks the existing SQL H.264 fixture against an
+independent FFmpeg CLI decode and Pillow nearest-neighbor resize. It compares
+every RGB byte at original, smaller, non-square and larger dimensions, with
+out-of-order frame selection and a bounded decoder queue. This avoids encoding
+one FFmpeg version's color-conversion output into permanent MD5 expectations.
+It requires Python, Pillow and `ffmpeg`, and takes `--duckdb` and `--extension`.
+
+`test_lance_snapshot.py` requires `duckdb==1.5.5` in the converter environment
+and takes `--extension` and `--lance-extension`. In one connection, it warms
+video routes, deletes the backing row with pylance, and requires the next route
+query to reject the missing mapping. Appending the row creates a new route URI;
+the retained old URI still reads its original bytes. Both versions decode the
+same frames while their history remains available.
+
+```bash
+build/release/conformance-venv/bin/python test/conformance/test_lance_video.py \
+  --duckdb build/lance-integration/duckdb \
+  --extension build/lance-integration/extension/lerobot/lerobot.duckdb_extension \
+  --lance-extension build/lance-integration/extension/lance/lance.duckdb_extension \
+  --rgb-codec libaom-av1
+```

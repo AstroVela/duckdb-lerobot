@@ -587,6 +587,39 @@ FROM lerobot_scan('{TEST_DIR}/lerobot_incomplete_depth', refresh := true);
 ----
 uses a legacy depth marker; use info.is_depth_map instead
 
+# Public RGB datasets such as lerobot/pusht retain an explicit false legacy
+# marker, under either info or video_info. It does not claim depth.
+statement ok
+COPY (
+    SELECT 'v3.0' AS codebase_version,
+           'data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet' AS data_path,
+           'videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4' AS video_path,
+           30 AS fps,
+           0 AS total_episodes,
+           0 AS total_frames,
+           0 AS total_tasks,
+           struct_pack(
+               "observation.images.left" := struct_pack(
+                   dtype := 'video',
+                   shape := [64, 64, 3],
+                   info := struct_pack("video.is_depth_map" := false)
+               ),
+               "observation.images.right" := struct_pack(
+                   dtype := 'video',
+                   shape := [64, 64, 3],
+                   video_info := struct_pack("video.is_depth_map" := false)
+               ),
+               action := struct_pack(dtype := 'float32', shape := [1])
+           ) AS features
+) TO '{TEST_DIR}/lerobot_incomplete_depth/meta/info.json'
+  (FORMAT JSON, ARRAY false, OVERWRITE_OR_IGNORE);
+
+query I
+SELECT count(*)
+FROM lerobot_scan('{TEST_DIR}/lerobot_incomplete_depth', refresh := true);
+----
+0
+
 # Duplicate video keys are rejected globally rather than only when their
 # occurrences happen to be adjacent in the source object.
 statement ok

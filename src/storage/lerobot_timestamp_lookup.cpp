@@ -121,7 +121,7 @@ void Merge(LerobotTimestampMatch &result, const LerobotTimestampMatch &part) {
 	}
 }
 
-string FilteredQuery(const vector<string> &files, const vector<LerobotTimestampKey> &keys) {
+string FilteredQuery(const vector<string> &files, const vector<LerobotTimestampKey> &keys, bool is_lance) {
 	string values;
 	for (const auto &key : keys) {
 		if (!values.empty()) {
@@ -129,16 +129,12 @@ string FilteredQuery(const vector<string> &files, const vector<LerobotTimestampK
 		}
 		values += "(" + std::to_string(key.first) + "," + std::to_string(key.second) + ")";
 	}
-	string paths = "[";
-	for (idx_t i = 0; i < files.size(); i++) {
-		paths += (i ? "," : "") + Value(files[i]).ToSQLString();
-	}
 	return "WITH requested(episode_index, frame_index) AS (VALUES " + values +
 	       "), frames AS (SELECT CAST(episode_index AS BIGINT) AS episode_index, "
 	       "CAST(frame_index AS BIGINT) AS frame_index, CAST(timestamp AS DOUBLE) AS timestamp "
-	       "FROM read_parquet(" +
-	       paths +
-	       "])) SELECT CAST(requested.episode_index AS BIGINT), CAST(requested.frame_index AS BIGINT), "
+	       "FROM " +
+	       LerobotFrameSourceSQL(files, is_lance) +
+	       ") SELECT CAST(requested.episode_index AS BIGINT), CAST(requested.frame_index AS BIGINT), "
 	       "min(frames.timestamp), "
 	       "CAST(count(frames.frame_index) AS BIGINT) FROM requested LEFT JOIN frames "
 	       "USING (episode_index, frame_index) GROUP BY requested.episode_index, requested.frame_index";
@@ -179,7 +175,7 @@ struct LerobotTimestampLookup::Impl {
 	}
 
 	shared_ptr<TimestampIndex> Load(ClientContext &context, const string &path) {
-		const auto source = "read_parquet(" + Value(path).ToSQLString() + ")";
+		const auto source = LerobotFrameSourceSQL({path});
 		idx_t row_count;
 		{
 			// Native count(*) uses the Parquet footer. Size the one allocation
@@ -351,7 +347,7 @@ struct LerobotTimestampLookup::Impl {
 	}
 
 	vector<LerobotTimestampMatch> Lookup(ClientContext &context, const vector<string> &files,
-	                                     const vector<LerobotTimestampKey> &keys, idx_t request_count) {
+	                                     const vector<LerobotTimestampKey> &keys, idx_t request_count, bool is_lance) {
 		CheckInterrupted(context);
 		auto seen = requests.load();
 		while (seen < min_requests &&
@@ -363,7 +359,9 @@ struct LerobotTimestampLookup::Impl {
 		}
 		vector<string> uncached;
 		for (const auto &file : files) {
-			auto index = GetIndex(context, file);
+			// A Lance dataset is a directory, not a file with a stable stat identity.
+			// Keep its native filtered query instead of building a Parquet index.
+			auto index = is_lance ? nullptr : GetIndex(context, file);
 			if (!index) {
 				uncached.push_back(file);
 				continue;
@@ -375,7 +373,7 @@ struct LerobotTimestampLookup::Impl {
 		}
 		if (!uncached.empty()) {
 			queries++;
-			LerobotNestedQuery query(context, FilteredQuery(uncached, keys), true);
+			LerobotNestedQuery query(context, FilteredQuery(uncached, keys, is_lance), true);
 			CheckResult(query.GetResult());
 			while (auto chunk = query.Fetch()) {
 				UnifiedVectorFormat formats[4];
@@ -426,8 +424,8 @@ LerobotTimestampLookup::~LerobotTimestampLookup() {
 
 vector<LerobotTimestampMatch> LerobotTimestampLookup::Lookup(ClientContext &context, const vector<string> &files,
                                                              const vector<LerobotTimestampKey> &keys,
-                                                             idx_t request_count) {
-	return impl->Lookup(context, files, keys, request_count ? request_count : keys.size());
+                                                             idx_t request_count, bool is_lance) {
+	return impl->Lookup(context, files, keys, request_count ? request_count : keys.size(), is_lance);
 }
 
 LerobotTimestampLookupStats LerobotTimestampLookup::GetStats() const {

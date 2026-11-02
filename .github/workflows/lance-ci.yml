@@ -1,0 +1,101 @@
+name: Lance integration
+
+on:
+  push:
+    branches: [v1.5-variegata]
+  pull_request:
+    branches: [v1.5-variegata]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lance-video:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CC: clang
+      CXX: clang++
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Check out the fixed Blob-capable Lance source
+        uses: actions/checkout@v4
+        with:
+          repository: AstroVela/lance-duckdb
+          ref: f791817e7b5dce775118e93cd00c34d20f973b0c
+          path: build/lance-source
+          persist-credentials: false
+      - name: Install build and media dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang ccache ninja-build pkg-config protobuf-compiler \
+            python3-venv ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            libaom-dev libsvtav1-dev libx265-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/ccache
+          key: lance-duckdb155-${{ runner.os }}-${{ hashFiles('test/lance-extension.cmake') }}-${{ github.sha }}
+          restore-keys: |
+            lance-duckdb155-${{ runner.os }}-
+      - name: Apply the pinned test-host EOF fix
+        run: |
+          test "$(git -C duckdb rev-parse HEAD)" = d8cdaa33fda8df955cc76ef58a280f68f4cd43fa
+          git -C duckdb apply --check ../test/patches/duckdb-1.5.5-cached-eof.patch
+          git -C duckdb apply ../test/patches/duckdb-1.5.5-cached-eof.patch
+      - name: Build both extensions against DuckDB 1.5.5
+        run: |
+          cmake -S duckdb -B build/lance-integration -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDUCKDB_EXTENSION_CONFIGS="$PWD/test/lance-extension.cmake" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DOVERRIDE_GIT_DESCRIBE=v1.5.5-0-gd8cdaa33fd \
+            -DLEROBOT_ENABLE_FFMPEG=ON -DLEROBOT_ALLOW_GPL=ON -DLEROBOT_AV1_ENCODER=libaom \
+            -DENABLE_SANITIZER=OFF -DENABLE_UBSAN=OFF \
+            -DBUILD_UNITTESTS=OFF
+          cmake --build build/lance-integration --parallel 2 --target \
+            shell lerobot_loadable_extension lance_loadable_extension
+      - name: Set up the Lance test environment
+        run: |
+          python3 -m venv build/lance-python
+          build/lance-python/bin/pip install \
+            torch==2.10.0 torchvision==0.25.0 torchcodec==0.10.0 \
+            --index-url https://download.pytorch.org/whl/cpu
+          build/lance-python/bin/pip install './python[test]' \
+            'lerobot[dataset]==0.6.1' lerobot-lancedb==0.3.1 lancedb==0.37.1 \
+            numpy==2.2.6 av==15.1.0 pylance==12.0.0 pyarrow==25.0.1 \
+            torch==2.10.0 torchvision==0.25.0 torchcodec==0.10.0
+      - name: Validate Lance videos, snapshots and remote authorization
+        run: |
+          build/lance-python/bin/python test/conformance/test_lance_video.py \
+            --duckdb "$PWD/build/lance-integration/duckdb" \
+            --extension "$PWD/build/lance-integration/extension/lerobot/lerobot.duckdb_extension" \
+            --lance-extension "$PWD/build/lance-integration/extension/lance/lance.duckdb_extension" \
+            --rgb-codec libaom-av1 --threads 4
+          build/lance-python/bin/python test/conformance/test_lance_snapshot.py \
+            --extension "$PWD/build/lance-integration/extension/lerobot/lerobot.duckdb_extension" \
+            --lance-extension "$PWD/build/lance-integration/extension/lance/lance.duckdb_extension" \
+            --rgb-codec libaom-av1
+          build/lance-integration/duckdb -unsigned -c 'INSTALL httpfs;'
+          build/lance-python/bin/python test/conformance/test_lance_remote.py \
+            --duckdb "$PWD/build/lance-integration/duckdb" \
+            --extension "$PWD/build/lance-integration/extension/lerobot/lerobot.duckdb_extension" \
+            --lance-extension "$PWD/build/lance-integration/extension/lance/lance.duckdb_extension" \
+            --rgb-codec libaom-av1
+      - name: Test the Python Lance video reader with TorchCodec
+        env:
+          LEROBOT_EXTENSION: ${{ github.workspace }}/build/lance-integration/extension/lerobot/lerobot.duckdb_extension
+          LANCE_EXTENSION: ${{ github.workspace }}/build/lance-integration/extension/lance/lance.duckdb_extension
+        run: |
+          build/lance-python/bin/python -m pytest python/tests -q -k lance

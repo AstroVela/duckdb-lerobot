@@ -528,3 +528,7 @@ query I
 SELECT count(*) FROM glob('{TEST_DIR}/lerobot_changed_thread_budget*');
 ----
 0
+
+# Release the failed COPY state while its connection's ClientData is still alive.
+statement ok
+DEALLOCATE budget_copy;

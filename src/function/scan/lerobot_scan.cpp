@@ -4,16 +4,20 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
 
 #include "lerobot_path.hpp"
+#include "lerobot_query.hpp"
 #include "storage/lerobot_metadata_cache.hpp"
 
 #include <algorithm>
@@ -168,6 +172,47 @@ unique_ptr<TableRef> CreateFilteredFrameScan(vector<string> paths, const named_p
 	return make_uniq<SubqueryRef>(std::move(statement));
 }
 
+LogicalType RestoreLanguageJSONType(const LogicalType &type) {
+	if (type.id() != LogicalTypeId::LIST || ListType::GetChildType(type).id() != LogicalTypeId::STRUCT) {
+		return type;
+	}
+	auto fields = StructType::GetChildTypes(ListType::GetChildType(type));
+	for (auto &field : fields) {
+		if (field.first == "tool_calls" && field.second.id() == LogicalTypeId::LIST &&
+		    ListType::GetChildType(field.second).id() == LogicalTypeId::VARCHAR) {
+			// The converter strips Arrow JSON extensions to strings. Only restore
+			// the known JSON field; annotation writers can also store struct calls.
+			field.second = LogicalType::LIST(LogicalType::JSON());
+		}
+	}
+	return LogicalType::LIST(LogicalType::STRUCT(std::move(fields)));
+}
+
+vector<LogicalType> ResolveLanceFrameTypes(ClientContext &context, const LerobotDatasetMetadata &metadata) {
+	const auto &schema = metadata.GetFrameSchema();
+	auto types = schema.types;
+	string projection;
+	vector<idx_t> language_columns;
+	for (idx_t index = 0; index < types.size(); index++) {
+		if (types[index].id() == LogicalTypeId::ANY) {
+			ColumnRefExpression column(StringUtil::Replace(schema.names[index], ".", "_"));
+			projection += (projection.empty() ? "" : ", ") + column.ToString();
+			language_columns.push_back(index);
+		}
+	}
+	if (!language_columns.empty()) {
+		LerobotNestedQuery query(context, "SELECT " + projection + " FROM " +
+		                                      LerobotFrameSourceSQL(metadata.GetDataFiles(), true) + " LIMIT 0");
+		if (query.GetResult().HasError()) {
+			query.GetResult().ThrowError();
+		}
+		for (idx_t index = 0; index < language_columns.size(); index++) {
+			types[language_columns[index]] = RestoreLanguageJSONType(query.GetResult().types[index]);
+		}
+	}
+	return types;
+}
+
 unique_ptr<TableRef> LerobotScanBindReplace(ClientContext &context, TableFunctionBindInput &input) {
 	auto root = GetRoot(input, "lerobot_scan");
 	auto requested_episodes = input.named_parameters.find("episode_indices");
@@ -178,6 +223,45 @@ unique_ptr<TableRef> LerobotScanBindReplace(ClientContext &context, TableFunctio
 	const auto refresh = GetRefreshParameter(input);
 	auto metadata = LerobotDatasetMetadata::Get(context, root, refresh);
 	auto parameters = GetParquetParameters(input);
+	if (metadata->IsLance()) {
+		if (!parameters.empty()) {
+			throw BinderException("lerobot_scan parameter '%s' is only supported for Parquet datasets",
+			                      parameters.begin()->first);
+		}
+		const auto &schema = metadata->GetFrameSchema();
+		if (metadata->GetEpisodeCount() == 0) {
+			return LerobotCreateEmptyParquetRelation(context, schema.names, schema.types);
+		}
+		EnsureLerobotLanceExtension(context);
+		LerobotCheckLanceFrameCount(context, *metadata);
+		auto types = ResolveLanceFrameTypes(context, *metadata);
+		auto source = make_uniq<BaseTableRef>();
+		source->table_name = metadata->GetDataFiles().front();
+		auto select = make_uniq<SelectNode>();
+		select->from_table = std::move(source);
+		for (idx_t index = 0; index < schema.names.size(); index++) {
+			unique_ptr<ParsedExpression> column =
+			    make_uniq<ColumnRefExpression>(StringUtil::Replace(schema.names[index], ".", "_"));
+			column = make_uniq<CastExpression>(types[index], std::move(column));
+			column->SetAlias(schema.names[index]);
+			select->select_list.push_back(std::move(column));
+		}
+		if (requested_episodes != input.named_parameters.end()) {
+			if (episode_indices.empty()) {
+				select->where_clause = make_uniq<ConstantExpression>(Value::BOOLEAN(false));
+			} else {
+				vector<unique_ptr<ParsedExpression>> children;
+				children.push_back(make_uniq<ColumnRefExpression>("episode_index"));
+				for (const auto episode_index : episode_indices) {
+					children.push_back(make_uniq<ConstantExpression>(Value::BIGINT(episode_index)));
+				}
+				select->where_clause = make_uniq<OperatorExpression>(ExpressionType::COMPARE_IN, std::move(children));
+			}
+		}
+		auto statement = make_uniq<SelectStatement>();
+		statement->node = std::move(select);
+		return make_uniq<SubqueryRef>(std::move(statement));
+	}
 
 	if (requested_episodes == input.named_parameters.end()) {
 		if (metadata->GetDataFiles().empty()) {

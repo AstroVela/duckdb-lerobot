@@ -103,6 +103,7 @@ jobs:
         run: |
           sudo apt-get install -y -qq \
             ffmpeg \
+            python3-pil \
             libaom-dev \
             libavcodec-dev \
             libavformat-dev \
@@ -198,6 +199,16 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
           "${{ matrix.build_dir }}/test/unittest" 'test/sql/lerobot_video_frames.test'
+
+      - name: Check exact video pixels against independent FFmpeg decoding
+        if: matrix.ffmpeg
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          python3 test/conformance/test_video_pixels.py \
+            --duckdb "${{ matrix.build_dir }}/duckdb" \
+            --extension "${{ matrix.build_dir }}/extension/lerobot/lerobot.duckdb_extension"
 
       - name: Check concurrent mixed-resolution video against FFmpeg
         if: matrix.ffmpeg
@@ -346,6 +357,11 @@ jobs:
             --extension "${BUILD_DIR}/extension/lerobot/lerobot.duckdb_extension"
           "${BUILD_DIR}/conformance-venv/bin/python" \
             test/conformance/test_numeric_stats.py \
+            --duckdb "${BUILD_DIR}/duckdb" \
+            --extension "${BUILD_DIR}/extension/lerobot/lerobot.duckdb_extension"
+          "${BUILD_DIR}/duckdb" -c "INSTALL lance;"
+          "${BUILD_DIR}/conformance-venv/bin/python" \
+            test/conformance/test_lance.py \
             --duckdb "${BUILD_DIR}/duckdb" \
             --extension "${BUILD_DIR}/extension/lerobot/lerobot.duckdb_extension"
 
